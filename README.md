@@ -23,9 +23,10 @@ applications define their own kinds. Applications are specified and implemented 
 | Layer 0 specification | Settled by 16 accepted ADRs ([`docs/decisions/`](docs/decisions/)) |
 | `sbtp-core` | Implemented: zero-copy decoder, `block_id`, PoW, strict Ed25519, self-test; 116 tests, fuzzed, reviewed |
 | Interoperability vectors | 82 vectors in [`docs/test-vectors/v1/`](docs/test-vectors/) (unpublished; frozen on first publication) |
-| `sbtp-relay` | In progress (Phase 2): redb index prototype; HTTP API next |
-| `sbtp-wasm`, CLI | Planned (Phase 3) |
+| `sbtp-relay` | Implemented: HTTP API, flat-file store, redb index, age-based sweeper; container image `ghcr.io/sbtp-protocol/sbtp-relay` (from `relay-v0.1.0`) |
+| `sbtp-wasm`, CLI | Implemented: WASM bindings, `cli-demo`, minimal web client |
 | Layer 2 grammar | Specified ([`docs/spec/l2-grammar.md`](docs/spec/l2-grammar.md)); `sbtp-l2` validates it |
+| Graph access | Specified ([`docs/spec/graph-access.md`](docs/spec/graph-access.md)): `sbtp:` URI, JSON view, optional gateway, MCP server; not implemented yet |
 
 Changes: [`CHANGELOG.md`](CHANGELOG.md).
 

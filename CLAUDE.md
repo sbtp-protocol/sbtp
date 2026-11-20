@@ -13,6 +13,7 @@ Contributor rules are in `CONTRIBUTING.md`; this file summarises them for coding
 | `docs/spec/sbtp-core-v0.2.md` | **Normative layer 0 spec** (binary format, crypto, relay API). |
 | `docs/spec/architecture.md` | The layers, relay design, runtimes. |
 | `docs/spec/l2-grammar.md` | Layer 2 grammar (`{v, kind, edges, body}`), `sbtp.*` kinds, sealed envelope. |
+| `docs/spec/graph-access.md` | `sbtp:` URI, JSON block view, optional graph gateway API, MCP server, discovery. |
 | `docs/decisions/` | Published architecture decision records. |
 | `docs/test-vectors/` | Interoperability vectors. A published vector set never changes. |
 | `crates/sbtp-core` | Layer 0, `no_std`, no `unsafe`. |
