@@ -481,6 +481,13 @@ impl KindRow {
         self.repeatable = verbs;
         self
     }
+
+    /// The same row, with a closed edge set: no extension or unknown verb (spec §2.3, §3.1).
+    #[must_use]
+    pub const fn closed(mut self) -> Self {
+        self.closed = true;
+        self
+    }
 }
 
 /// Checks the edges and Parents Count against the row of an `sbtp.*` kind of spec §3. This is
@@ -496,13 +503,43 @@ fn check_shape(kind: Kind, n_parents: usize, edges: &[Edge<'_>]) -> Result<(), L
         // spec §1.3: an unknown kind is checked against §1 and §2 only.
         Kind::Unknown => return Ok(()),
         Kind::Manifest => KindRow::new((0, 1), &["in"], &[]),
-        // spec §3 and §5.2: one parent, the delivery tag, named by the single `tagged` edge.
-        Kind::Enc => KindRow::new((1, 1), &[], &["tagged"]),
-        // spec §3 and §5.5: the directory tag (`tagged`), and on an update the previous version
-        // (at most one `supersedes`).
+        // spec §3 and §5.2: one parent, the delivery tag, named by the single `tagged` edge. The
+        // edge set is closed (spec §5.2, ADR 0039 rule 4).
+        Kind::Enc => KindRow::new((1, 1), &[], &["tagged"]).closed(),
+        // spec §3 and §5.5: the directory tag (`tagged`, `p: 0`), and on an update the previous
+        // version (`supersedes`, `p: 1`). The positions are checked below; the edge set stays
+        // open for non-causal extension and unknown verbs.
         Kind::EncKey => KindRow::new((1, 2), &["supersedes"], &["tagged"]),
     };
-    check_row(&row, n_parents, edges)
+    check_row(&row, n_parents, edges)?;
+    if kind == Kind::EncKey {
+        check_enc_key_positions(n_parents, edges)?;
+    }
+    Ok(())
+}
+
+/// spec §5.5 (ADR 0039 rules 1 and 2): the parent positions of an `sbtp.enc_key`, on edges that
+/// already passed its row and the coverage rule of spec §2.1. `tagged` and `supersedes` take the
+/// `p` form only (spec §2.2), so each names a parent position.
+fn check_enc_key_positions(n_parents: usize, edges: &[Edge<'_>]) -> Result<(), L2Error> {
+    // spec §5.5: the directory tag is `p: 0`, named by the `tagged` edge.
+    if edges
+        .iter()
+        .any(|e| e.rel == Rel::Tagged && e.target != Target::Parent(0))
+    {
+        return Err(L2Error::EncKeyTagPosition);
+    }
+    // spec §5.5: an update (2 parents) names the previous version as `p: 1`, by `supersedes`.
+    // Coverage guarantees an edge at `p: 1`; it MUST be `supersedes`, not an extension or
+    // unknown causal verb.
+    if n_parents == 2
+        && !edges
+            .iter()
+            .any(|e| e.target == Target::Parent(1) && matches!(e.rel, Rel::Supersedes { .. }))
+    {
+        return Err(L2Error::EncKeySupersedesPosition);
+    }
+    Ok(())
 }
 
 /// Checks a payload's edges and its block's Parents Count against a kind row, under the reading
@@ -626,8 +663,10 @@ fn enc<'a>(r: &mut Reader<'a>, payload_len: usize) -> Result<Enc<'a>, L2Error> {
     if !ENC_PAYLOAD_LENS.contains(&payload_len) {
         return Err(L2Error::EncPayloadLen);
     }
-    // spec §5.2: "the payload is 90 bytes plus the ciphertext". With the body and the single
-    // `tagged` edge fixed, only `ct` is free; any other edge or byte breaks this.
+    // spec §5.2: "the payload is 90 bytes plus the ciphertext". With the closed edge set, the
+    // single `tagged` edge and the closed body, only `ct` is free, and every payload of a
+    // bucket's length meets this rule: kept as a defence in depth should the overhead
+    // computation and the row ever diverge, and tested on the body decoder directly.
     if ct.len().checked_add(ENC_OVERHEAD) != Some(payload_len) {
         return Err(L2Error::EncCiphertextLen);
     }
@@ -667,5 +706,29 @@ fn check_total_size(total_size: u64, n: usize) -> Result<(), L2Error> {
     match (lower, upper) {
         (Some(lo), Some(hi)) if lo < total_size && total_size <= hi => Ok(()),
         _ => Err(E),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbor::{Value as V, encode};
+
+    // spec §5.2: `EncCiphertextLen`. Through `validate_l2_invariants`, every payload of a bucket's
+    // length that passes the closed row and the closed body meets the rule, so the variant is
+    // tested on the body decoder with a payload length that does not match `ct`.
+    #[test]
+    fn enc_ciphertext_len() {
+        let ct = [0x5a; 422];
+        let body = encode(&V::Map(alloc::vec![
+            ("ct", V::Bytes(&ct)),
+            ("enc", V::Bytes(&[0xaa; 32])),
+        ]))
+        .unwrap();
+        assert!(enc(&mut Reader::new(&body), 512).is_ok());
+        assert_eq!(
+            enc(&mut Reader::new(&body), 2_048).err(),
+            Some(L2Error::EncCiphertextLen)
+        );
     }
 }

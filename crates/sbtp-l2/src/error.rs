@@ -131,6 +131,11 @@ pub enum L2Error {
     EncCiphertextLen,
     /// An `sbtp.enc_key` whose `intro_bucket` is above 15 (spec §5.5).
     EncKeyIntroBucket,
+    /// An `sbtp.enc_key` whose `tagged` edge is not `p: 0` (spec §5.5, ADR 0039 rule 1).
+    EncKeyTagPosition,
+    /// An `sbtp.enc_key` with 2 parents whose edge at `p: 1` is not `supersedes` (spec §5.5,
+    /// ADR 0039 rule 2).
+    EncKeySupersedesPosition,
 }
 
 impl fmt::Display for L2Error {
