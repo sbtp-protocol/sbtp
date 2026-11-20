@@ -46,10 +46,10 @@ Every change to a workflow keeps these:
 
 ## Limits and follow-ups
 
-- **Toolchain channel.** `rust-toolchain.toml` names `stable`, so CI follows each new Rust release
-  on the day it ships (a new clippy lint can fail an unchanged commit). Pinning an exact version
-  there (for example `1.99.1`, matching the Docker builder) makes CI reproducible; it is a
-  repository-wide change for the owner to decide.
+- **Toolchain version.** `rust-toolchain.toml` pins an exact version (`1.99.1`), so a new Rust
+  release or clippy lint never fails an unchanged commit. Raise it in one commit together with the
+  builder image of `deploy/Dockerfile` (`rust:1.99-alpine`, pinned by digest), so that CI and the
+  release image build with the same compiler.
 - **Advisories.** `cargo deny check` fetches the RustSec database at each run, so a new advisory
   fails CI on unchanged code. That is intended.
 - **Provenance.** Each pushed image gets a GitHub build provenance attestation (Sigstore,

@@ -95,9 +95,11 @@ pub struct Relay<I> {
     ids: [Mutex<()>; ID_STRIPES],
     /// Per stripe, incremented under the stripe's lock each time a block of the stripe gets a new
     /// acceptance: a new file (`201`, or a damaged file replaced) or a re-acceptance of an expired
-    /// block (ADR 0043 rule 3). The sweeper compares it with the value it read before listing a
-    /// batch, and looks the block up again before deleting anything when it moved (ADR 0043 rule
-    /// 4; see [`crate::sweep`]).
+    /// block (ADR 0043 rule 3). Incremented only once the index insert of that acceptance has
+    /// returned (security review 2026-11-20 M-1), so that a sweeper that read the old value lists
+    /// after the insert committed, or sees the value move. The sweeper compares it with the value
+    /// it read before listing a batch, and looks the block up again before deleting anything when
+    /// it moved (ADR 0043 rule 4; see [`crate::sweep`]).
     accepted: [AtomicU64; ID_STRIPES],
     /// Per stripe, incremented by the sweeper after it deletes a block file. A `GET` miss that
     /// read the file before the deletion drops the cache entry it inserted when this moved during
@@ -115,6 +117,9 @@ pub struct Relay<I> {
     max_future_ms: u64,
     body_timeout: Duration,
     retry_after_s: u64,
+    /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
+    #[cfg(test)]
+    before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<I: IndexBackend + 'static> Relay<I> {
@@ -150,7 +155,18 @@ impl<I: IndexBackend + 'static> Relay<I> {
             max_future_ms: s.max_future_ms,
             body_timeout: Duration::from_millis(s.body_timeout_ms),
             retry_after_s: s.shed_retry_after_s,
+            #[cfg(test)]
+            before_insert: Mutex::new(None),
         }
+    }
+
+    /// Tests: `f` runs once, inside the next [`Relay::index_new`], just before its index insert.
+    #[cfg(test)]
+    pub(crate) fn set_before_insert(&self, f: impl FnOnce() + Send + 'static) {
+        *self
+            .before_insert
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
     /// Replaces the relay clock (tests: a controllable clock instead of [`log::unix_ms`]). The
@@ -197,7 +213,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
             .map_or(0, |a| a.load(Ordering::SeqCst))
     }
 
-    /// Records a new acceptance of `id`. Called under the lock of `id`.
+    /// Records a new acceptance of `id`. Called under the lock of `id`, after the index insert of
+    /// the acceptance returned (see `accepted`).
     fn bump_accepted(&self, id: &BlockId) {
         if let Some(a) = self.accepted.get(stripe(id)) {
             a.fetch_add(1, Ordering::SeqCst);
@@ -292,10 +309,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
             Settled::Known => return Ok(Accepted::Known),
             // ADR 0043 rule 3: an expired block is not held; the file is kept, the block gets a
             // new position. No quota check: nothing is written to the store.
-            Settled::Reaccept => {
-                self.bump_accepted(&id);
-                return self.index_new(&id, &block);
-            }
+            Settled::Reaccept => return self.index_new(&id, &block),
             Settled::Create { replaced } => replaced,
         };
         // C2, C3 (ADR 0023 rule 8.6: the normal create path).
@@ -305,22 +319,21 @@ impl<I: IndexBackend + 'static> Relay<I> {
         };
         match self.store.write_new(&valid) {
             Ok(Stored::Created) if replaced => {
-                self.bump_accepted(&id);
                 // ADR 0023 rule 8.7: the `block_id` was already accepted by this relay; an
                 // existing index entry is kept, a missing one is added as an orphan. `200`. An
                 // expired entry is not a holding (ADR 0043 rule 3): the block is new, `201`.
                 metrics::store_replaced();
                 match self.held(&id) {
                     Held::Unindexed => self.index_orphan(&id, &block),
+                    // Counts the acceptance after its insert.
                     Held::Expired => return self.index_new(&id, &block),
                     Held::Live | Held::Unknown => self.store.publish_gauges(),
                 }
+                // A new file: an acceptance, counted once the index is settled (see `accepted`).
+                self.bump_accepted(&id);
                 Ok(Accepted::Known)
             }
-            Ok(Stored::Created) => {
-                self.bump_accepted(&id);
-                self.index_new(&id, &block)
-            }
+            Ok(Stored::Created) => self.index_new(&id, &block),
             // A file appeared under the final name since the lookup (ADR 0008 rule 6). It is
             // indexed only if it holds the bytes just verified (ADR 0023 rule 15).
             Ok(Stored::AlreadyPresent) => {
@@ -349,10 +362,23 @@ impl<I: IndexBackend + 'static> Relay<I> {
 
     /// The index entries of a block that is new for the relay (`201`): a new file, or an expired
     /// block whose file is kept (ADR 0043 rule 3). [`FileState::Created`] replaces any older entry
-    /// of `id` (ADR 0013 rule 13). Under the lock of `id`.
+    /// of `id` (ADR 0013 rule 13). Under the lock of `id`. Counts the acceptance once the insert
+    /// has returned, whatever its result (security review 2026-11-20 M-1; see `accepted`).
     fn index_new(&self, id: &BlockId, block: &BlockRef<'_>) -> Result<Accepted, Rejection> {
         let len = u32::try_from(block.as_bytes().len()).unwrap_or(u32::MAX);
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_insert
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(f) = hook {
+                f();
+            }
+        }
         let inserted = self.insert(id, len, block.parents(), FileState::Created);
+        self.bump_accepted(id);
         self.store.publish_gauges();
         // ADR 0018 rule 13: the writer queue is bounded by the `PUT` permits; a refusal leaves an
         // orphan, repaired by the next `PUT` of the block or at start-up.
