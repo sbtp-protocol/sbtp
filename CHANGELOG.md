@@ -107,6 +107,13 @@ Initial public version. Pre-release software: no version is supported for produc
 - `sbtp-relay`: a file deletion that keeps failing (for example a directory under a block's final
   name) no longer stops eviction by age: the sweeper skips that position for the run and goes on
   with the next ones, still logging `sweep_failed` and counting `sweep_failures` (review L-1).
+- `cli-demo query --follow` with several relays no longer polls a relay whose walk failed (a fatal
+  refusal, a `Retry-After` above 300 s, no progress, the dedupe bound): that relay is retired for
+  the run, and the command ends when every relay is retired. The `block_id`s printed over all relays
+  have a bound of their own (1,000,000). (Security review 2026-11-21, M-1.)
+- Web client: a relay's `Retry-After` is checked again before each `GET` of a failover, and a
+  success already in flight no longer lifts it; merged `/query` ids are taken round-robin across the
+  relays, so the first relay cannot fill the view. (Security review 2026-11-21, L-1, L-2.)
 
 ### Security
 

@@ -1217,3 +1217,95 @@ fn several_relays_get_skips_a_hostile_relay() {
     assert_eq!(stdout(&o), "");
     assert!(!out.exists());
 }
+
+/// A server that answers every connection with `503` and `Retry-After: 3600` until `stop` is set,
+/// and returns how many requests it received.
+fn busy_server() -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    JoinHandle<usize>,
+) {
+    use std::sync::atomic::AtomicBool;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let thread = std::thread::spawn(move || {
+        let mut count = 0;
+        while !flag.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            count += 1;
+            let body = r#"{"error":"Unavailable"}"#;
+            let reply = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                 Retry-After: 3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+        count
+    });
+    (url, stop, thread)
+}
+
+/// Security review 2026-11-21, M-1: under `--follow`, a relay whose walk failed (here a
+/// `Retry-After` of an hour, above the 300 s maximum) is retired for the run: it is never asked
+/// again, while the other relay is still polled. When the last relay fails too, the command ends.
+#[test]
+fn query_follow_retires_a_relay_whose_walk_failed() {
+    let a = "0a".repeat(32);
+    let (good, t) = scripted_server(vec![
+        ("200 OK", page(&[&a], "c1", false)),
+        ("200 OK", page(&[], "c1", false)),
+        (
+            "400 Bad Request",
+            r#"{"error":"InvalidParameter"}"#.to_owned(),
+        ),
+    ]);
+    let (busy, stop, counter) = busy_server();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cli-demo"))
+        .args([
+            "query",
+            "--relay",
+            &format!("{busy},{good}"),
+            "--follow",
+            "--interval",
+            "1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Three rounds of about a second each; never more than 20 s.
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("query --follow did not end when every relay had failed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let o = child.wait_with_output().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(counter.join().unwrap(), 1, "the busy relay was asked again");
+    assert_eq!(t.join().unwrap().len(), 3);
+    // Both refusals are relay refusals: status 3.
+    assert_code(&o, 3);
+    assert_eq!(stdout(&o), format!("{a}\n"));
+    let err = stderr(&o);
+    assert!(err.contains("not polled again in this run"), "{err}");
+    assert!(err.contains("InvalidParameter"), "{err}");
+}

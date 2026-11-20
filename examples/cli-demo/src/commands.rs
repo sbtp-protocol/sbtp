@@ -529,11 +529,23 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
         .zip(cursors)
         .map(|(relay, cursor)| Walker::new(relay, filter.clone(), cursor, policy))
         .collect();
-    let mut printed: Option<HashSet<BlockId>> = several.then(HashSet::new);
+    let mut printed: Option<Printed> = several.then(|| Printed::new(walk::MAX_SEEN));
+    // A walk that failed is terminal for its relay (a fatal refusal, a Retry-After above the
+    // maximum, no progress, the dedupe bound): that relay is not asked again in this run, so that
+    // `--follow` never repeats a request early and the dedupe sets stop growing (security review
+    // 2026-11-21, M-1). The command ends when every relay is retired.
+    let mut retired = vec![false; relays.len()];
+    let mut retired_failures = Vec::new();
     let mut first = true;
     loop {
         let mut failures = Vec::new();
-        for (relay, walker) in relays.iter().zip(walkers.iter_mut()) {
+        for i in 0..relays.len() {
+            let (Some(relay), Some(walker)) = (relays.get(i), walkers.get_mut(i)) else {
+                continue;
+            };
+            if retired.get(i).copied().unwrap_or(true) {
+                continue;
+            }
             let mut closed = false;
             let result = walker.walk(
                 &mut std::thread::sleep,
@@ -545,39 +557,28 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
                 return Ok(());
             }
             match result {
-                Ok(summary) if first => {
-                    let restarts = match summary.restarts {
-                        0 => String::new(),
-                        n => format!(", {n} restart(s) after InvalidCursor"),
-                    };
-                    let from = if several {
-                        format!("relay {}: ", relay.base())
-                    } else {
-                        String::new()
-                    };
-                    eprintln!(
-                        "{from}{} block_id(s) in {} page(s){restarts}.",
-                        summary.new_ids, summary.pages
-                    );
-                }
+                Ok(summary) if first => walk_summary(relay, several, &summary),
                 Ok(_) => {}
+                Err(fail) if printed.as_ref().is_some_and(|p| p.full) => {
+                    // The bound over all relays: the whole command stops, with every cursor.
+                    print_cursors(&relays, &walkers, false);
+                    return Err(fail);
+                }
                 Err(mut fail) => {
-                    if let Some(c) = walker.cursor() {
-                        // The cursor is within the rule 5 alphabet: safe to show as is.
-                        let resume = if several {
-                            format!("{}={c}", relay.base())
-                        } else {
-                            c.to_owned()
-                        };
-                        fail.message =
-                            format!("{}\nResume later with `--cursor {resume}`.", fail.message);
+                    resume_hint(&mut fail, relay, walker.cursor(), several, follow);
+                    if let Some(r) = retired.get_mut(i) {
+                        *r = true;
                     }
-                    failures.push(fail);
+                    failures.push(Fail {
+                        code: fail.code,
+                        message: fail.message.clone(),
+                    });
+                    retired_failures.push(fail);
                 }
             }
         }
-        if failures.len() == relays.len() {
-            return Err(all_failed("the listing failed", failures));
+        if retired.iter().all(|r| *r) {
+            return Err(all_failed("the listing failed", retired_failures));
         }
         warn_all(&failures);
         if first {
@@ -588,6 +589,80 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+/// The counts of a relay's first walk, on standard error.
+fn walk_summary(relay: &Relay, several: bool, summary: &walk::Summary) {
+    let restarts = match summary.restarts {
+        0 => String::new(),
+        n => format!(", {n} restart(s) after InvalidCursor"),
+    };
+    let from = if several {
+        format!("relay {}: ", relay.base())
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "{from}{} block_id(s) in {} page(s){restarts}.",
+        summary.new_ids, summary.pages
+    );
+}
+
+/// Adds to the failure of a relay's walk the cursor to resume from and, under `--follow` with
+/// several relays, that the relay is retired.
+fn resume_hint(fail: &mut Fail, relay: &Relay, cursor: Option<&str>, several: bool, follow: bool) {
+    if let Some(c) = cursor {
+        // The cursor is within the rule 5 alphabet: safe to show as is.
+        let resume = if several {
+            format!("{}={c}", relay.base())
+        } else {
+            c.to_owned()
+        };
+        fail.message = format!("{}\nResume later with `--cursor {resume}`.", fail.message);
+    }
+    if follow && several {
+        fail.message
+            .push_str("\nThis relay is not polled again in this run.");
+    }
+}
+
+/// The `block_id`s printed by one `query` over several relays, with a bound of their own: what this
+/// process remembers does not depend on what the relays send (spec §4 "Client bounds"; security
+/// review 2026-11-21, M-1).
+struct Printed {
+    seen: HashSet<BlockId>,
+    max: usize,
+    /// The bound was reached: the command stops.
+    full: bool,
+}
+
+impl Printed {
+    fn new(max: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            max,
+            full: false,
+        }
+    }
+
+    /// Whether `id` is new, to be printed. Past `max` distinct identifiers, an error that ends the
+    /// command.
+    fn admit(&mut self, id: &BlockId) -> Result<bool, Fail> {
+        if self.seen.contains(id) {
+            return Ok(false);
+        }
+        if self.seen.len() >= self.max {
+            self.full = true;
+            return Err(Fail::failed(format!(
+                "more than {} distinct block_ids over all relays in one run, the most this client \
+                 remembers to avoid printing one twice; narrow the listing with `--parent` or \
+                 `--since`",
+                self.max
+            )));
+        }
+        self.seen.insert(*id);
+        Ok(true)
     }
 }
 
@@ -713,14 +788,14 @@ fn query_filter(p: &Parsed) -> Result<Filter, Fail> {
 fn on_walk_event(
     relay: &Relay,
     event: Event<'_>,
-    printed: Option<&mut HashSet<BlockId>>,
+    printed: Option<&mut Printed>,
     closed: &mut bool,
 ) -> Result<(), Fail> {
     match event {
         Event::Id(id) => {
             // spec §4 `/query`: a client MUST deduplicate by block_id, over every relay it reads.
             if let Some(set) = printed
-                && !set.insert(*id)
+                && !set.admit(id)?
             {
                 return Ok(());
             }
@@ -868,6 +943,22 @@ fn build_fail(e: BuildError) -> Fail {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// The set of printed identifiers has a bound of its own (security review 2026-11-21, M-1).
+    #[test]
+    fn printed_ids_are_bounded() {
+        let mut p = Printed::new(2);
+        let id = |n: u8| BlockId::from_bytes([n; 32]);
+        assert!(p.admit(&id(1)).unwrap());
+        assert!(!p.admit(&id(1)).unwrap());
+        assert!(p.admit(&id(2)).unwrap());
+        assert!(!p.full);
+        // Already printed: still fine at the bound; a third distinct one ends the command.
+        assert!(!p.admit(&id(2)).unwrap());
+        let fail = p.admit(&id(3)).unwrap_err();
+        assert!(p.full && fail.message.contains("more than 2 distinct"));
+        assert_eq!(p.seen.len(), 2);
+    }
 
     /// The exit status of a command that failed on every relay.
     #[test]
