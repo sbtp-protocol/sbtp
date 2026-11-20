@@ -433,6 +433,23 @@ fn admit(
     // client address, the key is the proxy's exact address (rule 10), not its /64.
     let (key, addressed) = match admission {
         Admission::Direct(key) => (*key, true),
+        // ADR 0044: the single-value header replaces `X-Forwarded-For`. A missing or malformed
+        // one falls back to the peer's exact address (rule 5, as ADR 0020 rule 10); the request
+        // is never refused for it. Neither the value nor the address is logged (rule 7).
+        Admission::Proxied(_) if clients.client_ip_header.is_some() => {
+            if let Some(ip) = clients.header_client(req.headers()) {
+                (clients.forwarded_key(ip), true)
+            } else {
+                let key = clients.proxy_key(peer);
+                log::throttled(
+                    &clients.header_fallback_log,
+                    Event::ForwardedInvalid,
+                    &[("reason", Value::Str("client_ip_header"))],
+                    key.as_ref(),
+                );
+                (key, false)
+            }
+        }
         Admission::Proxied(_) => match clients.forwarded_client(req.headers()) {
             Forwarded::Client(ip) => (clients.forwarded_key(ip), true),
             Forwarded::Absent => (clients.proxy_key(peer), false),

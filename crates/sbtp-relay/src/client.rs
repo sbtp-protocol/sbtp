@@ -133,6 +133,10 @@ pub struct ClientPolicy {
     pub(crate) unreadable_log: Throttle,
     /// ADR 0020 rule 11: a request without a client address was refused.
     pub(crate) unaddressed_log: Throttle,
+    /// ADR 0044: `client_ip_header`, lowercase. When set, it replaces `X-Forwarded-For`.
+    pub client_ip_header: Option<String>,
+    /// ADR 0044 rule 7: a request from a trusted peer fell back to the peer address.
+    pub(crate) header_fallback_log: Throttle,
 }
 
 impl ClientPolicy {
@@ -146,7 +150,16 @@ impl ClientPolicy {
             max_per_client: max,
             unreadable_log: Throttle::default(),
             unaddressed_log: Throttle::default(),
+            client_ip_header: None,
+            header_fallback_log: Throttle::default(),
         }
+    }
+
+    /// Sets `client_ip_header` (ADR 0044), lowercase.
+    #[must_use]
+    pub fn with_client_ip_header(mut self, header: Option<String>) -> Self {
+        self.client_ip_header = header;
+        self
     }
 
     /// The policy of `s`. Every value is in range after [`Settings::load`].
@@ -158,6 +171,33 @@ impl ClientPolicy {
             u8::try_from(s.client_ipv6_prefix).unwrap_or(64),
             u32::try_from(s.max_connections_per_client).unwrap_or(u32::MAX),
         )
+        .with_client_ip_header(s.client_ip_header.clone())
+    }
+
+    /// ADR 0044 rules 4 and 5, for a request from a trusted peer when `client_ip_header` is set:
+    /// the client address, or `None` to fall back to the peer address. The header must appear in
+    /// exactly one field line whose value, without leading and trailing spaces and tabs, is one
+    /// bare IPv4 or IPv6 address (no port, no brackets, no list) made of visible ASCII; it is
+    /// normalised (ADR 0020 rule 8) and must not be in `trusted_proxies`. `X-Forwarded-For` is
+    /// not read (rule 3). The value is never logged.
+    #[must_use]
+    pub fn header_client(&self, headers: &HeaderMap) -> Option<IpAddr> {
+        let name = self.client_ip_header.as_deref()?;
+        let mut lines = headers.get_all(name).iter();
+        let (Some(line), None) = (lines.next(), lines.next()) else {
+            return None;
+        };
+        let raw = line.as_bytes();
+        if !raw.iter().all(|b| matches!(b, 0x21..=0x7e | b' ' | b'\t')) {
+            return None;
+        }
+        let ip = std::str::from_utf8(raw)
+            .ok()?
+            .trim_matches(|c| c == ' ' || c == '\t')
+            .parse::<IpAddr>()
+            .ok()
+            .map(normalise)?;
+        (!self.trusts(ip)).then_some(ip)
     }
 
     /// Whether `ip` is in `trusted_proxies`.
@@ -342,6 +382,62 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// ADR 0044 rules 3 to 5: one field line holding one bare address, normalised and not
+    /// trusted, is the client; every other form falls back (`None`); `X-Forwarded-For` is never
+    /// read; nothing is read while the setting is off.
+    #[test]
+    fn client_ip_header_forms() {
+        let p =
+            policy(&["10.0.0.0/8"], &[]).with_client_ip_header(Some("cf-connecting-ip".to_owned()));
+        let read = |lines: &[&[u8]]| {
+            let mut h = HeaderMap::new();
+            h.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_static("198.51.100.99"),
+            );
+            for l in lines {
+                h.append(
+                    "CF-Connecting-IP",
+                    axum::http::HeaderValue::from_bytes(l).unwrap(),
+                );
+            }
+            p.header_client(&h)
+        };
+        assert_eq!(read(&[b"203.0.113.7"]), Some(ip("203.0.113.7")));
+        assert_eq!(read(&[b" \t203.0.113.7 "]), Some(ip("203.0.113.7")));
+        assert_eq!(read(&[b"2001:db8::1"]), Some(ip("2001:db8::1")));
+        assert_eq!(read(&[b"::ffff:203.0.113.7"]), Some(ip("203.0.113.7")));
+        for bad in [
+            &b"203.0.113.7:443"[..],
+            b"[2001:db8::1]",
+            b"[2001:db8::1]:443",
+            b"203.0.113.7, 198.51.100.1",
+            b"unknown",
+            b"",
+            b"10.1.2.3",
+            b"::ffff:10.1.2.3",
+            b"203.0.113.07",
+            b"fe80::1%eth0",
+            b"203.0.113.7\x80",
+        ] {
+            assert_eq!(read(&[bad]), None, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(read(&[]), None, "absent: X-Forwarded-For is not read");
+        assert_eq!(read(&[b"203.0.113.7", b"203.0.113.7"]), None, "two lines");
+        // IPv6 keys aggregate to the prefix as for any client address (ADR 0018 rule 20).
+        assert_eq!(
+            p.forwarded_key(read(&[b"2001:db8::1"]).unwrap()),
+            p.forwarded_key(read(&[b"2001:db8::2"]).unwrap())
+        );
+        let off = policy(&["10.0.0.0/8"], &[]);
+        let mut h = HeaderMap::new();
+        h.append(
+            "cf-connecting-ip",
+            axum::http::HeaderValue::from_static("203.0.113.7"),
+        );
+        assert_eq!(off.header_client(&h), None);
     }
 
     #[test]

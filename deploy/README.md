@@ -150,6 +150,60 @@ cloud firewall (Hetzner Cloud Firewall, not `ufw`: Docker's published ports bypa
 this, someone who reaches the origin from inside Cloudflare (their own zone, a Worker) can pick a
 fresh client key per request.
 
+### Behind a CDN: `client_ip_header`
+
+Some chains break `X-Forwarded-For`: Cloudflare → Traefik → relay, where Traefik does not trust
+the incoming header (Cloudflare's ranges are not in its `forwardedHeaders.trustedIPs`) and
+replaces it with the Cloudflare edge address. Every client behind one edge then shares one key.
+Cloudflare also writes the address of its own peer into `CF-Connecting-IP`, one value,
+overwriting whatever the client sent, and Traefik forwards that header unchanged. The relay can
+read it instead (ADR 0044):
+
+```bash
+SBTP_RELAY_CLIENT_IP_HEADER=cf-connecting-ip   # off by default
+```
+
+What the relay does with it:
+
+- It reads the header only on a connection from a peer in `trusted_proxies`; from any other peer
+  the header is ignored and the client is the peer address. `trusted_proxies` lists the proxy that
+  connects to the relay (Traefik's pod network, for example), **not** Cloudflare's ranges: no address
+  chain is read.
+- With the setting on, `X-Forwarded-For` is never read.
+- The header must appear once and hold exactly one bare IPv4 or IPv6 address (no port, no brackets,
+  no list), not itself in `trusted_proxies`. The address is keyed as any client address (IPv6
+  aggregated to `client_ipv6_prefix` bits, `rate_limit_exempt` applies). Anything else (absent, two
+  lines, a list, a port, `unknown`) falls back to the proxy's own address: the request is served,
+  and every such request shares that one key. A throttled `forwarded_invalid reason=client_ip_header`
+  warning says so. A health check without the header is such a request.
+- Neither the header value nor the derived address is ever logged. At start-up a `config_warning`
+  line with code `client_ip_header` names the header and the trust it implies.
+- `X-Forwarded-For` and `Forwarded` are refused as values (the relay does not start): they are
+  address chains, handled by the default path.
+
+Set it only when **both** hold; the relay cannot check either:
+
+1. **Only the CDN can reach the origin.** No other path to the proxy's ports, and no other program
+   on an address in `trusted_proxies`.
+2. **The CDN overwrites the header** on every request with the address of its own peer, whatever
+   the client sent. Cloudflare does this for `CF-Connecting-IP`.
+
+**Cross-tenant risk.** Cloudflare's addresses carry every Cloudflare customer's traffic. Another
+customer (their own zone pointed at your origin's address, or a Worker making `fetch()` calls to
+it) reaches the origin through those addresses and can set `CF-Connecting-IP` to any value, choosing
+a fresh client key for every request and defeating every per-client bound. A firewall that admits
+only Cloudflare's ranges does not stop this. Before setting `client_ip_header`:
+
+- authenticate the CDN's connection to the origin: Cloudflare **Authenticated Origin Pulls** with a
+  per-zone (not the shared global) certificate, verified by the proxy (Traefik TLS option
+  `clientAuth.clientAuthType: RequireAndVerifyClientCert` with that zone's CA), or reach the origin
+  only through a **Cloudflare Tunnel** with no open port; and
+- restrict ports 80 and 443 to Cloudflare's published ranges in the cloud firewall (not `ufw`:
+  Docker's published ports bypass it).
+
+Check after deployment as in "Client identification": two hosts, one exhausts its `block` bucket,
+the other is still served.
+
 ### Bare VM with Caddy
 
 `Caddyfile` is for a demo on a single VM where the relay and Caddy share the host. It is not used

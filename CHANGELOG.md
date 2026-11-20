@@ -66,6 +66,11 @@ Initial public version. Pre-release software: no version is supported for produc
   and is listed by `/query` again; the held file is kept, so a full relay still accepts it, and the
   sweeper never deletes a block accepted again after it listed it (ADR 0043). `GET` still serves an
   expired block until the sweeper deletes it.
+- `sbtp-relay`: `client_ip_header` (`SBTP_RELAY_CLIENT_IP_HEADER`, off by default): behind a CDN
+  that writes one client address into a header (`CF-Connecting-IP`), the relay keys clients by that
+  header on connections from `trusted_proxies`, instead of `X-Forwarded-For`; any other form falls
+  back to the proxy's address; the value is never logged (ADR 0044). `deploy/README.md` states the
+  conditions and the cross-tenant risk.
 - `deploy/`: what the relay and its reverse proxy log about clients, recommended retention (none, or
   at most 7 days, for any log that holds addresses), and how to drop or mask addresses in Caddy and
   Traefik access logs.
