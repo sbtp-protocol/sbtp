@@ -264,18 +264,13 @@ pub fn mine_slice(
     difficulty: u32,
     max_attempts: u64,
 ) -> Result<Option<BlockId>, BindError> {
-    let start = parse(block)?.nonce();
     match mine(block, difficulty, max_attempts) {
         Ok((_, id)) => Ok(Some(id)),
-        // `mine` tries `start, start + 1, ...`: the slice covered nonce u64::MAX exactly when
-        // `start + max_attempts` overflows. `mine` reports both "budget spent" and "end of the nonce
-        // space" as `PowNotFound`; only the first one can be resumed.
-        Err(BuildError::PowNotFound) if start.checked_add(max_attempts).is_none() => {
-            Err(BindError::new(
-                names::NONCE_SPACE_EXHAUSTED,
-                "every nonce up to 2^64 - 1 was tried: change the timestamp or payload and mine again",
-            ))
-        }
+        // Only a spent budget can be resumed; the end of the nonce space cannot.
+        Err(BuildError::NonceSpaceExhausted) => Err(BindError::new(
+            names::NONCE_SPACE_EXHAUSTED,
+            "every nonce up to 2^64 - 1 was tried: change the timestamp or payload and mine again",
+        )),
         Err(BuildError::PowNotFound) => Ok(None),
         Err(error) => Err(error.into()),
     }

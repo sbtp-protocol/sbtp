@@ -849,6 +849,10 @@ fn build_stops_at_its_attempt_budget() {
     );
     // The default budget is finite and large enough for the difficulties of the tests.
     assert_eq!(sbtp_core::DEFAULT_MAX_ATTEMPTS, 1 << 28);
+    assert_eq!(
+        BlockBuilder::for_key(&key).build(&key, 4).map(|_| ()),
+        Ok(())
+    );
     let block = BlockBuilder::for_key(&key)
         .max_attempts(1 << 16)
         .build(&key, 4)
@@ -912,9 +916,94 @@ fn exhaustion_advances_the_nonce_by_exactly_max_attempts() {
         .unwrap();
     assert_eq!(
         mine(&mut last, 256, 10),
-        Err(sbtp_core::BuildError::PowNotFound)
+        Err(sbtp_core::BuildError::NonceSpaceExhausted)
     );
     assert_eq!(parse(&last).unwrap().nonce(), u64::MAX);
+}
+
+/// Review finding: the end of the nonce space is its own error, not `PowNotFound`, so that a
+/// resume loop ends. Returned at exhaustion and by every later call that starts there.
+#[test]
+fn nonce_space_exhaustion_is_distinct_and_sticky() {
+    use sbtp_core::BuildError;
+    let key = key_a();
+    let at = |nonce| {
+        BlockBuilder::for_key(&key)
+            .nonce(nonce)
+            .build_unsigned()
+            .unwrap()
+    };
+    // A slice that stops one short of u64::MAX is a spent budget: resumable.
+    let mut block = at(u64::MAX - 2);
+    assert_eq!(mine(&mut block, 256, 2), Err(BuildError::PowNotFound));
+    assert_eq!(parse(&block).unwrap().nonce(), u64::MAX);
+    // The next slice tries u64::MAX and reaches the end, whatever budget is left.
+    assert_eq!(
+        mine(&mut block, 256, 1),
+        Err(BuildError::NonceSpaceExhausted)
+    );
+    assert_eq!(parse(&block).unwrap().nonce(), u64::MAX);
+    // Every later call that starts at exhaustion reports it again.
+    for budget in [1, 1_000, u64::MAX] {
+        assert_eq!(
+            mine(&mut block, 256, budget),
+            Err(BuildError::NonceSpaceExhausted)
+        );
+        assert_eq!(parse(&block).unwrap().nonce(), u64::MAX);
+    }
+    // A slice that crosses the end in one call.
+    let mut block = at(u64::MAX - 3);
+    assert_eq!(
+        mine(&mut block, 256, 10),
+        Err(BuildError::NonceSpaceExhausted)
+    );
+    // The resume loop of a slicing caller now ends.
+    let mut block = at(u64::MAX - 20);
+    let mut calls = 0;
+    let end = loop {
+        calls += 1;
+        match mine(&mut block, 256, 3) {
+            Err(BuildError::PowNotFound) => {}
+            other => break other,
+        }
+    };
+    assert_eq!(end, Err(BuildError::NonceSpaceExhausted));
+    assert_eq!(calls, 7);
+    // `build` reports it too.
+    assert_eq!(
+        BlockBuilder::for_key(&key).nonce(u64::MAX).build(&key, 256),
+        Err(BuildError::NonceSpaceExhausted)
+    );
+}
+
+/// Review finding: the default mining budget is counted in bytes hashed, so that the cost of one
+/// `build` call does not grow with the payload (spec §4, "Client bounds").
+#[test]
+fn default_mining_budget_is_independent_of_block_size() {
+    use sbtp_core::{DEFAULT_MINING_BUDGET_BYTES, default_max_attempts};
+    assert_eq!(DEFAULT_MINING_BUDGET_BYTES, 1 << 34);
+    // A root block hashes 54 bytes, counted as one 64-byte BLAKE3 block.
+    assert_eq!(default_max_attempts(MIN_BLOCK_LEN), 1 << 28);
+    assert_eq!(
+        default_max_attempts(MIN_BLOCK_LEN),
+        sbtp_core::DEFAULT_MAX_ATTEMPTS
+    );
+    assert_eq!(default_max_attempts(0), 1 << 28);
+    // The largest block hashes 65,845 bytes: attempts times bytes stays within the budget.
+    let hashed = (MAX_BLOCK_LEN - 64) as u64;
+    assert_eq!(hashed, 65_845);
+    let attempts = default_max_attempts(MAX_BLOCK_LEN);
+    assert_eq!(attempts, DEFAULT_MINING_BUDGET_BYTES / hashed);
+    assert!(attempts * hashed <= DEFAULT_MINING_BUDGET_BYTES);
+    assert!(attempts > 1 << 17);
+    for len in [MIN_BLOCK_LEN, 200, 1_088, 4_096, 30_000, MAX_BLOCK_LEN] {
+        let a = default_max_attempts(len);
+        let per = ((len - 64) as u64).max(64);
+        assert!(a * per <= DEFAULT_MINING_BUDGET_BYTES, "len {len}");
+        assert!((a + 1) * per > DEFAULT_MINING_BUDGET_BYTES, "len {len}");
+    }
+    // At least one attempt, whatever the length.
+    assert_eq!(default_max_attempts(usize::MAX), 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1271,6 +1360,7 @@ fn build_and_self_test_errors_display() {
         ),
         (BuildError::KeyMismatch, "does not match"),
         (BuildError::PowNotFound, "no nonce"),
+        (BuildError::NonceSpaceExhausted, "nonce space exhausted"),
         (BuildError::DifficultyTooHigh { difficulty: 257 }, "257"),
         (BuildError::Signing, "signing failed"),
     ];

@@ -45,7 +45,8 @@ mod verify;
 pub use block::{BlockRef, parse};
 pub use block_id::{BlockId, MAX_DIFFICULTY, compute_block_id};
 pub use builder::{
-    BlockBuilder, BuildError, DEFAULT_MAX_ATTEMPTS, mine, sign_block, sign_block_id,
+    BlockBuilder, BuildError, DEFAULT_MAX_ATTEMPTS, DEFAULT_MINING_BUDGET_BYTES,
+    default_max_attempts, mine, sign_block, sign_block_id,
 };
 pub use consts::{BLOCK_ID_CONTEXT, SIG_PREFIX, SIGNED_MESSAGE_LEN};
 pub use error::Error;
