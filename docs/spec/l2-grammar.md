@@ -47,6 +47,10 @@ The examples of this document are in CBOR diagnostic notation, for reading.
   application uses its own first label and documents its kinds in its own specification; it MUST NOT
   define a kind whose first label is `sbtp`. Application kinds are not registered here. An
   application's context strings follow the reserved prefixes of core spec §3.5.
+- **Undefined `sbtp.*` kinds.** A decoder MUST treat an `sbtp.*` kind that this specification does not
+  define as an unknown kind (last rule of this section): a later version may define it. The registry
+  rules still apply to it (§2.2). In particular, a later `sbtp.*` kind that uses `tagged` is invalid,
+  not unknown, for a decoder of this version. (ADR 0039 rule 5)
 - `edges` MUST be an array of 0 to 64 edges (§2). It MUST be present when empty.
 - `body` MUST be present. Its CBOR type is fixed by the kind. Every kind of §3 has a map body, possibly
   empty. A byte string body is allowed only for a kind whose definition says so.
@@ -408,6 +412,12 @@ the envelope through the tags it defines (§5.4).
   `p: 0` (`tagged`); an update adds the previous version as `p: 1` (`supersedes`). A key block whose tag
   does not match its PubKey is ignored for state resolution. The current key is the current version of
   the chain (§4.3).
+- **Tag and PubKey.** The match between a key block's directory tag and its PubKey is a state resolution
+  rule, not a grammar validation rule: grammar validation reads parent values only for the `block` rule
+  of §2.1 (§2.4). A client that reads a key directory MUST recompute the directory tag from the PubKey
+  of each listed block and ignore a block whose `tagged` parent differs; it MUST NOT rely on
+  `/query?parent=<tag>` alone. This check is what prevents an author from filing a key under another
+  identity's directory. (ADR 0039 rule 6)
 - A sender MUST seal to the current key it holds and MUST NOT seal to a retracted key (a retraction of
   any version retracts the chain, §4.2). A user SHOULD rotate at least every 90 days. A recipient keeps
   older private keys as long as it wants to read messages sealed to them, and MAY erase one once no relay
