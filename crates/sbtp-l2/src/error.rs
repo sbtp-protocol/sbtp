@@ -88,6 +88,9 @@ pub enum L2Error {
     /// A `rel` that is not a text string of 1 to 64 bytes, or an unknown verb (no `x.` prefix, not
     /// a registry verb) that is not one label (spec §2.3).
     InvalidVerb,
+    /// A `tagged` edge on a kind other than `sbtp.enc` and `sbtp.enc_key`, application kinds
+    /// included (spec §2.2, §5.4).
+    TaggedNotAllowed,
 
     // --- Kinds, spec §3, §3.1 and §2.5 ---
     /// The block's Parents Count is outside the range of its kind's row.
@@ -97,7 +100,8 @@ pub enum L2Error {
     /// A required edge of the kind's row is missing.
     MissingRequiredEdge,
     /// A registry verb appears more often than its kind's multiplicity allows: a required verb more
-    /// than once, an optional verb other than `cites` and `composed_of` more than once, more than
+    /// than once, an optional verb more than once on a row that does not allow it any number of
+    /// times, more than
     /// one edge of a `one_of` rule, or an extension or unknown verb on a kind whose edge set is
     /// closed (spec §3.1 and §2.3).
     EdgeMultiplicity,
@@ -111,14 +115,22 @@ pub enum L2Error {
     BodyFieldValue,
     /// An empty array that the CDDL declares `[+ ...]`, such as `chunks` (spec §2.5).
     BodyEmptyArray,
-    /// A body identifier (public key, `block_id`, `chunk_id`) that is a byte string of another
-    /// length than 32 bytes (spec §1.4).
+    /// A body identifier (public key, `block_id`, `chunk_id`) or another 32-byte body field (the
+    /// `enc` of `sbtp.enc`) that is a byte string of another length than 32 bytes (spec §1.4,
+    /// §2.5).
     BodyIdSize,
     /// An `sbtp.manifest` whose `chunk_size` is not 262,144 (spec §3).
     ManifestChunkSize,
     /// An `sbtp.manifest` whose `total_size` does not satisfy
     /// `(n − 1) × chunk_size < total_size ≤ n × chunk_size` for its `n` chunks (spec §3).
     ManifestTotalSize,
+    /// An `sbtp.enc` payload whose length is not 512, 2,048, 8,192 or 65,535 bytes (spec §5.2,
+    /// length buckets).
+    EncPayloadLen,
+    /// An `sbtp.enc` payload that is not 90 bytes plus its ciphertext `ct` (spec §5.2).
+    EncCiphertextLen,
+    /// An `sbtp.enc_key` whose `intro_bucket` is above 15 (spec §5.5).
+    EncKeyIntroBucket,
 }
 
 impl fmt::Display for L2Error {

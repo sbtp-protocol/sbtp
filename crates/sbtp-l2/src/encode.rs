@@ -109,6 +109,14 @@ fn body<'a>(body: &'a Body<'a>) -> Value<'a> {
             }
             Value::Map(m)
         }
+        Body::Enc(enc) => Value::Map(vec![
+            ("ct", Value::Bytes(enc.ct)),
+            ("enc", Value::Bytes(&enc.enc)),
+        ]),
+        Body::EncKey(key) => Value::Map(vec![
+            ("x25519", Value::Bytes(&key.x25519)),
+            ("intro_bucket", Value::Uint(u64::from(key.intro_bucket))),
+        ]),
         // An application body, encoded by its application; checked by `cbor::encode`.
         Body::Raw(raw) => Value::Raw(raw),
     }

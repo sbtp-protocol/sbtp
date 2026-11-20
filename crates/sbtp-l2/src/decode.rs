@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 use sbtp_core::BlockId;
 
 use crate::L2Error;
-use crate::body::{self, BAD, required};
+use crate::body::{self, BAD, closed_map, required};
 use crate::cbor::{self, Major, Reader};
-use crate::payload::{Body, CHUNK_SIZE, Edge, Manifest, Payload, Rel, Target};
+use crate::payload::{
+    Body, CHUNK_SIZE, ENC_OVERHEAD, ENC_PAYLOAD_LENS, Edge, Enc, EncKey, MAX_INTRO_BUCKET,
+    Manifest, Payload, Rel, Target,
+};
 
 /// Most edges in one payload (spec §1.3).
 pub const MAX_EDGES: u64 = 64;
@@ -20,7 +23,9 @@ pub const MAX_PARENTS: usize = 8;
 ///
 /// Applies spec §1.2 (CBOR profile), §1.3 (envelope), §2.1 to §2.3 (edges, registry, distinct
 /// `composed_of` sequence numbers, verb syntax, extension verbs, with the tolerance for an unknown
-/// verb), and, for the `sbtp.*` kinds of spec §3, their row (§3.1) and their body rule. It knows
+/// verb, `tagged` only on `sbtp.enc` and `sbtp.enc_key`), and, for the `sbtp.*` kinds of spec
+/// §3, their row (§3.1) and their body rule, with the length rules of `sbtp.enc` (§5.2). It
+/// opens no ciphertext and checks no key. It knows
 /// no application kind: the payload of any other kind passes with its body checked for type only,
 /// a map or a byte string, returned as [`Body::Raw`] for the application validation (spec §2.4).
 /// It reads no other block. Its cost is linear in the payload size (spec §2.4).
@@ -73,7 +78,7 @@ pub fn validate_l2_invariants<'a>(
     check_coverage(parents, &edges)?;
     check_distinct_seq(&edges)?;
     check_shape(kind, parents.len(), &edges)?;
-    let body = decode_body(kind, body_raw)?;
+    let body = decode_body(kind, body_raw, payload.len())?;
     Ok(Payload {
         kind: kind_str,
         edges,
@@ -120,14 +125,24 @@ fn is_kind(s: &str) -> bool {
         && labels >= 2
 }
 
-/// The kinds of spec §3 that this crate validates, parsed once from the `kind` string so that
-/// every dispatch on the kind is an exhaustive `match`. `sbtp.enc` and `sbtp.enc_key` are not
-/// implemented yet and are validated as unknown kinds.
+/// The kinds of spec §3, parsed once from the `kind` string so that every dispatch on the kind
+/// is an exhaustive `match`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    /// `sbtp.manifest` (spec §3).
     Manifest,
+    /// `sbtp.enc` (spec §5.2).
+    Enc,
+    /// `sbtp.enc_key` (spec §5.5).
+    EncKey,
     /// A well-formed kind outside spec §3, application kinds included (spec §1.3: checked against
     /// §1 and §2 only).
+    ///
+    /// This includes an `sbtp.*` kind that spec §3 does not define. The reserved prefix of spec
+    /// §1.3 binds authors (an application MUST NOT define such a kind); it gives a decoder no
+    /// rejection rule, and spec §2.4 passes "the payload of any other kind" with its body checked
+    /// for type only. A later version of the specification may define new `sbtp.*` kinds, which
+    /// an older client then validates as unknown and never applies to a resolved state.
     Unknown,
 }
 
@@ -135,6 +150,8 @@ impl Kind {
     fn parse(s: &str) -> Self {
         match s {
             "sbtp.manifest" => Self::Manifest,
+            "sbtp.enc" => Self::Enc,
+            "sbtp.enc_key" => Self::EncKey,
             _ => Self::Unknown,
         }
     }
@@ -147,23 +164,6 @@ fn is_extension_verb(s: &str) -> bool {
         && parts.next().is_some_and(is_label)
         && parts.next().is_some_and(is_label)
         && parts.next().is_none()
-}
-
-/// Reads a map item and calls `f` on each key; `f` returns `false` for a key it does not allow.
-fn fields<'a>(
-    r: &mut Reader<'a>,
-    not_map: L2Error,
-    unknown: L2Error,
-    mut f: impl FnMut(&'a str, &mut Reader<'a>) -> Result<bool, L2Error>,
-) -> Result<u64, L2Error> {
-    let n = r.expect(Major::Map, not_map)?;
-    for _ in 0..n {
-        let key = r.text(not_map)?;
-        if !f(key, r)? {
-            return Err(unknown);
-        }
-    }
-    Ok(n)
 }
 
 /// Which target forms a registry verb allows (spec §2.2).
@@ -187,7 +187,7 @@ fn edge<'a>(r: &mut Reader<'a>, n_parents: usize) -> Result<Edge<'a>, L2Error> {
     let mut target = None;
     let mut verb = None;
     let mut meta = None;
-    fields(r, L2Error::EdgeShape, L2Error::EdgeShape, |key, r| {
+    closed_map(r, L2Error::EdgeShape, L2Error::EdgeShape, |key, r| {
         match key {
             "p" => {
                 let p = r.uint(L2Error::EdgeTargetValue)?;
@@ -243,12 +243,20 @@ fn rel<'a>(verb: &'a str, target: Target, meta: Option<&'a [u8]>) -> Result<Rel<
         "in" => (Forms::P, Rel::In),
         "supersedes" => (Forms::P, Rel::Supersedes { reason: None }),
         "composed_of" => (Forms::Any, Rel::ComposedOf { seq: 0, mime: None }),
+        // spec §2.2: `p` only, no `meta`. The kinds it may appear on are checked in
+        // `check_shape` (spec §2.2, §5.4).
+        "tagged" => (Forms::P, Rel::Tagged),
         "replies_to" => (Forms::P, Rel::RepliesTo),
         "cites" => (Forms::BlockOrChunk, Rel::Cites { span: None }),
         "endorses" => (Forms::P, Rel::Endorses),
         "opposes" => (Forms::P, Rel::Opposes),
         "tombstones" => (Forms::P, Rel::Tombstones),
         "moderates" => (Forms::P, Rel::Moderates),
+        // spec §2.2: `p` only, no `meta`. "Allowed only on the one application kind that the
+        // application requesting the verb designates [...]; application validation checks it":
+        // grammar validation knows no application kind, so it checks the form and `meta` only.
+        // No `sbtp.*` row lists it, so it is refused on those kinds by their row.
+        "tallies" => (Forms::P, Rel::Tallies),
         "supports" => (Forms::P, Rel::Supports { confidence: None }),
         "refutes" => (Forms::P, Rel::Refutes { confidence: None }),
         "synthesizes" => (Forms::P, Rel::Synthesizes),
@@ -300,7 +308,7 @@ fn registry_meta<'a>(rel: Rel<'a>, meta: Option<&'a [u8]>) -> Result<Rel<'a>, L2
         },
         Rel::ComposedOf { .. } => {
             let (mut seq, mut mime) = (None, None);
-            fields(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
+            closed_map(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
                 match k {
                     "seq" => seq = Some(r.uint(BAD_META)?),
                     "mime" => mime = Some(r.text(BAD_META)?),
@@ -315,7 +323,7 @@ fn registry_meta<'a>(rel: Rel<'a>, meta: Option<&'a [u8]>) -> Result<Rel<'a>, L2
         }
         Rel::Cites { .. } => {
             let mut span = None;
-            fields(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
+            closed_map(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
                 Ok(k == "span" && {
                     span = Some(body::pair(r, BAD_META)?);
                     true
@@ -342,7 +350,7 @@ fn registry_meta<'a>(rel: Rel<'a>, meta: Option<&'a [u8]>) -> Result<Rel<'a>, L2
 /// The text value of a `meta` map whose only allowed key is `name`.
 fn one_text<'a>(r: &mut Reader<'a>, name: &str) -> Result<&'a str, L2Error> {
     let mut value = None;
-    fields(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
+    closed_map(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
         Ok(k == name && {
             value = Some(r.text(L2Error::MetaValue)?);
             true
@@ -354,7 +362,7 @@ fn one_text<'a>(r: &mut Reader<'a>, name: &str) -> Result<&'a str, L2Error> {
 /// `confidence`: 0 to 100 (spec §2.2).
 fn confidence(r: &mut Reader<'_>) -> Result<u8, L2Error> {
     let mut value = None;
-    fields(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
+    closed_map(r, L2Error::BadMeta, L2Error::MetaUnknownKey, |k, r| {
         Ok(k == "confidence" && {
             let c = r.uint(L2Error::MetaValue)?;
             value = Some(
@@ -424,21 +432,25 @@ fn check_distinct_seq(edges: &[Edge<'_>]) -> Result<(), L2Error> {
     }
 }
 
-/// Registry verbs a kind's row allows any number of times (spec §3.1); every other registry verb
-/// of a row appears at most once.
-const REPEATABLE: [&str; 2] = ["cites", "composed_of"];
-
 /// A kind's row (spec §3.1, read the same way for the `sbtp.*` kinds of spec §3 and for the rows
 /// of every application specification): Parents range, registry verbs allowed, required verbs
-/// (each exactly once), and the two per-kind rules that application tables state in words.
+/// (each exactly once), the optional verbs the row allows "any number" of times, and the two
+/// per-kind rules that application tables state in words.
+///
+/// Multiplicity is per row (spec §3.1: "an optional verb appears at most once, unless the row
+/// says 'any number'"): no verb repeats unless its row lists it in `repeatable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KindRow {
     /// The inclusive range of the Parents Count.
     pub parents: (usize, usize),
-    /// The registry verbs the row lists. Any other registry verb makes the payload invalid.
+    /// The optional registry verbs the row lists. Any registry verb outside `allowed` and
+    /// `required` makes the payload invalid.
     pub allowed: &'static [&'static str],
-    /// The verbs that appear exactly once.
+    /// The verbs that appear exactly once. They are allowed without being listed in `allowed`.
     pub required: &'static [&'static str],
+    /// The verbs of `allowed` that the row allows any number of times; every other verb of the
+    /// row appears at most once. A required verb appears exactly once even if listed here.
+    pub repeatable: &'static [&'static str],
     /// Exactly one edge among these verbs (for example `endorses` or `opposes`); empty if none.
     pub one_of: &'static [&'static str],
     /// The kind's edge set is closed: no extension or unknown verb (spec §2.3, §3.1).
@@ -446,7 +458,7 @@ pub struct KindRow {
 }
 
 impl KindRow {
-    /// A row with no `one_of` rule and an open edge set.
+    /// A row with no repeatable verb, no `one_of` rule and an open edge set.
     #[must_use]
     pub const fn new(
         parents: (usize, usize),
@@ -457,20 +469,38 @@ impl KindRow {
             parents,
             allowed,
             required,
+            repeatable: &[],
             one_of: &[],
             closed: false,
         }
+    }
+
+    /// The same row, with `verbs` allowed any number of times (spec §3.1, "any number").
+    #[must_use]
+    pub const fn repeatable(mut self, verbs: &'static [&'static str]) -> Self {
+        self.repeatable = verbs;
+        self
     }
 }
 
 /// Checks the edges and Parents Count against the row of an `sbtp.*` kind of spec §3. This is
 /// the single source of truth for those rows.
 fn check_shape(kind: Kind, n_parents: usize, edges: &[Edge<'_>]) -> Result<(), L2Error> {
+    // spec §2.2 and §5.4: `tagged` is allowed only on `sbtp.enc` and `sbtp.enc_key`. A rule of
+    // the registry, so it holds for every kind, unknown and application kinds included.
+    if !matches!(kind, Kind::Enc | Kind::EncKey) && edges.iter().any(|e| e.rel == Rel::Tagged) {
+        return Err(L2Error::TaggedNotAllowed);
+    }
     // spec §3, table "Kinds".
     let row = match kind {
         // spec §1.3: an unknown kind is checked against §1 and §2 only.
         Kind::Unknown => return Ok(()),
         Kind::Manifest => KindRow::new((0, 1), &["in"], &[]),
+        // spec §3 and §5.2: one parent, the delivery tag, named by the single `tagged` edge.
+        Kind::Enc => KindRow::new((1, 1), &[], &["tagged"]),
+        // spec §3 and §5.5: the directory tag (`tagged`), and on an update the previous version
+        // (at most one `supersedes`).
+        Kind::EncKey => KindRow::new((1, 2), &["supersedes"], &["tagged"]),
     };
     check_row(&row, n_parents, edges)
 }
@@ -487,27 +517,30 @@ pub fn check_row(row: &KindRow, n_parents: usize, edges: &[Edge<'_>]) -> Result<
         return Err(L2Error::KindParentCount); // spec §3.1, column "Parents"
     }
     let count = |verb: &str| edges.iter().filter(|e| e.rel.verb() == verb).count();
-    // spec §3.1: a registry verb outside the row makes the payload invalid. Extension and unknown
-    // verbs are outside every row (spec §2.3), with any target form.
-    if edges
-        .iter()
-        .any(|e| e.rel.is_registry() && !row.allowed.contains(&e.rel.verb()))
-    {
+    // spec §3.1: a registry verb outside the row makes the payload invalid; the row's verbs are
+    // its required and its optional ones. Extension and unknown verbs are outside every row
+    // (spec §2.3), with any target form.
+    if edges.iter().any(|e| {
+        let verb = e.rel.verb();
+        e.rel.is_registry() && !row.allowed.contains(&verb) && !row.required.contains(&verb)
+    }) {
         return Err(L2Error::EdgeNotAllowedForKind);
     }
     // spec §3.1: a required verb appears exactly once; a count of 0 is reported as missing, a
-    // count above 1 by the multiplicity check below.
+    // count above 1 as a multiplicity error, below.
     if row.required.iter().any(|v| count(v) == 0) {
         return Err(L2Error::MissingRequiredEdge);
     }
-    // spec §3.1: every registry verb of the row but `cites` and `composed_of` at most once.
-    // Extension and unknown verbs do not count (spec §2.3). A repeated verb whose extra edge needs
-    // a parent beyond the row's range is reported as `KindParentCount` above; the check is kept as
-    // defence in depth.
-    if row
-        .allowed
-        .iter()
-        .any(|v| !REPEATABLE.contains(v) && count(v) > 1)
+    // spec §3.1: a required verb exactly once; an optional verb at most once, unless the row
+    // allows it any number of times. Extension and unknown verbs do not count (spec §2.3). On a
+    // row whose Parents maximum is 1 or less, a second causal edge with the same verb already
+    // fails the Parents check above; on any other row, and for non-causal targets, this check is
+    // the one that enforces the multiplicity.
+    if row.required.iter().any(|v| count(v) > 1)
+        || row
+            .allowed
+            .iter()
+            .any(|v| !row.repeatable.contains(v) && !row.required.contains(v) && count(v) > 1)
     {
         return Err(L2Error::EdgeMultiplicity);
     }
@@ -527,8 +560,9 @@ pub fn check_row(row: &KindRow, n_parents: usize, edges: &[Edge<'_>]) -> Result<
     Ok(())
 }
 
-/// Decodes the body of a payload whose edges already passed [`check_shape`].
-fn decode_body(kind: Kind, raw: &[u8]) -> Result<Body<'_>, L2Error> {
+/// Decodes the body of a payload whose edges already passed [`check_shape`]. `payload_len` is
+/// the length of the whole payload, for the length rules of `sbtp.enc` (spec §5.2).
+fn decode_body(kind: Kind, raw: &[u8], payload_len: usize) -> Result<Body<'_>, L2Error> {
     let r = &mut Reader::new(raw);
     match kind {
         // spec §1.3 / §2.5: an unknown kind's body is a map or a byte string.
@@ -538,6 +572,8 @@ fn decode_body(kind: Kind, raw: &[u8]) -> Result<Body<'_>, L2Error> {
         },
         // spec §1.3: every kind of §3 has a map body (`body::fields` rejects any other type).
         Kind::Manifest => manifest(r).map(Body::Manifest),
+        Kind::Enc => enc(r, payload_len).map(Body::Enc),
+        Kind::EncKey => enc_key(r).map(Body::EncKey),
     }
 }
 
@@ -569,6 +605,54 @@ fn manifest<'a>(r: &mut Reader<'a>) -> Result<Manifest<'a>, L2Error> {
         chunks,
         duration_ms: duration,
         resolution,
+    })
+}
+
+/// spec §5.2 and CDDL `enc-body`: exactly `ct` (a byte string) and `enc` (32 bytes), then the
+/// length rules that `validate_l2_invariants` checks "from the payload and the header, with no
+/// key". Structure only: nothing is decrypted.
+fn enc<'a>(r: &mut Reader<'a>, payload_len: usize) -> Result<Enc<'a>, L2Error> {
+    let (mut ct, mut enc) = (None, None);
+    body::fields::<L2Error>(r, |k, r| {
+        match k {
+            "ct" => ct = Some(r.bytes(BAD)?),
+            "enc" => enc = Some(body::id(r)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    let (ct, enc) = (required(ct)?, required(enc)?);
+    // spec §5.2, length buckets: Payload Len is 512, 2,048, 8,192 or 65,535 bytes.
+    if !ENC_PAYLOAD_LENS.contains(&payload_len) {
+        return Err(L2Error::EncPayloadLen);
+    }
+    // spec §5.2: "the payload is 90 bytes plus the ciphertext". With the body and the single
+    // `tagged` edge fixed, only `ct` is free; any other edge or byte breaks this.
+    if ct.len().checked_add(ENC_OVERHEAD) != Some(payload_len) {
+        return Err(L2Error::EncCiphertextLen);
+    }
+    Ok(Enc { ct, enc })
+}
+
+/// spec §5.5 and CDDL `enc-key-body`: exactly `x25519` (32 bytes) and `intro_bucket` (0 to 15).
+fn enc_key(r: &mut Reader<'_>) -> Result<EncKey, L2Error> {
+    let (mut x25519, mut bucket) = (None, None);
+    body::fields::<L2Error>(r, |k, r| {
+        match k {
+            "x25519" => x25519 = Some(body::id(r)?),
+            "intro_bucket" => bucket = Some(r.uint(BAD)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    let (x25519, bucket) = (required(x25519)?, required(bucket)?);
+    let intro_bucket = u8::try_from(bucket)
+        .ok()
+        .filter(|&b| b <= MAX_INTRO_BUCKET)
+        .ok_or(L2Error::EncKeyIntroBucket)?; // spec §5.5: 0 to 15
+    Ok(EncKey {
+        x25519,
+        intro_bucket,
     })
 }
 

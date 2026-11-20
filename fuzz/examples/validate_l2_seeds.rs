@@ -24,6 +24,10 @@ use sbtp_l2::validate_l2_invariants;
 
 const A: [u8; 32] = [0xaa; 32];
 
+/// The ciphertext of the smallest `sbtp.enc` bucket: a 512-byte payload is 90 bytes plus `ct`
+/// (l2-grammar §5.2).
+const CT: [u8; 422] = [0x5a; 422];
+
 fn env<'a>(kind: &'a str, edges: Vec<V<'a>>, body: V<'a>) -> Vec<u8> {
     cbor::encode(&V::Map(vec![
         ("v", V::Uint(1)),
@@ -223,7 +227,24 @@ fn seeds() -> Vec<(&'static str, u8, Vec<u8>)> {
             1,
             env("other.thing", vec![e(0, "frobnicates")], V::Bytes(b"x")),
         ),
-        ("enc", 0, env("sbtp.enc", vec![], V::Bytes(b"ciphertext"))),
+        (
+            "enc",
+            1,
+            env(
+                "sbtp.enc",
+                vec![e(0, "tagged")],
+                map(&[("ct", V::Bytes(&CT)), ("enc", V::Bytes(&A))]),
+            ),
+        ),
+        (
+            "enc_key",
+            2,
+            env(
+                "sbtp.enc_key",
+                vec![e(0, "tagged"), e(1, "supersedes")],
+                map(&[("x25519", V::Bytes(&A)), ("intro_bucket", V::Uint(15))]),
+            ),
+        ),
         ("kind64", 0, env(&kind64, vec![], empty())),
         (
             "eight_parents",

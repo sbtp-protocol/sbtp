@@ -60,6 +60,8 @@ pub enum Rel<'a> {
         seq: u64,
         mime: Option<&'a str>,
     },
+    /// Filed under a delivery or directory tag; the target is not a block (spec §5.4).
+    Tagged,
     RepliesTo,
     Cites {
         span: Option<(u64, u64)>,
@@ -68,6 +70,10 @@ pub enum Rel<'a> {
     Opposes,
     Tombstones,
     Moderates,
+    /// A published count over the target's supersession chain. Grammar validation checks its
+    /// form; the one application kind that may carry it is checked by application validation
+    /// (spec §2.2).
+    Tallies,
     Supports {
         confidence: Option<u8>,
     },
@@ -104,12 +110,14 @@ impl<'a> Rel<'a> {
             Self::In => "in",
             Self::Supersedes { .. } => "supersedes",
             Self::ComposedOf { .. } => "composed_of",
+            Self::Tagged => "tagged",
             Self::RepliesTo => "replies_to",
             Self::Cites { .. } => "cites",
             Self::Endorses => "endorses",
             Self::Opposes => "opposes",
             Self::Tombstones => "tombstones",
             Self::Moderates => "moderates",
+            Self::Tallies => "tallies",
             Self::Supports { .. } => "supports",
             Self::Refutes { .. } => "refutes",
             Self::Synthesizes => "synthesizes",
@@ -131,6 +139,10 @@ impl<'a> Rel<'a> {
 pub enum Body<'a> {
     /// `sbtp.manifest` (spec §3).
     Manifest(Manifest<'a>),
+    /// `sbtp.enc`, the outer block of a sealed envelope (spec §5.2).
+    Enc(Enc<'a>),
+    /// `sbtp.enc_key`, an encryption key (spec §5.5).
+    EncKey(EncKey),
     /// The body of any other kind, application kinds included: a map or a byte string, as encoded,
     /// not interpreted (spec §1.3, §2.4). An application that defines the kind validates it; a
     /// client that does not know the kind MUST NOT apply the block to any resolved state.
@@ -152,3 +164,31 @@ pub struct Manifest<'a> {
 
 /// The only `chunk_size` of a manifest (spec §2.5, ADR 0010).
 pub const CHUNK_SIZE: u64 = 262_144;
+
+/// `sbtp.enc` body (spec §5.2, CDDL `enc-body`): its shape only. Grammar validation opens
+/// nothing: `ct` is not decrypted and `enc` is not checked as a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Enc<'a> {
+    /// The HPKE ciphertext.
+    pub ct: &'a [u8],
+    /// The HPKE encapsulated key, 32 bytes.
+    pub enc: Id,
+}
+
+/// `sbtp.enc_key` body (spec §5.5, CDDL `enc-key-body`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncKey {
+    /// The X25519 HPKE recipient key, 32 bytes.
+    pub x25519: Id,
+    /// 0 to [`MAX_INTRO_BUCKET`].
+    pub intro_bucket: u8,
+}
+
+/// The Payload Len values allowed for an `sbtp.enc` block (spec §5.2, length buckets).
+pub const ENC_PAYLOAD_LENS: [usize; 4] = [512, 2_048, 8_192, 65_535];
+
+/// An `sbtp.enc` payload is this many bytes plus its ciphertext (spec §5.2).
+pub const ENC_OVERHEAD: usize = 90;
+
+/// The largest `intro_bucket` of an `sbtp.enc_key` (spec §5.5, CDDL `0..15`).
+pub const MAX_INTRO_BUCKET: u8 = 15;
