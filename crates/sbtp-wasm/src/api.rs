@@ -160,16 +160,19 @@ pub(crate) fn array32(what: &str, bytes: &[u8]) -> Result<[u8; 32], BindError> {
 /// Splits a flat concatenation of parent identifiers. Refuses a ragged length, and more than 8
 /// parents before allocating anything.
 pub(crate) fn split_parents(flat: &[u8]) -> Result<Vec<BlockId>, BindError> {
-    if flat.len() % HASH_LEN != 0 {
+    if !flat.len().is_multiple_of(HASH_LEN) {
         return Err(BindError::length("parents", "a multiple of 32", flat.len()));
     }
     let count = flat.len() / HASH_LEN;
     if count > usize::from(MAX_PARENTS) {
         return Err(BuildError::TooManyParents { count }.into());
     }
-    flat.chunks_exact(HASH_LEN)
-        .map(|chunk| array32("parent", chunk).map(BlockId::from))
-        .collect()
+    Ok(flat
+        .as_chunks::<HASH_LEN>()
+        .0
+        .iter()
+        .map(|id| BlockId::from(*id))
+        .collect())
 }
 
 /// Format-only decoding (spec §2.2 F1 to F9). The result is **not** authenticated.
