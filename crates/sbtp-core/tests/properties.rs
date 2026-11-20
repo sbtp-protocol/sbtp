@@ -361,3 +361,47 @@ fn structured_strategy_reaches_the_late_checks() {
     assert!(trailing > 5, "F8: {trailing}");
     assert!(too_many > 5, "F5: {too_many}");
 }
+
+// Inner signature of a sealed payload (`l2-grammar.md` §5.3).
+proptest! {
+    /// The builder writes the four fields then `msg`, and a signature by key A verifies.
+    #[test]
+    fn sealed_sig_layout_and_round_trip(
+        outer in any::<[u8; 32]>(),
+        id in any::<[u8; 32]>(),
+        x in any::<[u8; 32]>(),
+        msg in vec(any::<u8>(), 0..2_048),
+    ) {
+        let mut buf = vec![0u8; sbtp_core::SEALED_SIG_FIXED_LEN + msg.len()];
+        let m = sbtp_core::sealed_sig_message(&outer, &id, &x, &msg, &mut buf).unwrap();
+        let expected = [
+            &sbtp_core::SEALED_SIG_PREFIX[..], &outer[..], &id[..], &x[..], &msg[..],
+        ]
+        .concat();
+        prop_assert_eq!(m.as_bytes(), &expected[..]);
+        let sig = sbtp_core::sign_sealed(&key_a(), &m).unwrap();
+        let from = key_a().verifying_key().to_bytes();
+        prop_assert_eq!(sbtp_core::verify_sealed(&from, &sig, &m), Ok(()));
+    }
+
+    /// Arbitrary sender keys, signatures and buffers: never a panic, and a random signature is
+    /// never accepted.
+    #[test]
+    fn sealed_sig_arbitrary_inputs(
+        from in any::<[u8; 32]>(),
+        sig in vec(any::<u8>(), 64),
+        msg in vec(any::<u8>(), 0..512),
+        buf_len in 0usize..700,
+    ) {
+        let sig: [u8; 64] = sig.try_into().unwrap();
+        let mut buf = vec![0u8; buf_len];
+        let outer = [0x11; 32];
+        match sbtp_core::sealed_sig_message(&outer, &outer, &outer, &msg, &mut buf) {
+            Ok(m) => prop_assert!(sbtp_core::verify_sealed(&from, &sig, &m).is_err()),
+            Err(e) => prop_assert!(
+                matches!(e, sbtp_core::SealedSigError::BufferTooSmall { .. }),
+                "{e:?}"
+            ),
+        }
+    }
+}

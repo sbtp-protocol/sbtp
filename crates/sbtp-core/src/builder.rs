@@ -469,7 +469,8 @@ pub fn sign_block(block: &mut [u8], key: &SigningKey) -> Result<BlockId, BuildEr
     Ok(id)
 }
 
-/// Signs `SIG_PREFIX ‖ id` (spec §3.2). This is the only message an SBTP key signs (ADR 0002 rule 8).
+/// Signs `SIG_PREFIX ‖ id` (spec §3.2). Besides the inner signature of a sealed payload
+/// ([`crate::sign_sealed`], ADR 0016), this is the only message an SBTP key signs (ADR 0002 rule 8).
 ///
 /// # Errors
 ///

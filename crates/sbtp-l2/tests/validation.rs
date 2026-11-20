@@ -1086,11 +1086,93 @@ fn sealed_block_row_body_and_buckets() {
     assert_eq!(err(1, &bytes), E::EncPayloadLen);
     let tiny = env("sbtp.enc", tagged(), enc_body(b"ciphertext", &A));
     assert_eq!(err(1, &tiny), E::EncPayloadLen);
-    // A payload of a bucket's length that is not 90 bytes plus `ct`: an extra edge took the
-    // place of ciphertext bytes.
-    let padded = sealed(512, vec![en("chunk", &A, "x.a.b")]);
-    assert_eq!(padded.len(), 512);
-    assert_eq!(err(1, &padded), E::EncCiphertextLen);
+
+    // The edge set is closed (spec §5.2, ADR 0039 rule 4): an extra non-causal extension or
+    // unknown edge, in a payload of a bucket's length, fails on the row before the length rules
+    // (it used to fail with `EncCiphertextLen`).
+    for rel in ["x.a.b", "later"] {
+        for key in ["chunk", "block"] {
+            let padded = sealed(512, vec![en(key, &A, rel)]);
+            assert_eq!(padded.len(), 512);
+            assert_eq!(err(1, &padded), E::EdgeMultiplicity, "{key} {rel}");
+        }
+    }
+    // The flag is what refuses it: the same row without `closed` accepts the edge.
+    let edges = [
+        Edge {
+            target: Target::Parent(0),
+            rel: Rel::Tagged,
+        },
+        Edge {
+            target: Target::Chunk(A),
+            rel: Rel::Extension {
+                verb: "x.a.b",
+                meta: None,
+            },
+        },
+    ];
+    let open = KindRow::new((1, 1), &[], &["tagged"]);
+    assert_eq!(check_row(&open, 1, &edges), Ok(()));
+    assert_eq!(
+        check_row(&open.closed(), 1, &edges),
+        Err(E::EdgeMultiplicity)
+    );
+}
+
+#[test]
+fn encryption_key_parent_positions() {
+    let key = || enc_key_body(&A, V::Uint(7));
+    // spec §5.5, ADR 0039 rule 1: the `tagged` edge is `p: 0`. Swapped positions pass the row
+    // (one `tagged`, one `supersedes`) and the coverage rule, and fail here.
+    assert_eq!(
+        err(
+            2,
+            &env(
+                "sbtp.enc_key",
+                vec![e(0, "supersedes"), e(1, "tagged")],
+                key()
+            )
+        ),
+        E::EncKeyTagPosition
+    );
+    // An extension causal verb at `p: 0` and `tagged` at `p: 1`: rule 1 is checked first.
+    assert_eq!(
+        err(
+            2,
+            &env("sbtp.enc_key", vec![e(0, "x.a.b"), e(1, "tagged")], key())
+        ),
+        E::EncKeyTagPosition
+    );
+    // spec §5.5, ADR 0039 rule 2: with 2 parents, `p: 1` is `supersedes`, not an extension or
+    // unknown causal verb.
+    for rel in ["x.a.b", "later"] {
+        assert_eq!(
+            err(
+                2,
+                &env("sbtp.enc_key", vec![e(0, "tagged"), e(1, rel)], key())
+            ),
+            E::EncKeySupersedesPosition,
+            "{rel}"
+        );
+    }
+    // Positive cases: a root and an update, each with a non-causal extension or unknown edge
+    // (the edge set stays open for non-causal edges).
+    ok(
+        1,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged"), en("block", &A, "x.a.b")],
+            key(),
+        ),
+    );
+    ok(
+        2,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged"), e(1, "supersedes"), en("chunk", &A, "later")],
+            key(),
+        ),
+    );
 }
 
 #[test]
@@ -1115,10 +1197,15 @@ fn encryption_key_row_and_body() {
             key(),
         ),
     );
-    // The row is open: extension verbs are allowed (spec §2.3, §3.1).
+    // The row is open to non-causal extension verbs (spec §2.3, §3.1); the causal positions are
+    // fixed (`encryption_key_parent_positions`).
     ok(
-        2,
-        &env("sbtp.enc_key", vec![e(0, "tagged"), e(1, "x.a.b")], key()),
+        1,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged"), en("block", &A, "x.a.b")],
+            key(),
+        ),
     );
     // Row: 1 or 2 parents, exactly one `tagged`, at most one `supersedes`, nothing else.
     assert_eq!(
