@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
 use sbtp_core::layout::MAX_BLOCK_LEN;
@@ -644,9 +644,15 @@ pub async fn put_block<I: IndexBackend + 'static>(
 /// rule 4). A cache hit takes no permit (ADR 0018 rule 18) and verifies nothing (ADR 0023 rule 11);
 /// a miss takes a block-read permit, in which the file is fully validated (rule 10). axum routes
 /// `HEAD` here too and drops the body: same pipeline, permit and headers (rule 13).
+///
+/// A `200` carries `ETag: "<block_id>"`, a strong validator: the bytes served for a `block_id` never
+/// change (spec §3.4). A request whose `If-None-Match` matches it gets `304 Not Modified` with the
+/// same validator and `Cache-Control`, and no body (RFC 9110 §13.1.2, §15.4.5), once the block is
+/// known to be held: a block the relay no longer holds is `404`, whatever the condition.
 pub async fn get_block<I: IndexBackend + 'static>(
     State(relay): State<Arc<Relay<I>>>,
     uri: Uri,
+    headers: HeaderMap,
 ) -> Response {
     let Some(id) = uri
         .path()
@@ -658,7 +664,7 @@ pub async fn get_block<I: IndexBackend + 'static>(
             .into_response();
     };
     if let Some(bytes) = relay.cache.get(&id) {
-        return block_response(bytes);
+        return block_response(bytes, &id, &headers);
     }
     let permit = match relay.read.acquire().await {
         Ok(p) => p,
@@ -673,7 +679,7 @@ pub async fn get_block<I: IndexBackend + 'static>(
     match loaded {
         Ok(Ok(Some(bytes))) => {
             relay.cache.insert(&id, bytes.clone());
-            block_response(bytes)
+            block_response(bytes, &id, &headers)
         }
         Ok(Ok(None)) => ApiError::not_found().into_response(),
         Ok(Err(())) => ApiError::internal().into_response(),
@@ -681,20 +687,47 @@ pub async fn get_block<I: IndexBackend + 'static>(
     }
 }
 
-fn block_response(bytes: Bytes) -> Response {
-    let mut r = Response::new(Body::from(bytes));
+/// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`.
+fn block_response(bytes: Bytes, id: &BlockId, request: &HeaderMap) -> Response {
+    let etag = format!("\"{}\"", store::hex(id));
+    let mut r = if none_match(request, &etag) {
+        let mut r = Response::new(Body::empty());
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        r
+    } else {
+        let mut r = Response::new(Body::from(bytes));
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        r
+    };
     let h = r.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
     // ADR 0012 rule 32, ADR 0023 rule 13: only bytes that passed full validation, or C2 and C3,
     // reach this point.
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
+    // 64 hexadecimal digits in quotes: always a valid header value.
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        h.insert(header::ETAG, v);
+    }
     r
+}
+
+/// Whether `If-None-Match` in `request` matches `etag` (RFC 9110 §13.1.2): `*`, or a listed
+/// entity tag equal to it under the weak comparison this header uses (a `W/` prefix is ignored).
+/// Every field line counts; a line that is not visible ASCII is ignored. Tags are split at commas:
+/// a client tag that contains a comma can only fail to match, never match ours, which has none.
+fn none_match(request: &HeaderMap, etag: &str) -> bool {
+    request
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
 }
 
 #[cfg(test)]
@@ -715,6 +748,30 @@ mod tests {
         for k in 0..=u8::MAX {
             assert_eq!(stripe(&id(k)), usize::from(k) % ID_STRIPES);
         }
+    }
+
+    /// RFC 9110 §13.1.2: `*`, the exact tag, its weak form, any element of a list or of a second
+    /// field line match; another tag, an unquoted id, another case and no header do not.
+    #[test]
+    fn if_none_match_forms() {
+        let etag = format!("\"{}\"", "ab".repeat(32));
+        let check = |lines: &[&str]| {
+            let mut h = HeaderMap::new();
+            for l in lines {
+                h.append(header::IF_NONE_MATCH, HeaderValue::from_str(l).unwrap());
+            }
+            none_match(&h, &etag)
+        };
+        assert!(check(&["*"]));
+        assert!(check(&[&etag]));
+        assert!(check(&[&format!("W/{etag}")]));
+        assert!(check(&[&format!("\"x\", {etag} ,\"y\"")]));
+        assert!(check(&["\"x\"", &etag]));
+        assert!(!check(&[]));
+        assert!(!check(&["\"x\""]));
+        assert!(!check(&[&"ab".repeat(32)]), "unquoted");
+        assert!(!check(&[&format!("\"{}\"", "AB".repeat(32))]), "case");
+        assert!(!check(&["\"x,\""]));
     }
 
     /// ADR 0018 clarification M1: an orphan repair that the writer queue refuses (the relay is

@@ -448,7 +448,8 @@ pub fn quarantine_files() -> u64 {
 }
 
 /// Counts the response of a request on `route` with `status`. Statuses outside `2xx`, `4xx` and
-/// `5xx` (the relay sends none) are not counted.
+/// `5xx` are not counted: the only other one the relay sends is the `304` of a conditional
+/// `GET /block`, and the classes of ADR 0021 rule 41 have no `3xx`.
 pub fn request(route: Route, status: StatusCode) {
     let class = match status.as_u16() {
         200..=299 => 0,

@@ -56,6 +56,9 @@ Initial public version. Pre-release software: no version is supported for produc
 
 - `sbtp-relay`: `GET /sbtp/v1/info` carries `Cache-Control: no-store`, so that a CDN in front of the
   relay never serves settings from before a restart.
+- `sbtp-relay`: `GET /sbtp/v1/block/{block_id}` sends `ETag: "<block_id>"` and answers a matching
+  `If-None-Match` (a list, a weak tag or `*`) with `304 Not Modified`, for a block it holds. Spec §4
+  gains the corresponding `MAY`.
 
 ### Security
 
