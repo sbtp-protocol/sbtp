@@ -1,0 +1,130 @@
+[workspace]
+members = [
+    "crates/sbtp-core",
+    "crates/sbtp-relay",
+    "crates/sbtp-l2",
+    "crates/sbtp-wasm",
+    "examples/cli-demo",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["The SBTP Contributors"]
+license = "MIT OR Apache-2.0"
+
+# Vetted dependencies. A member crate uses them via `xxx.workspace = true`.
+# Adding a dependency = one line here, after checking (Context7 + crates.io),
+# never a git dependency or a "*" version. Cargo.lock is committed.
+# Versions taken from crates.io on 2026-11-18.
+[workspace.dependencies]
+sbtp-core = { path = "crates/sbtp-core", version = "0.1.0", default-features = false }
+
+# Core (no_std)
+blake3 = { version = "1.8.7", default-features = false }
+# ADR 0003: never enable the `batch` or `legacy_compatibility` features (also denied in deny.toml).
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+zerocopy = { version = "0.8.63", features = ["derive"] }
+
+# Relay
+tokio = { version = "1.54.1", features = ["full"] }
+axum = "0.8.9"
+tower-http = { version = "0.7.1", default-features = false, features = ["cors", "catch-panic"] }
+# ADR 0018 accept loop: hyper's HTTP/1.1 server builder (no HTTP/2: rule 27) and hyper-util's tokio
+# adapters. Both were already in the graph through axum. `hyper_util::server::conn::auto` is not
+# used: its feature `server-auto` forces HTTP/2 (and the `h2` crate) into the build.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body = "1.1.0"
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+serde_json = "1.0.154"
+# Relay configuration file (ADR 0018 rule 6): parsed into a `toml::Table` only, no serde derive
+# (`toml::Table` and `toml::Value` need the `serde` feature; `serde_core` is already in the graph).
+toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
+# `accept` error classes (EMFILE, ENFILE, ENOBUFS, ENOMEM): constants only, no `unsafe`. Already in
+# the graph through tokio.
+libc = "0.2.191"
+# Relay index backend (ADR 0013 rules 22 to 26). Exact pin, default features only (no `experimental-*`,
+# never `Builder::set_concurrency_mode()`). 4.6.0 is younger than two weeks: owner-approved exception of
+# 2026-11-18, see docs/security/dependency-exceptions.md and docs/security/2026-11-18-redb-4.6-exception.md.
+# Needs Rust 1.90.
+redb = "=4.6.0"
+
+# CLI (examples/cli-demo)
+# Blocking HTTP/1.1 client. No default features: no TLS (rustls, ring, webpki-roots), no gzip, no
+# JSON. Exact pin: 3.5.2 is younger than two weeks (2026-11-12). Adds base64, ureq-proto and
+# utf8-zero to the graph; http, httparse, log and percent-encoding were already in it.
+ureq = { version = "=3.5.1", default-features = false }
+# Wipes the secret key material the CLI reads. Already in the graph through ed25519-dalek.
+zeroize = "1.9.1"
+# The end-to-end test of the CLI starts the relay in-process (dev-dependency only).
+sbtp-relay = { path = "crates/sbtp-relay", version = "0.1.0" }
+
+# WASM (crates/sbtp-wasm). Versions checked on crates.io on 2026-11-19 (wasm-bindgen and js-sys
+# published 2026-10-30, getrandom 2026-06-17); all three were already in Cargo.lock. wasm-bindgen
+# and js-sys are released together (js-sys pins `=0.2.130`).
+wasm-bindgen = "0.2.130"
+# Only `Error` (to throw JS errors named after the sbtp-core variant) and `Uint8Array` (to check an
+# input's length before copying it into WASM memory). No default features: no `unsafe-eval`
+# (`Function` and `eval` bindings), no futures.
+js-sys = { version = "0.3.107", default-features = false }
+# Entropy of the demo key generator of sbtp-wasm. `wasm_js` only has an effect on
+# wasm32-unknown-unknown, where it calls Web Crypto `crypto.getRandomValues` through wasm-bindgen
+# (since 0.3.4 the feature alone selects that backend, no `--cfg getrandom_backend`). Natively it
+# reads the OS source. Already in the graph through proptest and tempfile (dev only until now).
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+
+# Tests & benches
+proptest = "1.12.0"
+criterion = "0.8.2"
+
+# ADR 0013 "Build": the profile that ships and that the benchmark gate applies to. `panic = "abort"`
+# MUST NOT be used: one panicking request must not stop the relay. Exception: a panic inside an index
+# job ends the process (ADR 0018 rule 37), see crates/sbtp-relay/src/pool.rs.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# Defence in depth: in our own crates an unexpected integer overflow panics (the task fails)
+# instead of wrapping silently. Layer 0 already uses checked arithmetic on all parsed values
+# (security reviews m1, m2). Scoped to the workspace crates, not to dependencies: upstream crates
+# (redb, tokio, hyper...) are tested and shipped with release semantics, where overflow wraps;
+# turning it into a panic there would add panic paths their authors never exercised, and a panic
+# inside redb leaves its internal locks poisoned (`lock().unwrap()`), so every later index call
+# would fail too (security review 2026-11-18, F-7).
+[profile.release.package.sbtp-core]
+overflow-checks = true
+
+[profile.release.package.sbtp-relay]
+overflow-checks = true
+# A package override does not inherit `strip` from `[profile.release]`: without this line cargo
+# passes `-C strip=debuginfo` (its default when debuginfo is off) to the binary, and the shipped
+# relay keeps its symbol table. Checked with `cargo build --release -v` (cargo 1.100).
+strip = true
+
+[profile.release.package.sbtp-wasm]
+overflow-checks = true
+# No `strip` here: it also drops the `target_features` custom section the wasm-bindgen CLI reads.
+# The `name` section is removed later in the pipeline (wasm-bindgen, then `wasm-opt`), see
+# crates/sbtp-wasm/README.md.
+
+[profile.release.package.sbtp-l2]
+overflow-checks = true
+
+[profile.release.package.cli-demo]
+overflow-checks = true
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+indexing_slicing = "warn"
+unwrap_used = "warn"

@@ -1,0 +1,38 @@
+[package]
+name = "sbtp-core"
+description = "SBTP layer 0: binary block format, BLAKE3 block_id, Ed25519 signature, proof of work. no_std."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = []
+# Tooling only: builds the interoperability vector generator (`examples/gen_vectors.rs`), which
+# needs `hazmat` (raw_sign with a chosen verifying key) and `digest` (SHA-512) to forge the
+# mixed-order public key cases. Neither changes verification (review 2026-11-18, L-1); `batch`
+# and `legacy_compatibility` stay forbidden (ADR 0003 rules 14, 15). Never enable it in a shipped
+# build: tests, benches and binaries run on the plain `fast, zeroize` feature set.
+vector-gen = ["std", "ed25519-dalek/hazmat", "ed25519-dalek/digest"]
+
+[dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[example]]
+name = "gen_vectors"
+required-features = ["vector-gen"]
+
+[[bench]]
+name = "core"
+harness = false
+
+[lints]
+workspace = true

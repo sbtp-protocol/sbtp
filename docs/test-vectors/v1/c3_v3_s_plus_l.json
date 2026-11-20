@@ -1,0 +1,7 @@
+{
+  "name": "c3_v3_s_plus_l",
+  "description": "The block of vector self_test_valid with S replaced by S + L, L = 2^252 + 27742317777372353535851937790883648493 (V3). Mandatory; replayed at start-up (ADR 0003 rule 16); exported by sbtp-core as S_PLUS_L_BLOCK. Accepted only by a verifier that does not enforce S < L. Signature criteria (spec 3.2, evaluated by the generator): fails V3; holds V1, V2, V4, V5, V6 (V6 evaluated with S mod L).",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000553202b204cfb6307494d2cfd35820ab39f5258b5b2ced9935db2b646b156bbd61d7336fc271e18d417fd0966836732082062ab199074cedce983c54186ad255dcfa4b13314",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "f0ce4441bcd0475f18e071862d24ae65277fe5ecadcad803100bb9d85049755d", "signed_message_hex": "534254502d76312d626c6f636b2d736967f0ce4441bcd0475f18e071862d24ae65277fe5ecadcad803100bb9d85049755d", "error": "InvalidSignature" }
+}

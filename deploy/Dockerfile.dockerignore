@@ -1,0 +1,14 @@
+# Build context of deploy/Dockerfile (BuildKit reads `<Dockerfile>.dockerignore`): the workspace
+# manifests and the Rust sources, nothing else (no target/, no .git, no keys, no web/).
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+!examples
+**/target
+**/pkg
+**/node_modules
+**/*.key
+**/*.pem
+**/.env
+**/.env.*

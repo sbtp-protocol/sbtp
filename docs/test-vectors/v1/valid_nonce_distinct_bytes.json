@@ -1,0 +1,7 @@
+{
+  "name": "valid_nonce_distinct_bytes",
+  "description": "Valid. Nonce 0x0102030405060708, encoded big-endian as bytes 01 .. 08 at offset 11 (ADR 0001). Signed by key A (public seed 32 x 0x01), timestamp 1700000000000. Signature criteria (spec 3.2, evaluated by the generator): V1 to V6 all hold.",
+  "block_hex": "5342010000018bcfe5680001020304050607088a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000056e6f6e63654dfca38973a245825881f2cf2bf61eea93f8bad2d247d71b94c4ff3b7f68a8760669987509a1077ad6089bb3e7403ca043f99d0ada366fa5db5ca6cbe4283a02",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": true, "block_id": "74c8c5bc119635d90b481f41a6805d6c17078b8f01a4d79293e8c765da53e331", "signed_message_hex": "534254502d76312d626c6f636b2d73696774c8c5bc119635d90b481f41a6805d6c17078b8f01a4d79293e8c765da53e331", "error": null }
+}

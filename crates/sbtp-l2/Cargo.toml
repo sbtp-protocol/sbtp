@@ -1,0 +1,20 @@
+[package]
+name = "sbtp-l2"
+description = "SBTP layer 2, generic part: grammar payloads, deterministic CBOR, validate_l2_invariants, kind rows, sbtp.* kinds. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# No CBOR crate: the ADR 0011 profile is checked and encoded by `src/cbor.rs`.
+[dependencies]
+sbtp-core.workspace = true
+
+[dev-dependencies]
+# Builds real blocks in the tests (`BlockBuilder::build_unsigned` needs `std`).
+sbtp-core = { workspace = true, features = ["std"] }
+proptest.workspace = true
+
+[lints]
+workspace = true

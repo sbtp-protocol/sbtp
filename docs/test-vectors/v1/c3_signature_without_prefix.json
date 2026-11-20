@@ -1,0 +1,7 @@
+{
+  "name": "c3_signature_without_prefix",
+  "description": "No parent, payload \"raw\"; signature by key A (public seed 32 x 0x01) over the 32 raw block_id bytes, without SIG_PREFIX (ADR 0002). Signature criteria (spec 3.2, evaluated by the generator): fails V6; holds V1, V2, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000003726177f2e8924f371293d33717355c6b8e85e33ce38f64674840ad052275ef99837e5cadcfd7519cdceb58601c4b16592dbffc8b4a19992a1e0e101cf4d9225f289204",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "2bf7d97cf01accaae3027750e4795a8da447b209f84efa7b459cf188ec99e4a4", "signed_message_hex": "534254502d76312d626c6f636b2d7369672bf7d97cf01accaae3027750e4795a8da447b209f84efa7b459cf188ec99e4a4", "error": "InvalidSignature" }
+}

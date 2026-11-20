@@ -1,0 +1,28 @@
+[package]
+name = "sbtp-relay"
+description = "SBTP dumb relay: validation (format, PoW, Ed25519), content-addressed flat-file storage, LRU cache, HTTP/WS API."
+version.workspace = true
+edition.workspace = true
+# ADR 0013 rule 25: redb 4.x requires Rust 1.90. The workspace value stays 1.85 for the other crates.
+rust-version = "1.90"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sbtp-core = { workspace = true, features = ["std"] }
+# ADR 0021 rule 13: the keyed client tag. Already in the graph through sbtp-core.
+blake3.workspace = true
+redb.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body.workspace = true
+tower.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

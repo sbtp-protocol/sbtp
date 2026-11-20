@@ -1,0 +1,7 @@
+{
+  "name": "c3_v6_cofactored_only",
+  "description": "PubKey A' = a*B + T as in vector valid_mixed_order_pubkey, nonce 14. k = SHA-512(R || A' || M) mod L is not 0 mod 8, so [S]B - [k]A' = R - [k]T differs from R: the cofactorless equation fails, the cofactored one [8][S]B = [8]R + [8][k]A' holds (V6). The unreduced digest is 0 mod 8: a verifier that skips the reduction accepts it. Signature criteria (spec 3.2, evaluated by the generator): fails V6; holds V1, V2, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe56800000000000000000e9ea3f11f5bd34f0cd7147fd0a436c088f624c6100c1df6a53c0a29e05d60cea000000b6d69786564206f726465725894a4d5d2781ffa54d62104b85ef96d728b253ff68cbdccccb3120db0dcf30c528f81ae4293e3f0cac480f0ddc4e37605dfdbd823f36d2f2c05227ee1fbdb0b",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "f2e39e857d1c5e0e68a6e31a32ba3f4cbfb5cca97c5677e019c9580fd2f43318", "signed_message_hex": "534254502d76312d626c6f636b2d736967f2e39e857d1c5e0e68a6e31a32ba3f4cbfb5cca97c5677e019c9580fd2f43318", "error": "InvalidSignature" }
+}

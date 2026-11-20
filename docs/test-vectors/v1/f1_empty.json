@@ -1,0 +1,7 @@
+{
+  "name": "f1_empty",
+  "description": "Empty buffer. F1.",
+  "block_hex": "",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "TooShort" }
+}

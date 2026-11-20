@@ -1,0 +1,7 @@
+{
+  "name": "c3_v5_r_small_order_order8_c_and_v6",
+  "description": "R replaced by the small-order point 26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05 (V5). No parent, payload \"c3\", key A (public seed 32 x 0x01), S of the valid signature. Combined case: V6 fails too. V5 alone is isolated by vector c3_v5_only_r_order8_c. Signature criteria (spec 3.2, evaluated by the generator): fails V5, V6; holds V1, V2, V3, V4.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000002633326e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05dfbb7b15c403fff7e183cf4a7a73505b21c6db17cbb807eac14fd3a57b23330a",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "07b5e5961ec6ba018cbabb47bb82a928f6a1c3632de7a09d9e346322166aa303", "signed_message_hex": "534254502d76312d626c6f636b2d73696707b5e5961ec6ba018cbabb47bb82a928f6a1c3632de7a09d9e346322166aa303", "error": "InvalidSignature" }
+}

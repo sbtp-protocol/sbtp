@@ -1,0 +1,7 @@
+{
+  "name": "f7_truncated_in_payload",
+  "description": "A valid block with no parent and a 200-byte payload cut after 150 payload bytes: 204 bytes, 318 expected. F7.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000c80726456483a2c1e004234261809fbedd01203f5e7d9cbbdaf91d3c5b7a99b8d7f61a39587796b5d4f31736557493b2d1f01433527190afceed11304f6e8daccbea0e2d4c6b8aa9c8e70b2a496887a6c5e40827466584a3c2e10524436281a0bfde0221405f7e9dbcdbfa1e3d5c7b9ab9d8f71b3a597897b6d5f41837567594b3d2f11534537291b0cfee1231506f8eadcceb0f2e4d6c",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "Truncated" }
+}

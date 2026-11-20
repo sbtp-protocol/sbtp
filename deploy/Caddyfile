@@ -1,0 +1,61 @@
+# Caddy in front of a demo sbtp-relay on a bare VM (ADR 0019 rules 18, 34, 42 and 43; ADR 0030).
+# Not used on K3s or Coolify, where Traefik is the reverse proxy (deploy/README.md). The relay runs
+# on the same host and Caddy reaches it on 127.0.0.1:8080.
+#
+# Run: SBTP_RELAY_DOMAIN=relay.example.org caddy run --config deploy/Caddyfile
+# The domain's DNS record points at this host and ports 80 and 443 are open: Caddy obtains and
+# renews the certificate itself (automatic HTTPS).
+#
+# Directive names checked against the Caddy documentation (Context7, 2026-11-20).
+{
+	# No admin API: any local process could otherwise reconfigure Caddy at run time through
+	# localhost:2019. The demo never reloads through the API (restart Caddy instead).
+	admin off
+
+	servers {
+		# The relay refuses heads over `max_header_bytes` (16,384). Caddy adds X-Forwarded-For,
+		# X-Forwarded-Proto and X-Forwarded-Host: keep the client's head well below the relay's
+		# bound, so that an over-long head gets Caddy's 431, not a 431 from the relay.
+		max_header_size 12KiB
+		timeouts {
+			# Relay `header_timeout_ms` (5,000) and `body_timeout_ms` (10,000).
+			read_header 5s
+			read_body 10s
+		}
+	}
+}
+
+{$SBTP_RELAY_DOMAIN} {
+	# No product name on the network (ADR 0019 rule 25 applies to the relay; same intent here).
+	header -Server
+
+	# Only the relay interface is proxied. No `redir`, no `rewrite`, no trailing-slash
+	# redirect on /sbtp/v1/ (ADR 0030 rule 3). Caddy's own plain-HTTP-to-HTTPS redirect on
+	# port 80 stays: it is on another origin (ADR 0030 rule 5).
+	handle /sbtp/v1/* {
+		# Backstop above the relay's own body limit (MAX_BLOCK_LEN = 65,909 bytes): a body
+		# between the two gets the relay's `413 BodyTooLarge` JSON body; a larger one is cut
+		# by Caddy.
+		request_body {
+			max_size 128KiB
+		}
+		reverse_proxy 127.0.0.1:8080 {
+			# The whole body (at most max_size) is read before the request goes upstream: a slow
+			# upload holds a Caddy connection, not one of the relay's 32 connection slots.
+			# Caddy then sends Content-Length.
+			request_buffers 128KiB
+			header_down -Via
+			transport http {
+				# ADR 0019 rule 18: HTTP/1.1 to the relay (Caddy's default is `1.1 2`).
+				versions 1.1
+				# ADR 0019 rule 34: idle upstream connections closed before the relay's
+				# `idle_timeout_ms` (30,000); Caddy's default is 2m.
+				keepalive 20s
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}

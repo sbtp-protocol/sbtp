@@ -1,0 +1,29 @@
+[package]
+name = "sbtp-wasm"
+description = "WebAssembly bindings of sbtp-core for the PWA and the web client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sbtp-core = { workspace = true, features = ["std"] }
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+getrandom.workspace = true
+# Wipes the copies of the demo key seed this crate makes. Already in the graph through ed25519-dalek.
+zeroize.workspace = true
+
+[dev-dependencies]
+# The vector replay test reads the JSON files of docs/test-vectors/v1/.
+serde_json.workspace = true
+# Stands in for an external Ed25519 signer (Web Crypto) in the "signature in" tests. Same version and
+# features as the one sbtp-core uses.
+ed25519-dalek.workspace = true
+
+[lints]
+workspace = true

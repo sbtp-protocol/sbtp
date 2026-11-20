@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>SBTP PoW measurement</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="src/pow.js"></script>
+</head>
+<body>
+<h1>SBTP proof-of-work measurement</h1>
+<p class="muted">Mines independent blocks in a Web Worker (sbtp-wasm, the same code as the client) and
+reports the time per block. For Q-28: run it on a desktop browser and on a phone, with the screen on
+and the page in the foreground, then copy the JSON.</p>
+<p>Runs at d = 16 <input id="r16" type="number" value="50" min="1">
+18 <input id="r18" type="number" value="30" min="1">
+20 <input id="r20" type="number" value="20" min="1">
+22 <input id="r22" type="number" value="10" min="1"></p>
+<button id="start">Start</button> <button id="stop" disabled>Stop</button>
+<p id="progress" class="muted"></p>
+<table id="table"><thead><tr><th>d</th><th>runs</th><th>median ms</th><th>p95 ms</th><th>min ms</th><th>max ms</th><th>hashes/s</th></tr></thead><tbody></tbody></table>
+<h2>Result (JSON)</h2>
+<textarea id="json" readonly rows="12" aria-label="Result as JSON"></textarea>
+</body>
+</html>

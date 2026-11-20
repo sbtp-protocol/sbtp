@@ -1,0 +1,8 @@
+# libFuzzer dictionary for decode_block: magic and version, Parents Count boundaries,
+# Payload Len boundaries (big-endian), the identity point.
+magic_v1="SB\x01"
+count_max="\x08"
+count_over="\x09"
+plen_0="\x00\x00"
+plen_max="\xff\xff"
+identity="\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"

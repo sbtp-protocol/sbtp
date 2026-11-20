@@ -1,0 +1,7 @@
+{
+  "name": "f7_last_signature_byte_missing",
+  "description": "A valid one-parent block without the last signature byte. F7.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c01010101010101010101010101010101010101010101010101010101010101010100096c61737420627974659bc87b62c9140ec6f9f2fbc3b2fc10eb1238722a6cd01b39f72662992cb77c9424a1f31eb33977e44d20eaacbaa9aa645e01ef3631a7997180ad4596b99943",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "Truncated" }
+}

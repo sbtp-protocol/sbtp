@@ -1,0 +1,251 @@
+# Deploying `sbtp-relay`
+
+The goal is a public demo relay, not a production service. `sbtp-relay` serves plain HTTP/1.1 and
+MUST NOT be exposed without a reverse proxy that terminates TLS (ADR 0019 rule 42). This directory
+has:
+
+| File | What it does |
+|---|---|
+| `Dockerfile` | Multi-stage build: a static musl binary, then a distroless `nonroot` image |
+| `Dockerfile.dockerignore` | The build context: workspace manifests and Rust sources only |
+| `Caddyfile` | Caddy in front of the relay on a bare VM, for the demo |
+
+## Static binary
+
+The relay builds as a fully static musl binary (`x86_64-unknown-linux-musl` or
+`aarch64-unknown-linux-musl`). The Rust Alpine builder image is natively musl and has the C
+toolchain that `blake3` needs, so no cross toolchain is needed. Run from the repository root:
+
+```bash
+docker build -f deploy/Dockerfile --platform linux/amd64 --target export --output type=local,dest=dist/amd64 .
+docker build -f deploy/Dockerfile --platform linux/arm64 --target export --output type=local,dest=dist/arm64 .
+```
+
+Each command writes `dist/<arch>/sbtp-relay`. A build for the other architecture runs under
+emulation and is slower. On a Linux host that already has the musl target and a musl C compiler,
+`cargo build --release --locked -p sbtp-relay --target x86_64-unknown-linux-musl` gives the same
+result.
+
+Release builds use the `release` profile only (ADR 0013 "Build": `opt-level = "s"`, LTO, stripped,
+no `panic = "abort"`). They never use `--all-targets`, a test profile or the `vector-gen` feature.
+The runtime image has no libc, so it is also the check that the binary is static: a dynamically
+linked binary does not start there.
+
+## Docker image
+
+```bash
+docker build -f deploy/Dockerfile -t sbtp-relay .
+docker run -d --name sbtp-relay \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v sbtp-data:/data -p 127.0.0.1:8080:8080 sbtp-relay
+```
+
+- **Base images.** Both are pinned by the digest of their multi-platform index:
+  `rust:1.99-alpine` for the build and `gcr.io/distroless/static-debian12:nonroot` for the runtime.
+  The build downloads only crates from crates.io, through `Cargo.lock` (`--locked`): no `apk add`,
+  no `curl`. To update a base image, read the new digest with
+  `docker buildx imagetools inspect <image>:<tag>` and wait until it is two weeks old.
+- **User.** uid/gid 65532 (`nonroot`). No shell and no package manager in the image.
+- **File system.** The root file system can be read-only (`--read-only`, Kubernetes
+  `readOnlyRootFilesystem: true`). The relay writes only to `data_dir` (`/data`, the volume): its
+  temporary files are in `data_dir/tmp`, and logs go to standard error, never to a file. It does
+  not need `/tmp`. It makes no outbound connection, so egress can be closed.
+- **Kubernetes security context.** The `--chown=65532:65532` / `0700` mount point of the image
+  only initialises a Docker named volume. A PersistentVolumeClaim is mounted with the
+  provisioner's ownership, often `root:root 0755`, and the relay (uid 65532) then cannot write and
+  stops at start-up (it fails closed). K3s `local-path` creates `0777` directories, which work but
+  are world-writable on the node. Set, on the pod and container:
+
+  ```yaml
+  securityContext:   # pod level
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+  # container level
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities: { drop: [ALL] }
+  ```
+
+- **Existing `data_dir`.** The relay does not check the owner or mode of a `data_dir` that already
+  exists; it only needs it to be writable by uid 65532. Setting the ownership and mode (`0700`) is
+  the operator's job.
+- **Kubernetes service links.** A Service named `sbtp-relay` makes Kubernetes inject environment
+  variables such as `SBTP_RELAY_PORT` and `SBTP_RELAY_SERVICE_HOST` into every pod of the
+  namespace. The relay rejects any unknown `SBTP_RELAY_*` variable, so the pod fails at start-up
+  unless the pod spec sets `enableServiceLinks: false` (or the Service has another name).
+- **Listen address.** The image sets `SBTP_RELAY_LISTEN=0.0.0.0:8080`, so that a proxy in another
+  container or pod can reach it, and the relay logs a `listen_not_loopback` warning at start-up.
+  Publish the port only on loopback (`-p 127.0.0.1:8080:8080`) or keep it on an internal network
+  (a Kubernetes `ClusterIP` Service). Override it with `-e SBTP_RELAY_LISTEN=...`. Docker's
+  published ports bypass host firewalls such as `ufw`, so a mapping on `0.0.0.0` exposes plain HTTP
+  to the internet. On Coolify, leave "Ports Mappings" empty, set only "Ports Exposes: 8080" and
+  route through Traefik; use the cloud provider's firewall (Hetzner Cloud Firewall) as the real
+  perimeter.
+- **Settings.** Every setting is an `SBTP_RELAY_*` environment variable (ADR 0018 rule 6), or a
+  TOML file mounted read-only and named by `SBTP_RELAY_CONFIG`.
+- **Stop.** `SIGTERM` (Docker's and Kubernetes' default) drains connections and closes the index;
+  a clean stop keeps the `/query` cursors valid. Give it a few seconds (`terminationGracePeriodSeconds`
+  of the default 30 is enough).
+- **Health check.** The image has no `HEALTHCHECK`: there is no shell or HTTP client inside it, and
+  the relay has no health subcommand. A Kubernetes `httpGet` probe on `/sbtp/v1/info` (port 8080)
+  needs neither. Each probe takes a token from the probing address's `block` bucket (burst 200,
+  3,000 per minute by default), so one probe every 10 seconds costs nothing noticeable.
+- **Memory.** About 3 MiB resident when idle (measured, `docker stats`, arm64). The start-up line
+  `memory_bound` gives the computed worst case of the settings in use (about 13.7 MB with the
+  `small` profile). A container limit of 32 MiB leaves room.
+
+## Behind a reverse proxy
+
+Whatever the proxy, it MUST (ADR 0019 rules 18, 34 and 42; ADR 0030):
+
+- terminate TLS; it MAY offer HTTP/2 and HTTP/3 to clients;
+- buffer each request head before it sends anything to the relay;
+- reach the relay over HTTP/1.1;
+- close idle upstream connections before the relay's `idle_timeout_ms` (30 s): 20 s is the
+  recommended value;
+- set, or append to, `X-Forwarded-For` the address of the peer it accepted the request from;
+- have its own address in the relay's `trusted_proxies` (default: `127.0.0.1/32, ::1/128`);
+- answer no `3xx` on `/sbtp/v1/` (no trailing-slash or path redirect; the plain-HTTP-to-HTTPS
+  redirect on port 80 is allowed).
+
+### Client identification
+
+The per-client limits (token buckets, `max_connections_per_client`, in-flight `PUT`s) key each
+client by its IPv4 address or IPv6 /64 (ADR 0018 rule 20, ADR 0019 rules 29 to 31). For a request
+from a peer in `trusted_proxies`, the relay reads `X-Forwarded-For` from right to left, steps over
+every address in `trusted_proxies`, and uses the first other address (ADR 0020 rules 6 to 10). A
+peer in `trusted_proxies` is not counted at accept; each of its requests counts against the client
+named in the header.
+
+If the proxy's address is missing from `trusted_proxies`, every request has the proxy as its
+client: all clients share one set of buckets and one `max_connections_per_client` bound (8), and
+the relay logs a warning when that key is refused. If a proxy in `trusted_proxies` does not write
+the header, its requests share one key per proxy address.
+
+Never put a byte-level forwarder (`ssh -R`, `socat`, `stunnel`, nginx `stream`, HAProxy
+`mode tcp`) on an address in `trusted_proxies` (ADR 0020 rule 17). Every address in the list MUST
+only ever connect through a program that appends the address of its own peer to `X-Forwarded-For`.
+Through a byte-level forwarder, clients write their own `X-Forwarded-For` and pick any client key,
+which defeats every per-client bound. Loopback is trusted by default: if such a forwarder runs on
+the relay's host, set `trusted_proxies = []`; the forwarder is then one client, and not a
+supported way to publish.
+
+After deployment, check that clients are told apart: send `PUT`s from two different hosts, exhaust
+the `block` bucket of the first one (it gets `429`), and check that the second still gets `201`
+or `200`. If both get `429`, all clients share one key (see "Traefik (K3s, Coolify)").
+
+With several proxies in a row (Cloudflare, then Traefik), every hop that writes the header must be
+in `trusted_proxies`, and each hop must keep the address its own peer wrote rather than replace it.
+
+Cloudflare's ranges carry every Cloudflare customer's traffic, not only this zone's. Listing them
+in `trusted_proxies` (and in Traefik's `forwardedHeaders.trustedIPs`) meets ADR 0020 rule 17 only
+if nothing but this zone's Cloudflare can reach the origin. Before listing them, authenticate the
+origin pull: Cloudflare **Authenticated Origin Pulls** (per-zone certificate, with a Traefik TLS
+option `clientAuth.clientAuthType: RequireAndVerifyClientCert` on the relay's router), or a
+Cloudflare Tunnel with no open port. Also restrict ports 80 and 443 to Cloudflare's ranges in the
+cloud firewall (Hetzner Cloud Firewall, not `ufw`: Docker's published ports bypass `ufw`). Without
+this, someone who reaches the origin from inside Cloudflare (their own zone, a Worker) can pick a
+fresh client key per request.
+
+### Bare VM with Caddy
+
+`Caddyfile` is for a demo on a single VM where the relay and Caddy share the host. It is not used
+on K3s or Coolify, where Traefik is the proxy.
+
+```bash
+SBTP_RELAY_DOMAIN=relay.example.org caddy run --config deploy/Caddyfile
+```
+
+- The relay listens on `127.0.0.1:8080`: the binary's default, or the container with
+  `--network host` and `-e SBTP_RELAY_LISTEN=127.0.0.1:8080`. The default `trusted_proxies` already
+  trusts Caddy on loopback.
+- The DNS record of the domain points at the VM and ports 80 and 443 are open: Caddy obtains the
+  certificate itself (automatic HTTPS).
+- Only `/sbtp/v1/*` is proxied; any other path gets `404` from Caddy. No access log is configured,
+  so Caddy keeps no client addresses.
+- Limits, against the relay's defaults:
+
+  | Caddy | Value | Relay |
+  |---|---|---|
+  | `max_header_size` | 12 KiB | `max_header_bytes` 16,384 (leaves room for the `X-Forwarded-*` headers Caddy adds) |
+  | `timeouts read_header` | 5 s | `header_timeout_ms` 5,000 |
+  | `timeouts read_body` | 10 s | `body_timeout_ms` 10,000 |
+  | `request_body max_size` | 128 KiB | body limit `MAX_BLOCK_LEN` 65,909 bytes: a body between the two gets the relay's `413 BodyTooLarge` JSON body |
+  | `request_buffers` | 128 KiB | the whole body is read by Caddy first, so a slow upload holds no relay connection slot |
+  | `transport http versions` | `1.1` | no HTTP/2 in the relay (ADR 0019 rule 18) |
+  | `transport http keepalive` | 20 s | `idle_timeout_ms` 30,000 (ADR 0019 rule 34) |
+
+- Head buffering (rule 42): Caddy is built on Go's `net/http`, which parses the whole request head
+  before any handler runs, so nothing reaches the relay before the head is complete. This follows
+  from how `net/http` works; it was not measured.
+- Checked locally (Caddy 2.11.9, relay image, `localhost` with Caddy's internal CA): `caddy fmt`
+  and `caddy validate` pass; `PUT` gives `201` then `200`, `GET /query` works over HTTP/2;
+  `/sbtp/v1/info/`, `//sbtp/v1/info` and `/sbtp/v1` give `404`, never `3xx`; a 70,000-byte body
+  gets the relay's `413 BodyTooLarge` (chunked too), a 200,000-byte body Caddy's `413`; port 80
+  answers `308` to `https`. A 13 KB header gets `431` over HTTP/1.1; over HTTP/2 Go resets the
+  stream instead.
+
+### Traefik (K3s, Coolify)
+
+No configuration file is shipped for Traefik yet. What the relay needs from it (Traefik
+documentation and source read through Context7 on 2026-11-20):
+
+- HTTP/1.1 upstream: a plain `http://` service, never the `h2c` scheme.
+- Idle upstream connections: `serversTransport` `forwardingTimeouts.idleConnTimeout` defaults to
+  90 s, above the relay's `idle_timeout_ms` (30 s). Set it to 20 s on the relay's transport (ADR
+  0019 rule 34); otherwise a `PUT` sent on a connection the relay just closed gets `502`.
+- `X-Forwarded-For`: Traefik deletes the incoming `X-Forwarded-*` headers unless the peer is in
+  the entry point's `forwardedHeaders.trustedIPs` (or `insecure` is set), then appends the
+  address of its own peer. Behind Cloudflare, list Cloudflare's published ranges in
+  `forwardedHeaders.trustedIPs`, or every client is seen as a Cloudflare address.
+- Request bodies: Traefik streams them to the upstream by default, so a few slow `PUT`s would
+  hold every global `PUT` slot until `body_timeout_ms`. Require a `buffering` middleware on the
+  relay's router, with `maxRequestBodyBytes: 131072` and `memRequestBodyBytes: 131072` (the
+  same values as the Caddyfile): Traefik then reads the whole body before it opens the upstream
+  request, and refuses larger bodies itself. The relay's own `413` stays the normal answer
+  between 65,909 and 131,072 bytes.
+- Request heads: Traefik's entry point `http.maxHeaderBytes` defaults to 1 MiB (Go). That is
+  harmless, because the relay answers `431` itself above `max_header_bytes` (16,384), but set it
+  to 12 KiB to match the Caddyfile if you want Traefik to answer first.
+- `trusted_proxies` of the relay must hold the address Traefik connects from: the pod network on
+  K3s (by default `10.42.0.0/16`), the Docker network of Coolify. Behind Cloudflare it must also
+  hold Cloudflare's ranges, because the relay steps over every trusted address from the right
+  (see "Client identification"); several of those ranges are wider than /16, so the relay logs
+  `trusted_proxies_broad` for them.
+- Traefik must see the real client address in the first place. This is a requirement: its
+  Service needs `externalTrafficPolicy: Local` (on K3s, a `HelmChartConfig` for `traefik` with
+  `service.spec.externalTrafficPolicy: Local`), or an upstream L4 balancer using the PROXY protocol
+  with Traefik's `proxyProtocol.trustedIPs`. With the default `Cluster` policy the connection is
+  source-NATed to a node address, Traefik writes that address, and the relay (which steps over the
+  pod network) falls back to Traefik's own address: every client then shares one set of buckets,
+  and one busy client gives the others `429`. On the planned K3s cluster the Traefik Service
+  already uses `Local` and LAN client IPs are preserved.
+- Pod network trust: with `trusted_proxies` on the pod CIDR (`10.42.0.0/16`), any pod of the
+  cluster could write `X-Forwarded-For` and choose its client key. Add a `NetworkPolicy` that
+  allows ingress to the relay pod only from the Traefik pods (namespace `kube-system`, label
+  `app.kubernetes.io/name=traefik`). The planned K3s manifests include it, together with the
+  buffering middleware above (131072) and `enableServiceLinks: false`.
+- Coolify: do not fill "Ports Mappings" (see "Listen address").
+- Cloudflare's limits (100 MB request body, 100 s to the first response byte) are far above the
+  relay's (65,909-byte body, 15 s request deadline) and change nothing. Its settings must not put
+  a `3xx` or an HTML page on `/sbtp/v1/` (ADR 0030 rule 3, ADR 0029 rules 4 and 5):
+  - SSL/TLS mode **Full (strict)**. Flexible makes Cloudflare reach the origin over HTTP and hit
+    the HTTP-to-HTTPS redirect (a `3xx`, or a loop). "Always Use HTTPS" is fine.
+  - No challenge, Bot Fight Mode or "Under Attack" rule on `/sbtp/v1/*` (add a WAF skip rule for
+    that path): their HTML challenge pages can exceed the 16,384-byte error-body ceiling.
+  - Cache rule "bypass" on `/sbtp/v1/*`, explicitly.
+
+## Data directory
+
+- `data_dir/tmp`, `data_dir/quarantine` and `data_dir/blocks` must be on **one file system**. The
+  relay moves files between them with `link` and `unlink` (ADR 0013 rule 7, ADR 0023 rule 4), which
+  fail across file systems (`EXDEV`): with `tmp/` elsewhere no block can be stored, with
+  `quarantine/` elsewhere no damaged file can be moved out of the way. Do not mount a separate
+  volume or a `tmpfs` on any of these subdirectories; mount the data volume at `data_dir` itself.
+- A file-system quota on the data volume (`EDQUOT`) is reported like a full disk: `507` and a
+  `storage_full` line (reason `edquot`).
+- One relay process per data directory: a Kubernetes Deployment with one replica and the
+  `Recreate` strategy, so that two pods never open the same volume.

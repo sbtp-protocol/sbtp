@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+/pkg
+/crates/sbtp-wasm/pkg
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/data
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+CLAUDE.local.md
+
+# Local assistant configuration (kept outside this repository)
+/.claude/

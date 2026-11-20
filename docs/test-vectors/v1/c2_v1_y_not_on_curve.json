@@ -1,0 +1,7 @@
+{
+  "name": "c2_v1_y_not_on_curve",
+  "description": "PubKey y = 2, not on the curve (V1). No parent, payload \"c2\", signature by key A (public seed 32 x 0x01) over the right message, so it is not a signature for this PubKey; C2 is reported before C3. Signature criteria (spec 3.2, evaluated by the generator): fails V1; holds V3, V4, V5; V2 not evaluable (PubKey does not decode); V6 not evaluable (PubKey does not decode).",
+  "block_hex": "5342010000018bcfe568000000000000000000020000000000000000000000000000000000000000000000000000000000000000000263328c0d88128f7d1966b1c97c067c2a8e770d4cd5dc8a8eca9dace87ca6285b96d92e2c178b749954b9255794012b08d9adadb1017910301a4a31ac9d1b6270c402",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "1eebadf6d9dda56e3cb3745a3e929cdd1f73b0a2f59c2e5edf25ecfa84026986", "signed_message_hex": "534254502d76312d626c6f636b2d7369671eebadf6d9dda56e3cb3745a3e929cdd1f73b0a2f59c2e5edf25ecfa84026986", "error": "InvalidPublicKey" }
+}

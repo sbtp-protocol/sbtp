@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Keep in sync with CSP in serve.mjs (which also sends frame-ancestors, not allowed in a meta tag). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>SBTP web client</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="src/app.js"></script>
+</head>
+<body>
+<h1>SBTP web client <span class="muted">(minimal, Phase 3)</span></h1>
+<p id="status" class="muted">Loading the WebAssembly module…</p>
+<p><a href="pow.html">PoW measurement page</a></p>
+
+<section>
+  <h2>Relay</h2>
+  <input id="relay" type="text" value="http://127.0.0.1:8080" aria-label="Relay URL">
+  <button id="info">Read /info</button>
+  <pre id="info-out"></pre>
+</section>
+
+<section>
+  <h2>Identity</h2>
+  <p id="key-out" class="mono">No key.</p>
+  <p id="persist-out"></p>
+  <button id="key-new">Generate a key</button>
+  <button id="key-delete">Delete the key</button>
+</section>
+
+<section>
+  <h2>New block</h2>
+  <textarea id="payload" aria-label="Payload (UTF-8 text)">Hello from the SBTP web client</textarea>
+  <input id="parents" type="text" placeholder="Parent block ids, space-separated (0 to 8)" aria-label="Parents">
+  <input id="difficulty" type="number" min="0" max="256" placeholder="Difficulty (empty: the relay's /info value, at most 24)" aria-label="Difficulty">
+  <button id="publish">Mine, sign and publish</button>
+  <button id="cancel" disabled>Cancel</button>
+  <button id="republish">Publish pending blocks</button>
+  <pre id="publish-out"></pre>
+</section>
+
+<section>
+  <h2>Browse</h2>
+  <input id="parent-filter" type="text" placeholder="Only children of this block id (optional)" aria-label="Parent filter">
+  <button id="list">List (/query) and fetch</button>
+  <button id="ancestors">Ancestors of the block id above</button>
+  <button id="browse-cancel" disabled>Cancel</button>
+  <button id="local">Show local blocks</button>
+  <button id="clear-fetched">Clear fetched blocks</button>
+  <pre id="list-out"></pre>
+  <div id="blocks"></div>
+</section>
+</body>
+</html>

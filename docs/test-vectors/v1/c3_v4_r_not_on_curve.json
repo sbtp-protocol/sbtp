@@ -1,0 +1,7 @@
+{
+  "name": "c3_v4_r_not_on_curve",
+  "description": "R replaced by y = 2, which does not decode to a point (V4). No parent, payload \"c3\", key A (public seed 32 x 0x01), S of the valid signature. Signature criteria (spec 3.2, evaluated by the generator): fails V4, V6; holds V1, V2, V3; V5 not evaluable (R does not decode).",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000263330200000000000000000000000000000000000000000000000000000000000000dfbb7b15c403fff7e183cf4a7a73505b21c6db17cbb807eac14fd3a57b23330a",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "07b5e5961ec6ba018cbabb47bb82a928f6a1c3632de7a09d9e346322166aa303", "signed_message_hex": "534254502d76312d626c6f636b2d73696707b5e5961ec6ba018cbabb47bb82a928f6a1c3632de7a09d9e346322166aa303", "error": "InvalidSignature" }
+}

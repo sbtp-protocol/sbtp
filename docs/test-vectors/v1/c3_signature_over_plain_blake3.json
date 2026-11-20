@@ -1,0 +1,7 @@
+{
+  "name": "c3_signature_over_plain_blake3",
+  "description": "No parent, payload \"plain\"; signature by key A (public seed 32 x 0x01) over SIG_PREFIX || BLAKE3(hashed bytes) in plain hash mode instead of derive_key (ADR 0002). Signature criteria (spec 3.2, evaluated by the generator): fails V6; holds V1, V2, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000005706c61696e7f09a9451f97c05fbe23e99940616d662caa660f84f16b2271b66d0d449221e0f46ff1597174aac58882fda9a55a13a2ff38ae347ee64727cb68cc3902684a0c",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "d015ba34fc6f3b033cd1b037885c3c4e855767abbfbdffc0120fd1a17b248c4b", "signed_message_hex": "534254502d76312d626c6f636b2d736967d015ba34fc6f3b033cd1b037885c3c4e855767abbfbdffc0120fd1a17b248c4b", "error": "InvalidSignature" }
+}

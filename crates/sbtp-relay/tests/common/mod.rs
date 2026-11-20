@@ -1,0 +1,285 @@
+//! Helpers shared by the integration tests: settings from test environments, a server on a real
+//! loopback socket, and a raw HTTP/1.1 client (so that the tests control every byte and timing).
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use axum::Router;
+use sbtp_relay::blocks::Relay;
+use sbtp_relay::config::Settings;
+use sbtp_relay::index::{IndexBackend, RedbIndex};
+use sbtp_relay::pool::IndexPool;
+use sbtp_relay::server::{ConnLimits, serve};
+use sbtp_relay::store::{Store, reconcile};
+
+/// A fresh, empty directory under Cargo's integration-test temporary directory.
+pub fn tmp_dir(name: &str) -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// `SBTP_RELAY_<NAME>` pairs as an environment.
+pub fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (format!("SBTP_RELAY_{k}").into(), (*v).into()))
+        .collect()
+}
+
+/// Settings from `pairs`, with `MIN_POW_DIFFICULTY = 16` unless given. Every test client comes
+/// from `127.0.0.1` and shares one client key, so the `block` and `put` bursts are raised to the
+/// top of their range unless given: a test of the token buckets sets its own rates.
+pub fn settings(pairs: &[(&str, &str)]) -> Settings {
+    let mut e = env(pairs);
+    for (k, v) in [
+        ("MIN_POW_DIFFICULTY", "16"),
+        ("RATE_BLOCK_BURST", "1000000"),
+        ("RATE_PUT_BURST", "1000000"),
+    ] {
+        if !pairs.iter().any(|(p, _)| *p == k) {
+            e.extend(env(&[(k, v)]));
+        }
+    }
+    Settings::load(Vec::<OsString>::new(), e).unwrap()
+}
+
+/// The relay's accept loop and middleware on `127.0.0.1:0`, with the production routes plus
+/// `extra`, on its own runtime, over a store and an index in `data`. Stopped (graceful shutdown)
+/// on drop; the index is closed once the thread has ended.
+pub struct TestServer {
+    pub addr: SocketAddr,
+    pub data: PathBuf,
+    stop: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    thread: Option<JoinHandle<()>>,
+    /// The index threads, stopped once the server thread has ended.
+    pool: Option<Box<dyn Send + Sync>>,
+}
+
+impl TestServer {
+    /// On a fresh data directory.
+    pub fn start(settings: &Settings, extra: Router) -> Self {
+        Self::start_in(settings, extra, &tmp_dir("server"))
+    }
+
+    /// On `data`, opened and reconciled as at start-up (ADR 0013 rule 9).
+    pub fn start_in(settings: &Settings, extra: Router, data: &std::path::Path) -> Self {
+        std::fs::create_dir_all(data).unwrap();
+        let index = RedbIndex::open(&data.join("index.redb"), 1 << 20).unwrap();
+        Self::start_with(settings, extra, data, std::sync::Arc::new(index))
+    }
+
+    /// On `data`, with `index` (opened on `data/index.redb`) as the index backend.
+    pub fn start_with<I: IndexBackend + 'static>(
+        settings: &Settings,
+        extra: Router,
+        data: &std::path::Path,
+        index: std::sync::Arc<I>,
+    ) -> Self {
+        std::fs::create_dir_all(data).unwrap();
+        let index_file = data.join("index.redb");
+        let store = Store::open(data, index_file, settings.max_store_bytes).unwrap();
+        reconcile(&store, &*index).unwrap();
+        let pool = IndexPool::start(&index, settings).unwrap();
+        drop(index); // Held by the index threads from here on.
+        let relay = std::sync::Arc::new(Relay::new(settings, store, pool.handle()));
+        let app = sbtp_relay::api::layered(
+            sbtp_relay::api::routes(settings, relay).merge(extra),
+            settings,
+        );
+        let limits = ConnLimits::from_settings(settings).unwrap();
+        let (stop, stopped) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                serve(listener, app, limits, stopped).await.unwrap();
+            });
+        });
+        Self {
+            addr: addr_rx.recv().unwrap(),
+            data: data.to_path_buf(),
+            stop: Some(stop),
+            thread: Some(thread),
+            pool: Some(Box::new(pool)),
+        }
+    }
+
+    pub fn connect(&self) -> TcpStream {
+        connect(self.addr)
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        drop(self.pool.take());
+    }
+}
+
+pub fn connect(addr: SocketAddr) -> TcpStream {
+    let s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s
+}
+
+/// A parsed HTTP response.
+#[derive(Debug)]
+pub struct Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap()
+    }
+}
+
+/// Sends `raw` and reads one response.
+pub fn exchange(s: &mut TcpStream, raw: &str) -> Response {
+    s.write_all(raw.as_bytes()).unwrap();
+    read_response(s).unwrap()
+}
+
+/// `GET path` with keep-alive and optional extra header lines (each ending in `\r\n`).
+pub fn get(s: &mut TcpStream, path: &str, extra: &str) -> Response {
+    exchange(
+        s,
+        &format!("GET {path} HTTP/1.1\r\nHost: relay.test\r\n{extra}\r\n"),
+    )
+}
+
+/// Reads one response (body by `Content-Length`, or none).
+pub fn read_response(s: &mut TcpStream) -> std::io::Result<Response> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        let n = s.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8(buf[..head_end].to_vec()).unwrap();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers: Vec<(String, String)> = lines
+        .map(|l| {
+            let (k, v) = l.split_once(':').unwrap();
+            (k.trim().to_ascii_lowercase(), v.trim().to_owned())
+        })
+        .collect();
+    let len: usize = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .map_or(0, |(_, v)| v.parse().unwrap());
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < len {
+        let n = s.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// The wall clock in Unix milliseconds.
+pub fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// A valid block of a test key with `payload` and `parents`, difficulty 0, timestamped now.
+pub fn signed_block(payload: &[u8], parents: &[sbtp_core::BlockId]) -> Vec<u8> {
+    let k = sbtp_core::SigningKey::from_bytes(&[9; 32]);
+    sbtp_core::BlockBuilder::for_key(&k)
+        .timestamp(now_ms())
+        .parents(parents)
+        .payload(payload)
+        .build(&k, 0)
+        .unwrap()
+}
+
+/// `PUT /sbtp/v1/block` of `body` with keep-alive.
+pub fn put_block(s: &mut TcpStream, body: &[u8]) -> Response {
+    s.write_all(
+        format!(
+            "PUT /sbtp/v1/block HTTP/1.1\r\nHost: relay.test\r\n\
+             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    s.write_all(body).unwrap();
+    read_response(s).unwrap()
+}
+
+/// Whether the server has closed `s`: a read returns end of file or a reset.
+pub fn is_closed(s: &mut TcpStream) -> bool {
+    let mut b = [0u8; 1];
+    match s.read(&mut b) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        ),
+    }
+}

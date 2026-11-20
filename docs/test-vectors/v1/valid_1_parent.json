@@ -1,0 +1,7 @@
+{
+  "name": "valid_1_parent",
+  "description": "Valid. One parent (32 x 0x01), payload \"one parent\": offsets with N = 1. Signed by key A (public seed 32 x 0x01), timestamp 1700000000000. Signature criteria (spec 3.2, evaluated by the generator): V1 to V6 all hold.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c010101010101010101010101010101010101010101010101010101010101010101000a6f6e6520706172656e74807a8ff90e6e5b765d2f49714c93d385303b5b6e80992751cc381e0d7d50de457f9e4e6480b0d7d95252b501ab8b6fd49fcd6513e1fe3b3e5b7ab3ad5255520e",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": true, "block_id": "5965bbc78bc2135f00abd7e7226c04aeca9cafa37f56c536bdbe7fad4f046d47", "signed_message_hex": "534254502d76312d626c6f636b2d7369675965bbc78bc2135f00abd7e7226c04aeca9cafa37f56c536bdbe7fad4f046d47", "error": null }
+}

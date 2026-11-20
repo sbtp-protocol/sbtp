@@ -1,0 +1,51 @@
+# cargo-deny: `cargo deny check`. Docs: https://embarkstudios.github.io/cargo-deny/
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+]
+
+[sources]
+# crates.io only: no git dependency, no other registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# libfuzzer-sys (fuzz/ only, never shipped) bundles LLVM libFuzzer under the permissive NCSA licence.
+# Scoped exception, security review 2026-11-18 (sbtp-core m2, F-3).
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
+
+# ADR 0003: batch verification and the lax `S` check are forbidden. This complements the mandatory
+# `S + L` negative test vector; it does not replace it.
+[[bans.features]]
+name = "ed25519-dalek"
+deny = ["batch", "legacy_compatibility"]
+
+[[bans.features]]
+name = "curve25519-dalek"
+deny = ["legacy_compatibility"]

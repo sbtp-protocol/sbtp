@@ -1,0 +1,7 @@
+{
+  "name": "c2_v1_x_zero_sign_bit_y1",
+  "description": "PubKey y = 1 (x = 0) with the sign bit set (V1). No parent, payload \"c2\", signature by key A (public seed 32 x 0x01) over the right message, so it is not a signature for this PubKey; C2 is reported before C3. Signature criteria (spec 3.2, evaluated by the generator): fails V1, V2, V6; holds V3, V4, V5.",
+  "block_hex": "5342010000018bcfe56800000000000000000001000000000000000000000000000000000000000000000000000000000000800000026332eb86ff28f5f930ab15f28e4b307f8eb13616473411ebf4428e1fea27d03643b35bd95d1d92e732789eb7fb0de452874e3dc3ff68ed10e42248b296d49482b709",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "0d24ba82456ac9dc50ac9c1a8e6a22fbefcce98ea647bb26304ce2eddb608c50", "signed_message_hex": "534254502d76312d626c6f636b2d7369670d24ba82456ac9dc50ac9c1a8e6a22fbefcce98ea647bb26304ce2eddb608c50", "error": "InvalidPublicKey" }
+}

@@ -1,0 +1,3 @@
+# pnpm 11+ reads only auth and registry settings from .npmrc; other settings live here.
+# .npmrc keeps ignore-scripts=true for npm.
+ignoreScripts: true

@@ -1,0 +1,7 @@
+{
+  "name": "c3_v5_only_r_order8_b",
+  "description": "PubKey A' = a*B + T as in vector valid_mixed_order_pubkey (T = c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a, order 8). R = c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa, a small-order point (V5). S = k*a mod L with k = SHA-512(R || A' || M) mod L, so [S]B - [k]A' = -[k]T; nonce 0, searched from 0 so that -[k]T = R: the cofactorless equation V6 holds. No parent, payload \"v5 only\". Isolates V5: a verifier without the small-order check on R accepts this block. Signature criteria (spec 3.2, evaluated by the generator): fails V5; holds V1, V2, V3, V4, V6.",
+  "block_hex": "5342010000018bcfe5680000000000000000009ea3f11f5bd34f0cd7147fd0a436c088f624c6100c1df6a53c0a29e05d60cea00000077635206f6e6c79c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa2b53373f614c1b15fc8f57bc3b607f7f498da2bcf210707d235a5584bf670d0b",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "3a63023d2226bd65cbf36ff52dd4148461f9cd0cab4a67c5494628dba523b46d", "signed_message_hex": "534254502d76312d626c6f636b2d7369673a63023d2226bd65cbf36ff52dd4148461f9cd0cab4a67c5494628dba523b46d", "error": "InvalidSignature" }
+}

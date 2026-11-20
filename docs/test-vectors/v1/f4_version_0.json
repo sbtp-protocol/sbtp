@@ -1,0 +1,7 @@
+{
+  "name": "f4_version_0",
+  "description": "No parent, payload \"version\", Version byte 0x00; signed by key A (public seed 32 x 0x01) over the modified bytes, so only F4 fails.",
+  "block_hex": "5342000000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000776657273696f6e2138d4f9d8732e6af4f70e11b40e2baa73dfed8bd3879f7bf43d888fa6969ef90538a3cf1590e5656b7ff87d7689db244b71d9b31cfc839ec83557e074ddcd07",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "UnsupportedVersion" }
+}

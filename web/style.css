@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; --fg: #1b1b1f; --bg: #fafafa; --muted: #666; --line: #ccc; --bad: #b00020; --ok: #1b6e2f; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --bg: #17171a; --muted: #9a9a9a; --line: #444; --bad: #ff6b81; --ok: #6fd08c; } }
+body { font: 15px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 60rem; margin: 0 auto; padding: 1rem; }
+section { border-top: 1px solid var(--line); padding: 0.5rem 0 1rem; }
+h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin: 0.4rem 0; }
+input[type=text], input[type=number], textarea { width: 100%; box-sizing: border-box; font: inherit; }
+textarea { min-height: 4rem; }
+button { font: inherit; margin: 0.2rem 0.3rem 0.2rem 0; }
+pre, .mono { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+.muted { color: var(--muted); } .bad { color: var(--bad); } .ok { color: var(--ok); }
+.block { border: 1px solid var(--line); border-radius: 4px; padding: 0.4rem; margin: 0.4rem 0; }
+table { border-collapse: collapse; } td, th { border: 1px solid var(--line); padding: 0.2rem 0.5rem; text-align: right; }
