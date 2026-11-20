@@ -16,9 +16,7 @@ zeroize.workspace = true
 # `O_NOFOLLOW` when opening the key file: a constant only, no `unsafe`.
 libc.workspace = true
 
-[dev-dependencies]
-# The end-to-end test starts the relay in-process on a loopback port. sbtp-relay needs Rust 1.90
-# (redb 4.x): running this crate's tests needs that toolchain, building the CLI does not.
+# The end-to-end test starts the relay in-process on a loopback port.
 sbtp-relay.workspace = true
 tokio.workspace = true
 

@@ -3,8 +3,8 @@ name = "sbtp-relay"
 description = "SBTP dumb relay: validation (format, PoW, Ed25519), content-addressed flat-file storage, LRU cache, HTTP/WS API."
 version.workspace = true
 edition.workspace = true
-# ADR 0013 rule 25: redb 4.x requires Rust 1.90. The workspace value stays 1.85 for the other crates.
-rust-version = "1.90"
+# ADR 0013 rule 25: redb 4.x requires Rust 1.90, now the workspace value (hpke review F-1).
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
