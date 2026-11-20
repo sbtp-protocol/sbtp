@@ -43,6 +43,15 @@ Initial public version. Pre-release software: no version is supported for produc
 - `sbtp-wasm`: WebAssembly bindings; `examples/cli-demo`: keygen, mine, sign, publish, query; `web/`:
   minimal browser client.
 
+### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
+
+- **Breaking:** the default mining budget of `BlockBuilder::build` is counted in bytes compressed
+  (`DEFAULT_MINING_BUDGET_BYTES`, `default_max_attempts`), so its time bound no longer grows with the
+  payload; nonce exhaustion is the distinct, sticky `BuildError::NonceSpaceExhausted`.
+- **Breaking:** `sbtp-l2` validates the registry verbs `tagged` and `tallies` and the structure of
+  `sbtp.enc` and `sbtp.enc_key` (padding lengths, ciphertext length, key fields); `KindRow` declares its
+  repeatable verbs per row (`repeatable`), and a required verb appears exactly once.
+
 ### Security
 
 - Independent security reviews of the decoder, the cryptography, the relay and the clients are in
