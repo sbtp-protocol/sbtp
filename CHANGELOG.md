@@ -46,6 +46,16 @@ Initial public version. Pre-release software: no version is supported for produc
   `SEALED_SIG_PREFIX` and `ENC_KEY_DIRECTORY_CONTEXT` (spec §3.5).
 - `sbtp-wasm`: WebAssembly bindings; `examples/cli-demo`: keygen, mine, sign, publish, query; `web/`:
   minimal browser client.
+- Several relays in the clients, with automatic failover. `cli-demo`: `--relay` is repeatable or a
+  comma list (at most 8) for `mine`, `publish`, `get`, `query` and `info`. `mine` mines once at the
+  highest `/info` difficulty (each bounded by 24); `publish` sends to every relay in parallel and
+  succeeds when one stores the block; `get` asks the relays in order and keeps the first block that
+  passes the receipt rule; `query` prints each `block_id` once over all relays, with one cursor per
+  relay (`--cursor <RELAY_URL>=<CURSOR>`). A command fails only when it fails on every relay. The web
+  client keeps a relay list in its local settings, publishes to all relays, reads with failover,
+  merges `/query` walks with per-relay cursors, leaves a failing relay aside with a back-off, and
+  sends an own block again to the relays it failed on. Every block is validated whatever relay served
+  it. Spec §4 gains a non-normative "Several relays" subsection; no rule changes.
 - CI (`.github/workflows/`, `docs/ci.md`): the `CONTRIBUTING.md` checks on every push and pull request
   to `main`; a relay image built by CI and pushed to `ghcr.io/sbtp-protocol/sbtp-relay` on `relay-v*`
   tags, deployed by digest. Actions pinned by commit SHA, read-only token outside the image job.

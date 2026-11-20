@@ -27,8 +27,16 @@ export const LIMITS = Object.freeze({
   backoffCapMs: 60_000,
   /** Blocks fetched because of /query hints in one operation, 404 included (rule 10). */
   fetchMaxBlocks: 200,
-  /** GET /block requests in flight per relay (spec §4: at most 8). */
+  /** GET /block requests in flight per relay (spec §4: at most 8); also the total over all relays. */
   fetchConcurrency: 4,
+  /** GET /block requests in one operation over all relays, failovers included (overall bound). */
+  fetchMaxAttempts: 800,
+  /** Relays in the list (overall bound: every per-relay bound is multiplied by at most this). */
+  maxRelays: 8,
+  /** Relay faults in a row (failed requests, invalid blocks, rule 16) before a relay is left aside. */
+  relayFailThreshold: 3,
+  /** Cap of the back-off of a relay left aside, before jitter. */
+  relayBackoffCapMs: 300_000,
   /** Blocks visited by one DAG traversal (rule 11). */
   traverseMaxVisited: 1_000,
   /** Local store budget (rule 12): blocks fetched from relays are evicted first. */

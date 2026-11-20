@@ -16,9 +16,13 @@
 <p><a href="pow.html">PoW measurement page</a></p>
 
 <section>
-  <h2>Relay</h2>
-  <input id="relay" type="text" value="http://127.0.0.1:8080" aria-label="Relay URL">
-  <button id="info">Read /info</button>
+  <h2>Relays</h2>
+  <p class="muted">One URL per line, at most 8. Blocks are published to every relay and read from the
+    first that serves a valid one; every block is verified whatever relay served it.</p>
+  <textarea id="relays" rows="3" aria-label="Relay URLs, one per line">http://127.0.0.1:8080</textarea>
+  <button id="relays-save">Save the list</button>
+  <button id="info">Read /info of each</button>
+  <pre id="relays-health"></pre>
   <pre id="info-out"></pre>
 </section>
 
@@ -34,7 +38,7 @@
   <h2>New block</h2>
   <textarea id="payload" aria-label="Payload (UTF-8 text)">Hello from the SBTP web client</textarea>
   <input id="parents" type="text" placeholder="Parent block ids, space-separated (0 to 8)" aria-label="Parents">
-  <input id="difficulty" type="number" min="0" max="256" placeholder="Difficulty (empty: the relay's /info value, at most 24)" aria-label="Difficulty">
+  <input id="difficulty" type="number" min="0" max="256" placeholder="Difficulty (empty: the highest /info value of the relays, each at most 24)" aria-label="Difficulty">
   <button id="publish">Mine, sign and publish</button>
   <button id="cancel" disabled>Cancel</button>
   <button id="republish">Publish pending blocks</button>

@@ -1,6 +1,7 @@
 // Minimal promise wrapper over IndexedDB. One database per origin for this client:
 //   keys       { name, privateKey: CryptoKey (non-extractable), publicKey: Uint8Array, created }
-//   blockMeta  { id, size, own, acked, accessed }   (index "accessed")
+//   blockMeta  { id, size, own, acked, accessed, failedOn? }   (index "accessed"; failedOn: relay
+//              bases an own block still has to be sent to; absent in records from before it)
 //   blockBytes { id, bytes }
 //   stats      { name: "totals", count, bytes, pending }   (running totals of blockMeta; v2)
 

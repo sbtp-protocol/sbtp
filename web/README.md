@@ -1,7 +1,7 @@
 # SBTP minimal web client
 
 A browser client of the SBTP relay interface: generate or load an identity, mine, sign and publish a
-block, list blocks with `/query`, fetch and verify them, walk ancestors. Plus a proof-of-work measurement
+block, list blocks with `/query`, fetch and verify them, walk ancestors, over one relay or several. Plus a proof-of-work measurement
 page (`pow.html`, Q-28).
 
 Plain ES modules and a Web Worker: **no JavaScript dependency, no bundler, no `package.json`**. Every
@@ -25,8 +25,8 @@ The port is deliberately uncommon: the identity key lives in this origin's Index
 server run later on the same origin (`127.0.0.1:8000` is the default of `python -m http.server` and many
 tools) would serve scripts that can use or delete the key. Do not reuse this origin for another project;
 a public deployment uses its own host name.
-`web/pkg/` is a build output and is not committed. Optimised module (2026-11-20): 141,124 bytes,
-79,433 bytes with `gzip -9`; JS glue 23,315 bytes.
+`web/pkg/` is a build output and is not committed. Optimised module (2026-11-20): 139,170 bytes,
+78,512 bytes with `gzip -9`; JS glue 23,315 bytes.
 
 Any static server works if it serves `.wasm` as `application/wasm` and `.js` as `text/javascript`;
 `serve.mjs` also sends the headers below.
@@ -41,7 +41,9 @@ SBTP_RELAY=http://127.0.0.1:8080 node --test web/tests/*.test.mjs  # adds the en
 The tests cover the response checks, the four body ceilings (at the ceiling and one byte above, gzip
 included), the deadline against a drip-fed body, redirects not followed (ADR 0030: 301, 307, 308, 303 on PUT, opaque redirect), the `/query` walk against scripted
 hostile relays, fetch and traversal bounds (a diamond DAG of depth 40), the eviction plan, a Web Crypto
-signature through `attachSignature`, and the poisoning of the module after a foreign exception. IndexedDB
+signature through `attachSignature`, the poisoning of the module after a foreign exception, and several
+relays (`relays.test.mjs`: fake relays over loopback HTTP, one healthy, one answering 404, one hostile
+serving a wrong block, one slow past the deadline, one answering 429 with `Retry-After`). IndexedDB
 and the Worker are not available in Node: they were checked in headless Chrome.
 
 ## Layout
@@ -53,6 +55,7 @@ and the Worker are not available in Node: they were checked in headless Chrome.
 | `src/store.js`, `src/eviction.js`, `src/idb.js` | Local block store and its budget |
 | `src/http.js` | The only `fetch()` call: redirect policy, deadline, bounded body read |
 | `src/relay.js` | `/info`, `PUT`/`GET /block`, `/query`, response checks, bounded fetch |
+| `src/relays.js`, `src/settings.js` | Several relays: publish to all, failover reads, merged walks, health; the saved list |
 | `src/walk.js`, `src/traverse.js` | `/query` walk, bounded DAG traversal |
 | `src/bounds.js` | Every client bound in one place |
 | `src/mine-worker.js`, `src/miner.js` | PoW in a module Web Worker, one worker per job |
@@ -141,6 +144,35 @@ blocked.
   through WASM frames (Rust destructors skipped), **poisons** the instance: every later call throws
   `WasmPoisoned` and the page must be reloaded. A JS module cannot be re-instantiated in place. Mining
   workers are terminated after each job, so the next job gets a fresh instance.
+
+## Several relays
+
+The relay list (one URL per line, at most 8) is a local setting kept in `localStorage`: it holds no
+secret. Each URL is checked again on load (`https://`, or `http://` on loopback only); a bad saved list
+falls back to `http://127.0.0.1:8080`. Code: `src/relays.js`.
+
+- **Publish.** The block is mined once, at the highest `min_pow_difficulty` among the relays' `/info`,
+  each bounded by 24 as for one relay (ADR 0029 rule 13). A relay asking for more is skipped (no mining
+  for it, no `PUT`); a relay whose `/info` fails stays a target but sets no difficulty. An explicit
+  difficulty reads no `/info`. The block is then sent to every target in parallel and the page shows
+  each relay's answer (`201`, `200`, or the error). It counts as published, and may be evicted, from the
+  first `200` or `201` (ADR 0029 rule 12); until then it stays pending. The relays it failed on are
+  kept with the block (`failedOn`), and "Publish pending blocks" sends it to them again, after the
+  blocks no relay acknowledged (at most 200 blocks per run).
+- **Read.** A block is asked from the relays in order; a `404`, a failed request, a transient refusal or
+  a block that fails `validateRequested` (R1 and full validation) moves on to the next relay. No relay is
+  trusted: every block is validated whatever relay served it, and an invalid one is never stored. A block
+  below the client's own floor is refused at once (its proof of work is a property of its `block_id`).
+- **`/query`.** Each relay is walked with its own cursor (ADR 0012, ADR 0024), in parallel; the ids are
+  merged in the list's order and deduplicated by `block_id`. A relay whose ids were cut by the overall
+  bound keeps its starting cursor.
+- **Bounds.** Per relay, every bound of the table below; overall: 8 relays, 200 ids merged in a view,
+  4 `GET /block` in flight in all, 800 `GET /block` per operation, failovers included.
+- **Health (in memory).** A failed request, a transient refusal or an invalid block counts as a relay
+  fault (ADR 0029 rule 16); a `404` or a refused `PUT` does not. From 3 faults in a row the relay is left
+  aside for an exponential back-off (1 s doubling, capped at 5 minutes, with jitter) and is not asked
+  meanwhile. A `Retry-After` in seconds always holds the relay back that long. A reload starts every
+  relay healthy. The page shows each relay's state under the list.
 
 ## Proof-of-work measurement (Q-28)
 
