@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 import { planEviction } from "../src/eviction.js";
 import { checkRelayUrl } from "../src/http.js";
-import { errorName, InvalidResponse, isCursorSyntax, parseInfo, parsePage, parseRetryAfter, resolveDifficulty, sendingDifficulty } from "../src/relay.js";
+import { errorName, InvalidResponse, isCursorSyntax, NETWORK_POW_DIFFICULTY, parseInfo, parsePage, parseRetryAfter, resolveDifficulty, sendingDifficulty } from "../src/relay.js";
 import { percentile, summarize } from "../src/stats.js";
 
 const enc = (v) => new TextEncoder().encode(typeof v === "string" ? v : JSON.stringify(v));
@@ -26,6 +26,12 @@ test("info: required members checked, optional ones dropped when out of range", 
 
 test("sending difficulty: bounded when read from /info, not when explicit", () => {
   assert.equal(sendingDifficulty({ minPowDifficulty: 24 }, null), 24);
+  // ADR 0045 rule 5: a value from /info below D_NET is raised to it; an explicit one is not.
+  assert.equal(NETWORK_POW_DIFFICULTY, 16);
+  assert.equal(sendingDifficulty({ minPowDifficulty: 0 }, null), 16);
+  assert.equal(sendingDifficulty({ minPowDifficulty: 8 }, null), 16);
+  assert.equal(sendingDifficulty({ minPowDifficulty: 17 }, null), 17);
+  assert.equal(sendingDifficulty({ minPowDifficulty: 8 }, 4), 4);
   assert.throws(() => sendingDifficulty({ minPowDifficulty: 25 }, null), InvalidResponse);
   assert.throws(() => sendingDifficulty({ minPowDifficulty: 256 }, undefined), InvalidResponse);
   assert.equal(sendingDifficulty({ minPowDifficulty: 256 }, 30), 30);

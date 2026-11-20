@@ -6,6 +6,13 @@ import { isIdHex } from "./hex.js";
 import { request } from "./http.js";
 
 const MAX_CURSOR_LEN = 128;
+
+/**
+ * The network difficulty `D_NET` (spec §3.3, ADR 0045; `sbtp_core::NETWORK_POW_DIFFICULTY`). A
+ * difficulty read from /info is raised to it, so that a published block can be copied to every
+ * relay of the network (ADR 0045 rule 5). It changes only by a revision of the specification.
+ */
+export const NETWORK_POW_DIFFICULTY = 16;
 const CURSOR_RE = /^[A-Za-z0-9_-]+$/;
 const U64_LIMIT = 2 ** 64;
 
@@ -73,7 +80,8 @@ export function parseInfo(bytes) {
 
 /**
  * The difficulty to mine at for a relay (ADR 0029 rule 13). An explicit user value wins; a value
- * from /info above `max` is refused rather than mined.
+ * from /info above `max` is refused rather than mined, and one below `D_NET` is raised to it
+ * (ADR 0045 rule 5).
  */
 export function sendingDifficulty(info, explicit, max = LIMITS.maxInfoDifficulty) {
   if (explicit !== undefined && explicit !== null) return explicit;
@@ -82,7 +90,7 @@ export function sendingDifficulty(info, explicit, max = LIMITS.maxInfoDifficulty
       `the relay asks for difficulty ${info.minPowDifficulty}, above this client's maximum of ${max} ` +
       "for a value read from /info; set a difficulty explicitly to mine anyway");
   }
-  return info.minPowDifficulty;
+  return Math.max(NETWORK_POW_DIFFICULTY, info.minPowDifficulty);
 }
 
 /**

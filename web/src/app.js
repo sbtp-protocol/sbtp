@@ -163,7 +163,8 @@ async function onPublish() {
     const typed = $("difficulty").value.trim();
     const explicit = typed === "" ? null : Number(typed);
     // An explicit difficulty needs no /info (review finding 10). Otherwise one mining at the
-    // highest /info difficulty of the relays, each bounded by maxInfoDifficulty (ADR 0029 rule 13).
+    // highest /info difficulty of the relays, each bounded by maxInfoDifficulty (ADR 0029 rule 13),
+    // and at least the network difficulty (ADR 0045 rule 5).
     const plan = await publishDifficulty(relays, explicit, { signal: controller.signal });
     const d = plan.difficulty;
     const unsigned = buildUnsignedBlock(identity.publicKey, BigInt(Date.now()), 0n, parents, payload);

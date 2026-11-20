@@ -222,6 +222,13 @@ fn publish_and_get_round_trip_through_the_relay() {
     assert_ok(&o);
     let id = stdout(&o).trim().to_owned();
     assert_eq!(id.len(), 64);
+    // ADR 0045 rule 5: the relay asks for 8, the block is mined at `D_NET` = 16.
+    assert!(
+        stderr(&o).contains("Mined at difficulty 16"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(id.starts_with("0000"), "16 leading zero bits: {id}");
 
     // First publish stores (201), the second finds it (200); both succeed.
     let o = cli(&["publish", "--relay", &relay.url, s(&block)]);
@@ -1012,7 +1019,8 @@ fn several_relays_publish_get_and_query() {
     ]);
     assert_ok(&o);
     assert!(
-        stderr(&o).contains(&format!("Mining once at difficulty {RELAY_DIFFICULTY}")),
+        // ADR 0045 rule 5: the relays ask for 8; the block is mined at `D_NET`.
+        stderr(&o).contains("Mining at difficulty 16, the network difficulty"),
         "{}",
         stderr(&o)
     );
