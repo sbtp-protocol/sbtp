@@ -18,6 +18,10 @@
 //! - [`self_test`]: start-up replay of the frozen `S + L` vector (ADR 0003 rule 16).
 //!
 //! Sending a block: [`BlockBuilder`], [`mine`], [`sign_block`].
+//!
+//! Inner signature of a sealed layer 2 payload (`l2-grammar.md` §5.3, ADR 0016 rule 15): the typed
+//! builder [`sealed_sig_message`], then [`sign_sealed`] or [`verify_sealed`] (strict, V1 to V6).
+//! These and the block signature are the only messages this crate signs or verifies.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(
@@ -39,6 +43,7 @@ mod builder;
 pub mod consts;
 mod error;
 pub mod layout;
+mod sealed_sig;
 mod self_test;
 mod verify;
 
@@ -48,8 +53,15 @@ pub use builder::{
     BlockBuilder, BuildError, DEFAULT_MAX_ATTEMPTS, DEFAULT_MINING_BUDGET_BYTES,
     default_max_attempts, mine, sign_block, sign_block_id,
 };
-pub use consts::{BLOCK_ID_CONTEXT, SIG_PREFIX, SIGNED_MESSAGE_LEN};
+pub use consts::{
+    BLOCK_ID_CONTEXT, ENC_KEY_DIRECTORY_CONTEXT, SEALED_HPKE_INFO, SEALED_SIG_PREFIX, SIG_PREFIX,
+    SIGNED_MESSAGE_LEN,
+};
 pub use error::Error;
+pub use sealed_sig::{
+    SEALED_SIG_FIXED_LEN, SealedSigError, SealedSigMessage, sealed_sig_message,
+    sealed_sig_message_len, sign_sealed, verify_sealed,
+};
 pub use self_test::{
     S_PLUS_L_BLOCK, S_PLUS_L_EXPECTED_ERROR, SELF_TEST_BLOCK_ID, SELF_TEST_BLOCK_LEN,
     SELF_TEST_VALID_BLOCK, SelfTestError, self_test,

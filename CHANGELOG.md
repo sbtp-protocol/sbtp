@@ -40,6 +40,10 @@ Initial public version. Pre-release software: no version is supported for produc
   resource limits and admission control, structured logs and metrics, store integrity checks;
   distroless container image and reverse-proxy guidance in `deploy/`.
 - `sbtp-l2`: validation of the layer 2 grammar.
+- `sbtp-core`: the inner signature of a sealed payload (`l2-grammar.md` §5.3): typed builder
+  `sealed_sig_message` (into a caller buffer, no allocation), `sign_sealed`, and `verify_sealed` with the
+  strict criteria V1 to V6 (`SealedSigError`); the layer 2 registry constants `SEALED_HPKE_INFO`,
+  `SEALED_SIG_PREFIX` and `ENC_KEY_DIRECTORY_CONTEXT` (spec §3.5).
 - `sbtp-wasm`: WebAssembly bindings; `examples/cli-demo`: keygen, mine, sign, publish, query; `web/`:
   minimal browser client.
 

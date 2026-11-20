@@ -1,5 +1,6 @@
 //! Criterion benches: parse (F1 to F9), `block_id`, signature verification (C2, C3), full
-//! validation, and PoW mining at d = 16 and 20.
+//! validation, PoW mining at d = 16 and 20, and the sealed inner signature (build and verify, at
+//! the smallest and largest sealed plaintexts).
 //!
 //! `cargo bench -p sbtp-core`. Keys from public seeds only (key A: 32 × `0x01`).
 
@@ -124,5 +125,35 @@ fn bench_pow(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parse_and_id, bench_verify, bench_pow);
+fn bench_sealed_sig(c: &mut Criterion) {
+    let from = key_a().verifying_key().to_bytes();
+    let mut group = c.benchmark_group("verify_sealed");
+    // `msg` lengths bounded by the smallest and largest sealed plaintexts (l2-grammar.md §5.2).
+    for (name, len) in [("406B", 406usize), ("65429B", 65_429)] {
+        let msg = vec![0x5a; len];
+        let mut buf = vec![0u8; sbtp_core::SEALED_SIG_FIXED_LEN + len];
+        let sig = {
+            let m = sbtp_core::sealed_sig_message(&from, &from, &from, &msg, &mut buf).unwrap();
+            sbtp_core::sign_sealed(&key_a(), &m).unwrap()
+        };
+        group.throughput(Throughput::Bytes(len as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let m =
+                    sbtp_core::sealed_sig_message(&from, &from, &from, black_box(&msg), &mut buf)
+                        .unwrap();
+                sbtp_core::verify_sealed(&from, &sig, &m).unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_parse_and_id,
+    bench_verify,
+    bench_pow,
+    bench_sealed_sig
+);
 criterion_main!(benches);
