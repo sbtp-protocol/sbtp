@@ -52,6 +52,11 @@ Initial public version. Pre-release software: no version is supported for produc
   `sbtp.enc` and `sbtp.enc_key` (padding lengths, ciphertext length, key fields); `KindRow` declares its
   repeatable verbs per row (`repeatable`), and a required verb appears exactly once.
 
+### Changed (relay hardening)
+
+- `sbtp-relay`: `GET /sbtp/v1/info` carries `Cache-Control: no-store`, so that a CDN in front of the
+  relay never serves settings from before a restart.
+
 ### Security
 
 - Independent security reviews of the decoder, the cryptography, the relay and the clients are in
