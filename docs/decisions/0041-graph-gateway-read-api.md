@@ -1,6 +1,6 @@
 # 0041: Graph gateway: an optional read API over the relay interface
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: touches Q-11 (synchronisation, not decided here) and Q-23 (push delivery, not decided
   here); opens Q-64 and Q-65

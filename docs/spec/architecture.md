@@ -32,7 +32,8 @@ and one sealed envelope (`l2-grammar.md`); applications are specified and implem
 repository (ADR 0038). A payload declares the meaning of each header parent through typed edges (ADR
 0015). An author retracts its own blocks with a signed tombstone; moderation relies on signed blocks
 published by keys the user chooses to trust (verb `moderates`), not on physical deletion. Signed rolling
-indexes give the recent state without walking the whole history.
+indexes give the recent state without walking the whole history. Programs read the graph without scraping
+pages through the `sbtp:` URI, the JSON block view and an optional graph gateway (`graph-access.md`).
 
 Blocks are public by default. Layer 2 adds a sealed envelope (`sbtp.enc`, HPKE RFC 9180) for payloads
 addressed to chosen recipients. A sealed block is an ordinary layer 0 block signed by a one-time key, whose
@@ -90,14 +91,18 @@ On the first failure, the block is rejected without allocating any persistent re
   runs the relay binary itself, over loopback HTTP. (ADR 0013, protocol clarified by ADR 0017)
 
 ### Eviction
-- A block expires when `received_at + block_ttl_ms ≤ now`. `block_ttl_ms` is a relay setting (default: 30
-  days), published by `/info`. Eviction does not depend on reads, and a `PUT` of a stored block does not
-  extend its lifetime.
+- A block expires when `received_at + block_ttl_ms ≤ now`. `block_ttl_ms` is a relay setting (default:
+  30 days), published by `/info`. Eviction does not depend on reads. A `PUT` of a held, unexpired block
+  does not extend its lifetime. From its expiry a block is not held for `PUT`: a `PUT` of it is a new
+  block (`201`, new `received_at`), even before the sweeper has deleted it, and the sweeper then deletes
+  nothing of it. (ADR 0043)
 - `/query` never lists an expired block. A sweeper deletes expired blocks periodically, oldest first:
   cache entry, block file, then index entries.
 - A relay MAY disable eviction (archive relay; `block_ttl_ms = 0` in the settings of `sbtp-relay`);
   `/info` then publishes `"block_ttl_ms": null`. (ADR 0019)
 - Eviction is local to a relay and is not a deletion mechanism. (ADR 0013)
+- Long-lived blocks are kept available by archive relays and by clients that submit them again after
+  expiry; a `PUT` never renews a block before it expires. (ADR 0043)
 
 ### Quota
 - `max_store_bytes` bounds the block files and quarantined files (each counted in 4,096-byte units
@@ -124,6 +129,9 @@ On the first failure, the block is rejected without allocating any persistent re
   `idle_timeout_ms`). A new connection that sends nothing is closed at `header_timeout_ms`. (ADR 0019)
 - One client holds at most `max_connections_per_client` connections, or requests in flight when it
   comes through a trusted proxy. (ADR 0019)
+- Behind trusted proxies, the client address comes from `X-Forwarded-For`, or, when the operator
+  sets `client_ip_header`, from that single-value header written by a CDN. Either source is read only
+  from a peer in `trusted_proxies`. (ADR 0020, ADR 0044)
 - A `profile` setting (`small`, `standard`, `large`) gives coherent values to the resource limits. Each
   setting overrides it. The 15 MB worst-case memory target applies to `small` with TLS off.
   (ADR 0019, ADR 0028)
@@ -140,6 +148,6 @@ On the first failure, the block is rejected without allocating any persistent re
 | 1 | Zero-install PWA (WASM, OPFS, IndexedDB, WebRTC) | Universal access, P2P while the tab is open. |
 | 2 | Self-hosted micro-relays (Rust binary ~5 MB, < 15 MB RAM with the default profile `small` and TLS off) | Backbone. Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
 | 3 | Object storage / CDN (S3, R2, Pages) | Static mirrors, near-zero cost. |
-| 4 | Desktop / mobile daemon | Super-peers: 24/7 seeding, indexing. |
+| 4 | Desktop / mobile daemon | Super-peers: 24/7 seeding, indexing; MAY run a graph gateway (`graph-access.md` §3). |
 
 Browser extensions are not a primary target (installation friction, Manifest V3, not available on mobile).

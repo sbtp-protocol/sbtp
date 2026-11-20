@@ -425,8 +425,8 @@ the envelope through the tags it defines (§5.4).
   any version retracts the chain, §4.2). A user SHOULD rotate at least every 90 days. A recipient keeps
   older private keys as long as it wants to read messages sealed to them, and MAY erase one once no relay
   it uses can still hold such a message and it has kept the plaintexts.
-- A client MUST submit its current key block again (the same bytes) before the shortest `block_ttl_ms`
-  of its relays, or rotate at that interval.
+- A client MUST submit its current key block again (the same bytes) to each relay with a TTL once it
+  has expired there (`architecture.md` §2, "Eviction"), or rotate at that interval. (ADR 0043)
 - **Storage.** In the web client, X25519 private keys are raw bytes in IndexedDB: an injected script can
   copy them, whereas it can only use the non-extractable identity key. A web build that holds them MUST
   be served with the web client's strict Content Security Policy; otherwise it MUST NOT enable any
