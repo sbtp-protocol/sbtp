@@ -76,6 +76,14 @@ js-sys = { version = "0.3.107", default-features = false }
 # reads the OS source. Already in the graph through proptest and tempfile (dev only until now).
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 
+# Sealing (crates/sbtp-seal, ADR 0016 rule 1 and D7): HPKE base mode, DHKEM(X25519, HKDF-SHA256),
+# HKDF-SHA256, ChaCha20Poly1305, single-shot API only. Exact pin; no default features (drops
+# getrandom, ML-KEM, X-Wing, SHAKE). Never use `hpke::danger`. Needs Rust 1.87. Review
+# docs/security/2026-11-20-hpke-dependency.md: the lock MUST hold `ctutils` >= 0.4.4 (RUSTSEC-2026-0385;
+# resolve with the workspace MSRV raised first) and `inout` <= 0.2.5 until 0.2.6 is 14 days old
+# (2026-11-21).
+hpke = { version = "=0.15.1", default-features = false, features = ["x25519", "chacha", "alloc"] }
+
 # Tests & benches
 proptest = "1.12.0"
 criterion = "0.8.2"
