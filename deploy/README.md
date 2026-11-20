@@ -97,6 +97,39 @@ docker run -d --name sbtp-relay \
   `memory_bound` gives the computed worst case of the settings in use (about 13.7 MB with the
   `small` profile). A container limit of 32 MiB leaves room.
 
+## Pulling the CI image
+
+The `relay-image.yml` workflow (docs/ci.md) builds `deploy/Dockerfile` on GitHub Actions and
+pushes `ghcr.io/sbtp-protocol/sbtp-relay` for `linux/amd64`. It runs on a `relay-v<version>` tag
+(image tags `<version>` and `sha-<commit>`) or on a manual dispatch from `main` (`sha-<commit>`
+only). The digest is in the run's job summary, and in the package page on GitHub.
+
+**Deploy by digest, never by tag.** A tag can be moved to another image; a digest names exactly
+the bytes that CI built:
+
+```bash
+docker pull ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest>
+docker run -d --name sbtp-relay \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v sbtp-data:/data -p 127.0.0.1:8080:8080 \
+  ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest>
+```
+
+In Compose, Kubernetes or Coolify, write the image as `ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest>`
+too. To check which commit an image was built from:
+`docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' <image>`.
+Check its build provenance before deploying:
+`gh attestation verify oci://ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest> -R sbtp-protocol/sbtp`.
+
+**Access.** The repository is public and so is the package: pulling needs no token and no
+`docker login` on the host. Do not create a token for it. If a pull is refused with `denied` or
+`unauthorized`, the package is still private (GHCR creates a package private on its first push in
+some organisation settings): make it public in the package settings ("Change visibility") rather
+than giving the host a token. Only if the package must stay private, use a classic personal access
+token with the `read:packages` scope only (GHCR does not accept fine-grained tokens for pulls at
+the time of writing), with an expiry of 90 days or less, stored on that host only (`docker login
+ghcr.io -u <account> --password-stdin`), never in the repository or a deployment file.
+
 ## Behind a reverse proxy
 
 Whatever the proxy, it MUST (ADR 0019 rules 18, 34 and 42; ADR 0030):

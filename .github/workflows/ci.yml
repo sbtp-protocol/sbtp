@@ -1,0 +1,99 @@
+# CI: the checks of CONTRIBUTING.md ("Before every commit") on every push and pull request to
+# `main`. Hardening (see docs/ci.md): every action pinned by full commit SHA, a read-only token
+# (`contents: read`, which a checkout of a private repository needs), no secret, no `pull_request_target`, no cache
+# (nothing written by one run is executed by another), the Rust toolchain from
+# `rust-toolchain.toml` through the runner's preinstalled rustup, cargo-deny built from crates.io
+# with `--locked` at a pinned version.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: fmt, clippy, test, no_std, wasm32, vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup is preinstalled on GitHub-hosted runners. With no argument, `rustup toolchain
+      # install` installs the toolchain, components and targets named by rust-toolchain.toml
+      # (rustup 1.28 and later); `rustup show` does the same on older rustup.
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup --version
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: sbtp-core without std (no_std)
+        run: cargo build -p sbtp-core --no-default-features --locked
+
+      - name: sbtp-wasm for wasm32
+        run: cargo build -p sbtp-wasm --target wasm32-unknown-unknown --locked
+
+      - name: Frozen test vectors intact
+        run: cargo run -p sbtp-core --features vector-gen --example gen_vectors --locked -- --check
+
+  deny:
+    name: cargo deny (workspace and fuzz)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Newest cargo-deny release older than two weeks on 2026-11-20 (CONTRIBUTING.md, two-week
+      # rule); `--locked` builds it with its own committed Cargo.lock.
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+
+      # Fetches the RustSec advisory database, so a new advisory can fail a run on unchanged code.
+      - name: cargo deny (workspace)
+        run: cargo deny check
+
+      - name: cargo deny (fuzz manifest)
+        run: cargo deny --manifest-path fuzz/Cargo.toml check
