@@ -1,15 +1,15 @@
 # 0039: Parent roles of `sbtp.enc_key`, closed edge set of `sbtp.enc`, undefined `sbtp.*` kinds
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: none open; points raised by the 2026-11-20 review of the `sbtp-l2` fixes
   (`docs/security/2026-11-20-review-fixes-core-l2.md`, "The author's four open spec points")
-- Amends, if accepted: ADR 0016 rule 21 (the parent positions of an `sbtp.enc_key` become a grammar
+- Amends: ADR 0016 rule 21 (the parent positions of an `sbtp.enc_key` become a grammar
   validation rule) and the `sbtp.enc` row of its mapping table (closed edge set); ADR 0032 rule 4 (one
   more kind with a closed edge set). Nothing else in ADR 0016 or ADR 0032 changes
 - Depends on: ADR 0015 (grammar, coverage and order of edges), ADR 0016 (sealed envelope, key
   directory), ADR 0032 (kind rows, closed edge sets, validation inputs)
-- Impact: `l2-grammar.md` §2.1, §5.2, §5.5 (rules 1 to 4, "Spec change on acceptance"), §1.3 and §5.5
+- Impact: `l2-grammar.md` §2.1, §5.2, §5.5 (rules 1 to 4, "Spec change on acceptance", applied on acceptance), §1.3 and §5.5
   (rules 5 and 6, editorial, applied with this proposal); `crates/sbtp-l2` (`check_shape`, two error
   variants, tests); no layer 0 change; no test vector (there is no layer 2 vector set yet; the frozen set
   `docs/test-vectors/v1/` is not affected)
