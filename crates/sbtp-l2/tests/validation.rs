@@ -147,11 +147,15 @@ fn valid_payload_per_kind_round_trips() {
     let bytes = env("sbtp.manifest", vec![e(0, "in")], manifest);
     assert!(matches!(ok(1, &bytes).body, Body::Manifest(_)));
     ok(0, &env("sbtp.manifest", vec![], manifest_body()));
-    // Unknown kinds (and the reserved `sbtp.enc`): map or byte string body, no row applied.
+    // Unknown kinds: map or byte string body, no row applied. An `sbtp.*` kind that spec §3 does
+    // not define is an unknown kind too (spec §1.3, §2.4): a later version may define it.
     let bytes = env("other.thing", vec![e(0, "frobnicates")], V::Bytes(b"x"));
     let p = ok(1, &bytes);
     assert!(matches!(p.body, Body::Raw(_)));
-    ok(0, &env("sbtp.enc", vec![], V::Bytes(b"ciphertext")));
+    let later = env("sbtp.later", vec![], V::Bytes(b"ciphertext"));
+    let future = ok(0, &later);
+    assert!(matches!(future.body, Body::Raw(_)));
+    ok(1, &env("sbtp.later", vec![e(0, "in")], empty()));
     ok(0, &env("a.b", vec![], empty()));
     let kind64 = format!("{}.{}", "a".repeat(31), "b".repeat(32));
     ok(0, &env(&kind64, vec![], empty()));
@@ -547,15 +551,57 @@ fn check_row_reads_a_row() {
         check_row(&row, 2, &[edge(0, Rel::In), edge(1, Rel::In)]),
         Err(E::EdgeMultiplicity)
     );
-    // `cites` and `composed_of` repeat; extension verbs are outside the row and do not count.
+    // spec §3.1: multiplicity is per row. Without "any number", a second `cites` is refused;
+    // extension verbs are outside the row and do not count.
     let many = [
         edge(0, Rel::In),
         cite.clone(),
-        cite,
+        cite.clone(),
         ext.clone(),
         ext.clone(),
     ];
-    assert_eq!(check_row(&row, 1, &many), Ok(()));
+    assert_eq!(check_row(&row, 1, &many), Err(E::EdgeMultiplicity));
+    let any_cites = row.repeatable(&["cites"]);
+    assert_eq!(check_row(&any_cites, 1, &many), Ok(()));
+    assert_eq!(check_row(&any_cites, 1, &many[..2]), Ok(()));
+    // A required verb is allowed without being listed in `allowed`, and appears exactly once,
+    // also on a non-causal target that the Parents column cannot catch.
+    let cited = KindRow::new((0, 0), &[], &["cites"]);
+    assert_eq!(check_row(&cited, 0, std::slice::from_ref(&cite)), Ok(()));
+    assert_eq!(check_row(&cited, 0, &[]), Err(E::MissingRequiredEdge));
+    assert_eq!(
+        check_row(&cited, 0, &[cite.clone(), cite.clone()]),
+        Err(E::EdgeMultiplicity)
+    );
+    // Listing a required verb as repeatable does not relax "exactly once".
+    let cited_any = cited.repeatable(&["cites"]);
+    assert_eq!(
+        check_row(&cited_any, 0, &[cite.clone(), cite]),
+        Err(E::EdgeMultiplicity)
+    );
+    // A required causal verb twice, on a row whose Parents maximum allows it.
+    let two_in = KindRow::new((2, 2), &[], &["in"]);
+    assert_eq!(
+        check_row(&two_in, 2, &[edge(0, Rel::In), edge(1, Rel::In)]),
+        Err(E::EdgeMultiplicity)
+    );
+    assert_eq!(
+        check_row(
+            &two_in,
+            2,
+            &[
+                edge(0, Rel::In),
+                Edge {
+                    target: Target::Parent(1),
+                    rel: Rel::Extension {
+                        verb: "x.a.b",
+                        meta: None
+                    }
+                }
+            ]
+        ),
+        Ok(())
+    );
     // `one_of`: exactly one of its verbs.
     let vote = KindRow {
         one_of: &["endorses", "opposes"],
@@ -825,6 +871,15 @@ fn mutations_never_panic_and_accepted_payloads_are_canonical() {
             ),
         ),
         (1, env("sbtp.manifest", vec![e(0, "in")], manifest_body())),
+        (1, sealed(512, vec![])),
+        (
+            2,
+            env(
+                "sbtp.enc_key",
+                vec![e(0, "tagged"), e(1, "supersedes")],
+                enc_key_body(&A, V::Uint(3)),
+            ),
+        ),
     ];
     let bytes = [
         0x00, 0x01, 0x17, 0x18, 0x1f, 0x20, 0x41, 0x61, 0x7f, 0x80, 0xa0, 0xbf, 0xf6, 0xff,
@@ -849,4 +904,299 @@ fn mutations_never_panic_and_accepted_payloads_are_canonical() {
             }
         }
     }
+}
+
+// --- `tagged`, `tallies` (spec §2.2) and the sealed envelope kinds (spec §3, §5.2, §5.5) ---
+
+/// `sbtp.enc` body.
+fn enc_body<'a>(ct: &'a [u8], enc: &'a [u8]) -> V<'a> {
+    map(&[("ct", V::Bytes(ct)), ("enc", V::Bytes(enc))])
+}
+
+/// A conforming `sbtp.enc` payload of `bucket` bytes (spec §5.2), with `extra` edges after the
+/// `tagged` one and a ciphertext shortened to keep the bucket.
+fn sealed(bucket: usize, extra: Vec<V<'_>>) -> Vec<u8> {
+    let probe = env("sbtp.enc", extra.clone(), enc_body(&[], &A));
+    // `ct` grows from 0 bytes (1-byte head) to 256 or more bytes (3-byte head).
+    // + 2 head bytes, + 15 bytes of `{"p": 0, "rel": "tagged"}`.
+    let fixed = probe.len() + 2 + 15;
+    let ct = vec![0x5a; bucket - fixed];
+    let mut edges = vec![e(0, "tagged")];
+    edges.extend(extra);
+    env("sbtp.enc", edges, enc_body(&ct, &A))
+}
+
+fn enc_key_body<'a>(x25519: &'a [u8], bucket: V<'a>) -> V<'a> {
+    map(&[("x25519", V::Bytes(x25519)), ("intro_bucket", bucket)])
+}
+
+#[test]
+fn tagged_and_tallies_are_registry_verbs() {
+    // `tallies`: `p` only, no `meta`; grammar validation leaves its kind to the application.
+    let bytes = env("a.b", vec![e(0, "tallies")], empty());
+    let p = ok(1, &bytes);
+    assert_eq!(p.edges[0].rel, Rel::Tallies);
+    assert!(p.edges[0].rel.is_registry());
+    assert_eq!(
+        err(0, &env("a.b", vec![en("block", &A, "tallies")], empty())),
+        E::TargetFormNotAllowed
+    );
+    let meta = map(&[("n", V::Uint(1))]);
+    assert_eq!(
+        err(
+            1,
+            &env("a.b", vec![em(0, "tallies", meta.clone())], empty())
+        ),
+        E::MetaNotAllowed
+    );
+    // No `sbtp.*` row lists it.
+    assert_eq!(
+        err(
+            1,
+            &env("sbtp.manifest", vec![e(0, "tallies")], manifest_body())
+        ),
+        E::EdgeNotAllowedForKind
+    );
+    // An application row that lists it accepts it; one that does not refuses it.
+    let tally = Edge {
+        target: Target::Parent(0),
+        rel: Rel::Tallies,
+    };
+    let listed = KindRow::new((1, 1), &[], &["tallies"]);
+    assert_eq!(check_row(&listed, 1, std::slice::from_ref(&tally)), Ok(()));
+    let other = KindRow::new((1, 1), &["in"], &[]);
+    assert_eq!(
+        check_row(&other, 1, &[tally]),
+        Err(E::EdgeNotAllowedForKind)
+    );
+
+    // `tagged`: `p` only, no `meta`, only on `sbtp.enc` and `sbtp.enc_key`.
+    let key = enc_key_body(&A, V::Uint(0));
+    let bytes = env("sbtp.enc_key", vec![e(0, "tagged")], key.clone());
+    let p = ok(1, &bytes);
+    assert_eq!(p.edges[0].rel, Rel::Tagged);
+    assert!(p.edges[0].rel.is_registry());
+    for kind in ["a.b", "app.item", "sbtp.later"] {
+        assert_eq!(
+            err(1, &env(kind, vec![e(0, "tagged")], empty())),
+            E::TaggedNotAllowed,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        err(
+            1,
+            &env("sbtp.manifest", vec![e(0, "tagged")], manifest_body())
+        ),
+        E::TaggedNotAllowed
+    );
+    assert_eq!(
+        err(
+            1,
+            &env(
+                "sbtp.enc_key",
+                vec![e(0, "tagged"), en("block", &A, "tagged")],
+                key.clone()
+            )
+        ),
+        E::TargetFormNotAllowed
+    );
+    assert_eq!(
+        err(1, &env("sbtp.enc_key", vec![em(0, "tagged", meta)], key)),
+        E::MetaNotAllowed
+    );
+}
+
+#[test]
+fn sealed_block_row_body_and_buckets() {
+    // spec §5.2: one valid payload per length bucket, round trip.
+    for bucket in sbtp_l2::ENC_PAYLOAD_LENS {
+        let bytes = sealed(bucket, vec![]);
+        assert_eq!(bytes.len(), bucket);
+        let p = ok(1, &bytes);
+        let Body::Enc(enc) = p.body else {
+            panic!("not an sbtp.enc body")
+        };
+        assert_eq!(enc.ct.len(), bucket - sbtp_l2::ENC_OVERHEAD);
+        assert_eq!(enc.enc, A);
+    }
+    let ct = vec![0x5a; 422];
+    let body = || enc_body(&ct, &A);
+    let tagged = || vec![e(0, "tagged")];
+    assert_eq!(ok(1, &env("sbtp.enc", tagged(), body())).edges.len(), 1);
+
+    // Row: exactly 1 parent, the single `tagged` edge (spec §3, §5.2).
+    assert_eq!(err(0, &env("sbtp.enc", vec![], body())), E::KindParentCount);
+    assert_eq!(
+        err(
+            2,
+            &env("sbtp.enc", vec![e(0, "tagged"), e(1, "x.a.b")], body())
+        ),
+        E::KindParentCount
+    );
+    assert_eq!(
+        err(1, &env("sbtp.enc", vec![e(0, "x.a.b")], body())),
+        E::MissingRequiredEdge
+    );
+    assert_eq!(
+        err(
+            1,
+            &env(
+                "sbtp.enc",
+                vec![e(0, "tagged"), en("block", &A, "cites")],
+                body()
+            )
+        ),
+        E::EdgeNotAllowedForKind
+    );
+
+    // Body: exactly `ct` (bytes) and `enc` (32 bytes).
+    let only_ct = map(&[("ct", V::Bytes(&ct))]);
+    assert_eq!(
+        err(1, &env("sbtp.enc", tagged(), only_ct)),
+        E::BodyMissingField
+    );
+    let extra = map(&[
+        ("ct", V::Bytes(&ct)),
+        ("enc", V::Bytes(&A)),
+        ("from", V::Bytes(&A)),
+    ]);
+    assert_eq!(
+        err(1, &env("sbtp.enc", tagged(), extra)),
+        E::BodyUnknownField
+    );
+    assert_eq!(
+        err(1, &env("sbtp.enc", tagged(), enc_body(&ct, &SHORT))),
+        E::BodyIdSize
+    );
+    let text_ct = map(&[("ct", V::Text("x")), ("enc", V::Bytes(&A))]);
+    assert_eq!(
+        err(1, &env("sbtp.enc", tagged(), text_ct)),
+        E::BodyFieldValue
+    );
+    assert_eq!(
+        err(1, &env("sbtp.enc", tagged(), V::Bytes(&ct))),
+        E::BodyType
+    );
+
+    // Length rules (spec §5.2), checked from the payload alone.
+    let short = vec![0x5a; 421];
+    let bytes = env("sbtp.enc", tagged(), enc_body(&short, &A));
+    assert_eq!(bytes.len(), 511);
+    assert_eq!(err(1, &bytes), E::EncPayloadLen);
+    let tiny = env("sbtp.enc", tagged(), enc_body(b"ciphertext", &A));
+    assert_eq!(err(1, &tiny), E::EncPayloadLen);
+    // A payload of a bucket's length that is not 90 bytes plus `ct`: an extra edge took the
+    // place of ciphertext bytes.
+    let padded = sealed(512, vec![en("chunk", &A, "x.a.b")]);
+    assert_eq!(padded.len(), 512);
+    assert_eq!(err(1, &padded), E::EncCiphertextLen);
+}
+
+#[test]
+fn encryption_key_row_and_body() {
+    let key = || enc_key_body(&A, V::Uint(7));
+    let bytes = env("sbtp.enc_key", vec![e(0, "tagged")], key());
+    let p = ok(1, &bytes);
+    assert_eq!(
+        p.body,
+        Body::EncKey(sbtp_l2::EncKey {
+            x25519: A,
+            intro_bucket: 7
+        })
+    );
+    // An update: the previous version as a second parent, `supersedes` (spec §5.5).
+    let reason = map(&[("reason", V::Text("rotation"))]);
+    ok(
+        2,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged"), em(1, "supersedes", reason)],
+            key(),
+        ),
+    );
+    // The row is open: extension verbs are allowed (spec §2.3, §3.1).
+    ok(
+        2,
+        &env("sbtp.enc_key", vec![e(0, "tagged"), e(1, "x.a.b")], key()),
+    );
+    // Row: 1 or 2 parents, exactly one `tagged`, at most one `supersedes`, nothing else.
+    assert_eq!(
+        err(0, &env("sbtp.enc_key", vec![], key())),
+        E::KindParentCount
+    );
+    let three = vec![e(0, "tagged"), e(1, "supersedes"), e(2, "x.a.b")];
+    assert_eq!(
+        err(3, &env("sbtp.enc_key", three, key())),
+        E::KindParentCount
+    );
+    assert_eq!(
+        err(1, &env("sbtp.enc_key", vec![e(0, "supersedes")], key())),
+        E::MissingRequiredEdge
+    );
+    assert_eq!(
+        err(
+            2,
+            &env("sbtp.enc_key", vec![e(0, "tagged"), e(1, "tagged")], key())
+        ),
+        E::EdgeMultiplicity
+    );
+    assert_eq!(
+        err(
+            2,
+            &env("sbtp.enc_key", vec![e(0, "tagged"), e(1, "follows")], key())
+        ),
+        E::EdgeNotAllowedForKind
+    );
+    // Body: exactly `x25519` (32 bytes) and `intro_bucket` (0 to 15).
+    ok(
+        1,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged")],
+            enc_key_body(&A, V::Uint(0)),
+        ),
+    );
+    ok(
+        1,
+        &env(
+            "sbtp.enc_key",
+            vec![e(0, "tagged")],
+            enc_key_body(&A, V::Uint(15)),
+        ),
+    );
+    for bucket in [16, 255, 256, u64::MAX] {
+        assert_eq!(
+            err(
+                1,
+                &env(
+                    "sbtp.enc_key",
+                    vec![e(0, "tagged")],
+                    enc_key_body(&A, V::Uint(bucket))
+                )
+            ),
+            E::EncKeyIntroBucket,
+            "{bucket}"
+        );
+    }
+    let bad = [
+        (enc_key_body(&A, V::Nint(0)), E::BodyFieldValue),
+        (enc_key_body(&SHORT, V::Uint(0)), E::BodyIdSize),
+        (map(&[("x25519", V::Bytes(&A))]), E::BodyMissingField),
+        (map(&[("intro_bucket", V::Uint(0))]), E::BodyMissingField),
+        (empty(), E::BodyMissingField),
+        (V::Bytes(&A), E::BodyType),
+    ];
+    for (i, (body, expected)) in bad.into_iter().enumerate() {
+        let bytes = env("sbtp.enc_key", vec![e(0, "tagged")], body);
+        assert_eq!(err(1, &bytes), expected, "case {i}");
+    }
+    let mut extra = key();
+    if let V::Map(m) = &mut extra {
+        m.push(("purpose", V::Text("dm")));
+    }
+    assert_eq!(
+        err(1, &env("sbtp.enc_key", vec![e(0, "tagged")], extra)),
+        E::BodyUnknownField
+    );
 }

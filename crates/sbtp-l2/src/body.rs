@@ -35,13 +35,25 @@ pub fn id(r: &mut Reader<'_>) -> Result<Id, L2Error> {
 /// refuses, or the first error of `f`.
 pub fn fields<'a, E: From<L2Error>>(
     r: &mut Reader<'a>,
+    f: impl FnMut(&'a str, &mut Reader<'a>) -> Result<bool, E>,
+) -> Result<(), E> {
+    closed_map(r, L2Error::BodyType, L2Error::BodyUnknownField, f)
+}
+
+/// Reads a closed map, as [`fields`], with the caller's errors: `not_map` when the item is not a
+/// map, `unknown` for a key `f` refuses. Shared by the bodies, the edges and their `meta`.
+pub(crate) fn closed_map<'a, E: From<L2Error>>(
+    r: &mut Reader<'a>,
+    not_map: L2Error,
+    unknown: L2Error,
     mut f: impl FnMut(&'a str, &mut Reader<'a>) -> Result<bool, E>,
 ) -> Result<(), E> {
-    let n = r.expect(Major::Map, L2Error::BodyType)?;
+    let n = r.expect(Major::Map, not_map)?;
     for _ in 0..n {
-        let key = r.text(L2Error::BodyType)?;
+        // The profile (spec §1.2) already made every key a text string.
+        let key = r.text(not_map)?;
         if !f(key, r)? {
-            return Err(L2Error::BodyUnknownField.into());
+            return Err(unknown.into());
         }
     }
     Ok(())

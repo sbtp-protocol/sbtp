@@ -114,6 +114,7 @@ impl From<BuildError> for BindError {
             BuildError::KeyMismatch => names::KEY_MISMATCH,
             BuildError::DifficultyTooHigh { .. } => names::DIFFICULTY_TOO_HIGH,
             BuildError::Signing => names::SIGNING,
+            BuildError::NonceSpaceExhausted => names::NONCE_SPACE_EXHAUSTED,
             BuildError::BufferTooSmall { .. } | BuildError::PowNotFound => names::INTERNAL,
         };
         Self::new(name, error.to_string())
@@ -198,6 +199,7 @@ mod tests {
                 "DuplicateParent",
             ),
             (BuildError::PowNotFound, "Internal"),
+            (BuildError::NonceSpaceExhausted, "NonceSpaceExhausted"),
         ];
         for (error, name) in cases {
             assert_eq!(BindError::from(error).name(), name);

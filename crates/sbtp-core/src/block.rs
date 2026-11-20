@@ -228,16 +228,25 @@ pub fn parse(bytes: &[u8]) -> Result<BlockRef<'_>, Error> {
 
 /// spec §2.2 F9. Reports the first duplicate pair in `(first, second)` lexicographic order.
 fn check_distinct_parents(parents: &[BlockId]) -> Result<(), Error> {
-    for (i, a) in parents.iter().enumerate() {
-        for (j, b) in parents.iter().enumerate().skip(i + 1) {
-            if a == b {
-                // Indices are < 8 after F5.
-                return Err(Error::DuplicateParent {
-                    first: u8::try_from(i).unwrap_or(u8::MAX),
-                    second: u8::try_from(j).unwrap_or(u8::MAX),
-                });
-            }
-        }
+    match first_duplicate(parents) {
+        None => Ok(()),
+        // Indices are < 8 after F5.
+        Some((first, second)) => Err(Error::DuplicateParent {
+            first: u8::try_from(first).unwrap_or(u8::MAX),
+            second: u8::try_from(second).unwrap_or(u8::MAX),
+        }),
     }
-    Ok(())
+}
+
+/// spec §2.2 F9: the first pair of equal parents, in `(first, second)` lexicographic order, if
+/// any. Shared by the decoder and the builder. At most 8 parents reach it, so 28 comparisons.
+pub(crate) fn first_duplicate(parents: &[BlockId]) -> Option<(usize, usize)> {
+    parents.iter().enumerate().find_map(|(i, a)| {
+        parents
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .find(|(_, b)| a == *b)
+            .map(|(j, _)| (i, j))
+    })
 }

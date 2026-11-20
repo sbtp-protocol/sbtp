@@ -7,12 +7,11 @@ use core::fmt;
 
 use ed25519_dalek::{Signer, SigningKey};
 
-use crate::block::parse;
+use crate::block::{first_duplicate, parse};
 use crate::block_id::{BlockId, MAX_DIFFICULTY, block_id_hasher};
 use crate::error::Error;
 use crate::layout::{
-    MAGIC, MAX_PARENTS, MAX_PAYLOAD_LEN, OFFSET_NONCE, PUBKEY_LEN, SIGNATURE_LEN, VERSION_V1,
-    block_len,
+    MAGIC, MAX_PARENTS, OFFSET_NONCE, PUBKEY_LEN, SIGNATURE_LEN, VERSION_V1, block_len,
 };
 
 /// Why a block could not be built, mined or signed. Sender-side only: validation errors are
@@ -47,8 +46,12 @@ pub enum BuildError {
     Malformed(Error),
     /// The signing key does not match the `PubKey` field of the block.
     KeyMismatch,
-    /// The nonce space was exhausted (or the attempt limit reached) without meeting the difficulty.
+    /// The attempt budget was spent without meeting the difficulty. The block holds the next
+    /// untried nonce: a later call resumes there, and a larger budget may succeed.
     PowNotFound,
+    /// Every nonce up to `u64::MAX` was tried without meeting the difficulty. No later call can
+    /// succeed on this block: change the timestamp or the payload and mine again.
+    NonceSpaceExhausted,
     /// The difficulty is above 256: no `block_id` can meet it (spec §3.3), so mining is refused
     /// without trying a single nonce.
     DifficultyTooHigh {
@@ -81,6 +84,9 @@ impl fmt::Display for BuildError {
             Self::Malformed(error) => write!(f, "malformed block: {error}"),
             Self::KeyMismatch => f.write_str("signing key does not match the block public key"),
             Self::PowNotFound => f.write_str("no nonce meets the difficulty"),
+            Self::NonceSpaceExhausted => {
+                f.write_str("nonce space exhausted: every nonce up to 2^64 - 1 was tried")
+            }
             Self::DifficultyTooHigh { difficulty } => {
                 write!(f, "difficulty {difficulty} is above the maximum of 256")
             }
@@ -97,12 +103,48 @@ impl From<Error> for BuildError {
     }
 }
 
-/// Default attempt budget of [`BlockBuilder::build`]: 2^28 nonces, about 45 s at the measured
-/// 5.9 M attempts/s of a native build. Enough for a difficulty up to about 26 (expected 2^d
-/// attempts); a hostile relay announcing a difficulty of 60 costs the client that much and no more.
-/// Above about d = 26, [`BlockBuilder::build`] may return `PowNotFound`: raise the budget with
-/// [`BlockBuilder::max_attempts`].
-pub const DEFAULT_MAX_ATTEMPTS: u64 = 1 << 28;
+/// Default mining budget of [`BlockBuilder::build`], in bytes hashed: 2^34 (16 GiB).
+///
+/// Each attempt hashes the block's whole covered range (everything but the signature, 54 to
+/// 65,845 bytes), so a budget counted in attempts would cost about 1,000 times more on a block
+/// with a full payload than on a root block. Counted in bytes, the cost of one call does not depend
+/// on the block's size (spec §4, "Client bounds": what a relay can make a client spend depends on
+/// the client's settings). At the measured 5.9 M attempts/s of a native build on root blocks
+/// (one 64-byte BLAKE3 block each), the budget bounds a call to about 45 s. BLAKE3 pays one
+/// compression per started 64-byte block, so the bytes are counted rounded up to a multiple of 64
+/// (review fixes L-1); per compressed byte, longer inputs hash at least as fast, so larger blocks
+/// stay under that bound. A WASM
+/// build is slower, by a factor that depends on the engine and SIMD support: such a caller mines
+/// with [`mine`] in slices.
+///
+/// A hostile relay announcing a difficulty of 60 costs the client this much and no more. The
+/// attempts this gives a block are [`default_max_attempts`]: 2^28 for a root block, enough for a
+/// difficulty up to about 26 (expected 2^d attempts), and about 2^18 for the largest block.
+pub const DEFAULT_MINING_BUDGET_BYTES: u64 = 1 << 34;
+
+/// BLAKE3 compresses 64-byte blocks: a shorter covered range costs as much as 64 bytes.
+const HASH_BLOCK_LEN: u64 = 64;
+
+/// The attempts of [`DEFAULT_MINING_BUDGET_BYTES`] for the smallest blocks (covered range of at
+/// most 64 bytes): 2^28. Larger blocks get fewer; see [`default_max_attempts`]. A caller of
+/// [`mine`] that wants the default bound passes `default_max_attempts(block.len())`, not this
+/// constant.
+pub const DEFAULT_MAX_ATTEMPTS: u64 = DEFAULT_MINING_BUDGET_BYTES / HASH_BLOCK_LEN;
+
+/// The attempt budget that [`DEFAULT_MINING_BUDGET_BYTES`] gives a block of `block_len` bytes:
+/// the budget divided by the bytes each attempt compresses (the block without its signature,
+/// rounded up to a multiple of 64, BLAKE3's block size), and at least 1. This is what [`BlockBuilder::build`] uses unless
+/// [`BlockBuilder::max_attempts`] is set.
+#[must_use]
+pub fn default_max_attempts(block_len: usize) -> u64 {
+    let hashed = u64::try_from(block_len.saturating_sub(SIGNATURE_LEN)).unwrap_or(u64::MAX);
+    // BLAKE3 compresses whole 64-byte blocks: a started block costs a full compression.
+    let compressed = hashed
+        .div_ceil(HASH_BLOCK_LEN)
+        .saturating_mul(HASH_BLOCK_LEN)
+        .max(HASH_BLOCK_LEN);
+    (DEFAULT_MINING_BUDGET_BYTES / compressed).max(1)
+}
 
 /// Builds the bytes of a block. Parents and payload are borrowed, not copied.
 ///
@@ -115,7 +157,8 @@ pub struct BlockBuilder<'a> {
     pubkey: [u8; PUBKEY_LEN],
     parents: &'a [BlockId],
     payload: &'a [u8],
-    max_attempts: u64,
+    /// `None`: [`default_max_attempts`] of the encoded block.
+    max_attempts: Option<u64>,
 }
 
 impl<'a> BlockBuilder<'a> {
@@ -128,16 +171,17 @@ impl<'a> BlockBuilder<'a> {
             pubkey,
             parents: &[],
             payload: &[],
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_attempts: None,
         }
     }
 
     /// Sets the mining budget of [`BlockBuilder::build`]: at most `max_attempts` nonces are tried
-    /// before `PowNotFound`. Default [`DEFAULT_MAX_ATTEMPTS`] (2^28, enough up to about d = 26);
+    /// before `PowNotFound`, whatever the block's size. By default the budget is counted in bytes
+    /// hashed, [`DEFAULT_MINING_BUDGET_BYTES`], which gives [`default_max_attempts`] nonces;
     /// `u64::MAX` removes the bound.
     #[must_use]
     pub const fn max_attempts(mut self, max_attempts: u64) -> Self {
-        self.max_attempts = max_attempts;
+        self.max_attempts = Some(max_attempts);
         self
     }
 
@@ -181,29 +225,30 @@ impl<'a> BlockBuilder<'a> {
     ///
     /// `TooManyParents`, `DuplicateParent` or `PayloadTooLong`.
     pub fn encoded_len(&self) -> Result<usize, BuildError> {
+        let (count, payload_len) = self.checked_lens()?;
+        Ok(block_len(count, payload_len))
+    }
+
+    /// The Parents Count and Payload Len fields, once the parents and payload are known to fit
+    /// them and the parents are distinct.
+    fn checked_lens(&self) -> Result<(u8, u16), BuildError> {
+        // spec §2.2 F5.
         let count = u8::try_from(self.parents.len())
             .ok()
             .filter(|n| *n <= MAX_PARENTS)
             .ok_or(BuildError::TooManyParents {
                 count: self.parents.len(),
             })?;
-        let payload_len = u16::try_from(self.payload.len())
-            .ok()
-            .filter(|_| self.payload.len() <= MAX_PAYLOAD_LEN)
-            .ok_or(BuildError::PayloadTooLong {
+        // The Payload Len field is a u16: MAX_PAYLOAD_LEN is u16::MAX.
+        let payload_len =
+            u16::try_from(self.payload.len()).map_err(|_| BuildError::PayloadTooLong {
                 len: self.payload.len(),
             })?;
-        for (i, a) in self.parents.iter().enumerate() {
-            for (j, b) in self.parents.iter().enumerate().skip(i + 1) {
-                if a == b {
-                    return Err(BuildError::DuplicateParent {
-                        first: i,
-                        second: j,
-                    });
-                }
-            }
+        // spec §2.2 F9.
+        if let Some((first, second)) = first_duplicate(self.parents) {
+            return Err(BuildError::DuplicateParent { first, second });
         }
-        Ok(block_len(count, payload_len))
+        Ok((count, payload_len))
     }
 
     /// Writes the block at the start of `out`, with the 64 signature bytes set to zero, and returns
@@ -213,15 +258,13 @@ impl<'a> BlockBuilder<'a> {
     ///
     /// The errors of [`BlockBuilder::encoded_len`], or `BufferTooSmall`.
     pub fn write_unsigned(&self, out: &mut [u8]) -> Result<usize, BuildError> {
-        let needed = self.encoded_len()?;
+        let (count, payload_len) = self.checked_lens()?;
+        let needed = block_len(count, payload_len);
         let available = out.len();
         let buf = out.get_mut(..needed).ok_or(BuildError::BufferTooSmall {
             needed,
             len: available,
         })?;
-        // encoded_len checked both conversions.
-        let count = u8::try_from(self.parents.len()).unwrap_or(u8::MAX);
-        let payload_len = u16::try_from(self.payload.len()).unwrap_or(u16::MAX);
 
         // spec §2, ADR 0001: big-endian integers.
         let mut w = Writer { buf, pos: 0 };
@@ -255,20 +298,23 @@ impl<'a> BlockBuilder<'a> {
     /// Encodes, mines (starting from the builder's nonce, increment by 1, ADR 0001 rule 3) and signs
     /// the block.
     ///
-    /// **Bounded search.** At most [`BlockBuilder::max_attempts`] nonces are tried:
-    /// [`DEFAULT_MAX_ATTEMPTS`] = 2^28 unless set (review 2026-11-18 M2, F-4). A difficulty `d`
-    /// needs about 2^d attempts on average, so above about `d = 26` a call with the default budget
-    /// may return `PowNotFound`, and above about `d = 28` it usually will. To mine harder blocks,
-    /// raise the budget with `.max_attempts(n)`; `.max_attempts(u64::MAX)` makes the search
-    /// unbounded again (up to 2^64 nonces). `PowNotFound` (budget spent, a larger budget may
-    /// succeed) is distinct from `DifficultyTooHigh` (`d > 256`, no budget can succeed). A caller
-    /// that must stay responsive (WASM) mines with [`mine`] in small slices instead, and caps the
-    /// difficulty it accepts from a relay.
+    /// **Bounded search.** Unless [`BlockBuilder::max_attempts`] is set, the budget is
+    /// [`DEFAULT_MINING_BUDGET_BYTES`] bytes hashed, that is [`default_max_attempts`] nonces for
+    /// this block (review 2026-11-18 M2, F-4): about 45 s of native hashing whatever the payload
+    /// size. A difficulty `d` needs about 2^d attempts on average, so the default reaches about
+    /// `d = 26` on a root block and about `d = 16` on a block with a full payload; above that a
+    /// call may return `PowNotFound`. To mine harder blocks, raise the budget with
+    /// `.max_attempts(n)`; `.max_attempts(u64::MAX)` makes the search unbounded again (up to 2^64
+    /// nonces). `PowNotFound` (budget spent, a larger budget may succeed) is distinct from
+    /// `NonceSpaceExhausted` (every nonce tried) and `DifficultyTooHigh` (`d > 256`, no budget can
+    /// succeed). A caller that must stay responsive (WASM) mines with [`mine`] in small slices
+    /// instead, and caps the difficulty it accepts from a relay.
     ///
     /// # Errors
     ///
     /// The errors of [`BlockBuilder::encoded_len`], `DifficultyTooHigh` (above 256, returned before
-    /// any work), `KeyMismatch`, `PowNotFound` (attempt budget spent) or `Signing`.
+    /// any work), `KeyMismatch`, `PowNotFound` (attempt budget spent), `NonceSpaceExhausted` or
+    /// `Signing`.
     #[cfg(feature = "std")]
     pub fn build(
         &self,
@@ -281,7 +327,10 @@ impl<'a> BlockBuilder<'a> {
         }
         let mut out = self.build_unsigned()?;
         if difficulty > 0 {
-            mine(&mut out, difficulty, self.max_attempts)?;
+            let budget = self
+                .max_attempts
+                .unwrap_or_else(|| default_max_attempts(out.len()));
+            mine(&mut out, difficulty, budget)?;
         }
         sign_block(&mut out, key)?;
         Ok(out)
@@ -322,12 +371,18 @@ impl Writer<'_> {
 /// (spec §3.3). Starts from the Nonce field already in `block`, increments by 1 (ADR 0001 rule 3),
 /// tries at most `max_attempts` values. Returns the nonce and the `block_id`.
 ///
+/// Each attempt hashes the whole covered range of the block, so the cost of a call is about
+/// `max_attempts` times the block length: a caller that bounds its effort in time derives the
+/// attempts from the block length, for example with [`default_max_attempts`].
+///
 /// Nonce left in `block`:
 /// - on success, the winning nonce;
 /// - on `PowNotFound`, the **next untried** nonce (start + `max_attempts`), so that mining in
 ///   slices, `mine(&mut block, d, k)` called again until it succeeds, resumes where the previous
-///   slice stopped and reaches the same nonce as one unbounded call. If the nonce space ends
-///   (`u64::MAX` tried), the block keeps `u64::MAX` and every later call fails at once;
+///   slice stopped and reaches the same nonce as one unbounded call;
+/// - on `NonceSpaceExhausted`, `u64::MAX`, the last nonce tried. A later call starts there, tries
+///   it again (one attempt) and returns `NonceSpaceExhausted` again, so a resume loop that stops on
+///   any error other than `PowNotFound` ends;
 /// - on any other error, the block is unchanged.
 ///
 /// The signature bytes are not covered by the `block_id`: sign after mining.
@@ -336,7 +391,8 @@ impl Writer<'_> {
 ///
 /// `DifficultyTooHigh` if `difficulty > 256`, before any hashing (no `block_id` can meet it);
 /// `Malformed` if `block` fails F1 to F9; `PowNotFound` if no nonce was found within
-/// `max_attempts` attempts.
+/// `max_attempts` attempts; `NonceSpaceExhausted` once nonce `u64::MAX` was tried without success
+/// (checked before the budget: a slice that ends exactly there reports the exhaustion).
 pub fn mine(
     block: &mut [u8],
     difficulty: u32,
@@ -362,8 +418,11 @@ pub fn mine(
             return Ok((nonce, id));
         }
         attempts += 1;
-        // End of the nonce space: the block keeps u64::MAX, the last nonce tried.
-        nonce = nonce.checked_add(1).ok_or(BuildError::PowNotFound)?;
+        // End of the nonce space: the block keeps u64::MAX, the last nonce tried. Not resumable,
+        // hence not `PowNotFound`.
+        nonce = nonce
+            .checked_add(1)
+            .ok_or(BuildError::NonceSpaceExhausted)?;
     }
     // Budget spent: leave the next untried nonce, so that the next slice resumes there.
     set_nonce(block, nonce)?;

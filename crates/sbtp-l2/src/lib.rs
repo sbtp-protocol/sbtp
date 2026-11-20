@@ -36,4 +36,7 @@ pub use decode::{
     KindRow, MAX_EDGES, MAX_PARENTS, check_row, validate_block, validate_l2_invariants,
 };
 pub use error::L2Error;
-pub use payload::{Body, CHUNK_SIZE, Edge, Id, Manifest, Payload, Rel, Target};
+pub use payload::{
+    Body, CHUNK_SIZE, ENC_OVERHEAD, ENC_PAYLOAD_LENS, Edge, Enc, EncKey, Id, MAX_INTRO_BUCKET,
+    Manifest, Payload, Rel, Target,
+};
