@@ -91,7 +91,8 @@ optionally the key `meta`. Wire order: `p`, `rel`, `meta`, `block` or `chunk`.
   block that carries the payload. A block has 0 to 8 parents (core spec §2.2, ADR 0014).
 - **Coverage.** Every header parent MUST be named by exactly one edge. Two edges MUST NOT carry the same
   `p`. A payload in a block with `N` parents has exactly `N` causal edges. The position of a parent in
-  the header carries no meaning of its own.
+  the header carries no meaning of its own, unless the definition of the kind fixes the position of a
+  verb (§5.5). (ADR 0039 rule 3)
 - **Order.** The causal edges come first, in increasing `p`. The other edges follow in the author's
   order. A `block` value MUST NOT equal one of the block's header parents.
 - `meta`, when present, MUST be a non-empty map. An edge with no metadata MUST omit the key. The keys
@@ -231,7 +232,7 @@ sealed          = { from: pubkey, msg: bstr, sig: bstr .size 64 }       ; plaint
 | `kind` | Required edges (exactly one each) | Optional edges | Parents | Authority |
 |---|---|---|---|---|
 | `sbtp.manifest` | none | at most one `in` → container | 0 or 1 | author |
-| `sbtp.enc` | `tagged` → delivery tag | none | 1 | none (ephemeral signer, §5.2) |
+| `sbtp.enc` | `tagged` → delivery tag | none (closed edge set, §5.2) | 1 | none (ephemeral signer, §5.2) |
 | `sbtp.enc_key` | `tagged` → directory tag | at most one `supersedes` → previous version | 1 or 2 | identity |
 
 Application kinds are defined in each application's specification (§1.3).
@@ -355,6 +356,7 @@ the envelope through the tags it defines (§5.4).
 - Payload: `{"v": 1, "body": {"ct": h'…', "enc": h'<32 bytes>'}, "kind": "sbtp.enc", "edges": [{"p": 0,
   "rel": "tagged"}]}`. `enc` is the HPKE encapsulated key; `ct` is the HPKE ciphertext. The body has
   exactly these two keys.
+- The edge set is closed (§3.1): the payload carries no extension or unknown verb. (ADR 0039 rule 4)
 - The block MUST have exactly 1 header parent: a delivery tag (§5.4), named by the single `tagged` edge.
 - **Ephemeral signer.** The PubKey MUST be a fresh Ed25519 key from a secure random source, used for this
   block only. The sender SHOULD erase its private key after signing, and MUST NOT use its identity key,
@@ -408,10 +410,11 @@ the envelope through the tags it defines (§5.4).
   file first contacts under bucketed tags.
 - The Ed25519 identity key MUST NOT be converted to X25519 or used for key agreement. The X25519 key is
   generated independently and serves one identity and one purpose.
-- Parents: the directory tag `derive_key("SBTP 2026-11-20 enc_key directory v1", identity_pubkey)` as
-  `p: 0` (`tagged`); an update adds the previous version as `p: 1` (`supersedes`). A key block whose tag
-  does not match its PubKey is ignored for state resolution. The current key is the current version of
-  the chain (§4.3).
+- Parents: the directory tag `derive_key("SBTP 2026-11-20 enc_key directory v1", identity_pubkey)`
+  MUST be `p: 0`, named by the `tagged` edge; an update has 2 parents and MUST name the previous
+  version as `p: 1`, by the `supersedes` edge. Grammar validation checks both positions. (ADR 0039
+  rules 1 and 2) A key block whose tag does not match its PubKey is ignored for state resolution. The
+  current key is the current version of the chain (§4.3).
 - **Tag and PubKey.** The match between a key block's directory tag and its PubKey is a state resolution
   rule, not a grammar validation rule: grammar validation reads parent values only for the `block` rule
   of §2.1 (§2.4). A client that reads a key directory MUST recompute the directory tag from the PubKey

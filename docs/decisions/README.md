@@ -74,4 +74,4 @@ Option, reason.
 | 0036 | *Not published.* | |
 | 0037 | *Not published.* | |
 | 0038 | *Not published.* | |
-| [0039](0039-sealed-kinds-edge-positions-and-closed-set.md) | Parent roles of `sbtp.enc_key` (`tagged` is `p: 0`, `supersedes` is `p: 1` on an update), closed edge set of `sbtp.enc`, undefined `sbtp.*` kinds are unknown kinds, tag/PubKey match of a key block is a resolution rule; amends 0016 rule 21 and 0032 rule 4 | proposed |
+| [0039](0039-sealed-kinds-edge-positions-and-closed-set.md) | Parent roles of `sbtp.enc_key` (`tagged` is `p: 0`, `supersedes` is `p: 1` on an update), closed edge set of `sbtp.enc`, undefined `sbtp.*` kinds are unknown kinds, tag/PubKey match of a key block is a resolution rule; amends 0016 rule 21 and 0032 rule 4 | accepted |
