@@ -18,6 +18,7 @@ pub mod blocks;
 pub mod cache;
 pub mod client;
 pub mod config;
+pub mod demand;
 pub mod error;
 pub mod index;
 pub mod limiter;
@@ -137,7 +138,12 @@ where
     log::emit(Event::DataDir, &[("path", Value::Str(&path))]);
     let cache = usize::try_from(settings.index_cache_bytes).unwrap_or(usize::MAX);
     let index_file = data_dir.join("index.redb");
-    let index = Arc::new(RedbIndex::open(&index_file, cache)?);
+    let index = RedbIndex::open(&index_file, cache)?;
+    // ADR 0046 rule 13: read before anything else writes; implementation plan step 2: the demand
+    // entries of an index written before ADR 0046, before any request.
+    let unclean = index.unclean_start();
+    index.configure_demand(settings.demand_epoch_ms)?;
+    let index = Arc::new(index);
     // ADR 0018 rules 9 to 11: from here on only the index threads call the index.
     let pool = IndexPool::start(&index, &settings)
         .map_err(|e| StartError::Io("starting the index threads", e))?;
@@ -163,11 +169,20 @@ where
             }
         });
     let served = match opened {
-        Ok(store) => {
-            let relay = Arc::new(Relay::new(&settings, store, pool.handle()));
-            let app = api::app(&settings, Arc::clone(&relay));
-            serve(&settings, app, relay, shutdown, on_listen)
-        }
+        Ok(store) => match Relay::new(&settings, store, pool.handle()) {
+            Ok(relay) => {
+                if unclean {
+                    relay.demand().unclean_start(log::unix_ms());
+                }
+                let relay = Arc::new(relay);
+                let app = api::app(&settings, Arc::clone(&relay));
+                serve(&settings, app, relay, shutdown, on_listen)
+            }
+            Err(e) => Err(StartError::Io(
+                "allocating the demand set",
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, e),
+            )),
+        },
         Err(e) => Err(e),
     };
     // Every exit path after the index is open. The first error wins; the later steps still run.
@@ -175,9 +190,20 @@ where
         ShutdownError::Flush(e) => StartError::Index(e),
         ShutdownError::Panicked(m) => StartError::Shutdown(m),
     });
+    // ADR 0046 rule 13: the index is marked closed cleanly only when every write is durable and
+    // the demand set was flushed; otherwise the next start suspends demand eviction.
+    let clean = served.is_ok() && durable.is_ok();
     let closed = Arc::try_unwrap(index)
         .map_err(|_| StartError::Shutdown("index still shared, not closed"))
-        .and_then(|i| i.close().map_err(StartError::Index));
+        .and_then(|i| {
+            let marked = if clean {
+                i.mark_clean().map_err(StartError::Index)
+            } else {
+                Ok(())
+            };
+            let closed = i.close().map_err(StartError::Index);
+            marked.and(closed)
+        });
     if closed.is_ok() {
         log::emit(Event::Shutdown, &[("phase", Value::Str("index_closed"))]);
     }
@@ -301,6 +327,7 @@ where
         log::emit(Event::Listening, &[("addr", Value::Str(&addr))]);
         on_listen(local);
         let (stop, stopped) = tokio::sync::watch::channel(false);
+        let flushed = Arc::clone(&relay);
         let mut sweeper = tokio::spawn(sweep::run(
             relay,
             std::time::Duration::from_millis(settings.sweep_interval_ms),
@@ -317,7 +344,16 @@ where
         };
         let _ = stop.send(true);
         let _ = sweeper.await;
-        served.map_err(|e| StartError::Io("serving", e))
+        // ADR 0046 rule 12: the last flush of the demand set, at a clean shutdown, after the
+        // sweeper task (the only other flusher) has stopped.
+        let lost = tokio::task::spawn_blocking(move || sweep::flush_demand(&flushed).lost)
+            .await
+            .unwrap_or(1);
+        served.map_err(|e| StartError::Io("serving", e))?;
+        if lost > 0 {
+            return Err(StartError::Shutdown("the demand set was not flushed"));
+        }
+        Ok(())
     })
 }
 

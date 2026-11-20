@@ -97,6 +97,24 @@ Initial public version. Pre-release software: no version is supported for produc
 - `deploy/`: what the relay and its reverse proxy log about clients, recommended retention (none, or
   at most 7 days, for any log that holds addresses), and how to drop or mask addresses in Caddy and
   Traefik access logs.
+- Network PoW difficulty `D_NET` = 16 (ADR 0045): `sbtp_core::NETWORK_POW_DIFFICULTY`; the default
+  of the relay's `min_pow_difficulty` reads it, and a value above it logs the `config_warning`
+  `pow_above_network`. `cli-demo` `mine` and the web client mine at `max(D_NET, highest /info
+  difficulty)` (the /info cap of 24 still applies); an explicit difficulty is used as given.
+- **Breaking (defaults):** `sbtp-relay` keeps what it receives (ADR 0046): `block_ttl_ms` defaults
+  to 0 (no eviction by age; `/info` `null`) and demand eviction is on (`demand_eviction`,
+  `demand_high_water_pct` 90, `demand_low_water_pct` 80, `demand_epoch_ms` one day,
+  `demand_touch_max` 16,384 / 131,072 / 1,048,576 by profile). Above the high-water mark the
+  sweeper deletes the blocks requested least recently (a `200` or `304` of `GET` or `HEAD`, a
+  `PUT` answered `200`, an acceptance, the acceptance of a child), never one demanded within
+  `3 × E`, down to the low-water mark; a lost demand or an unclean restart suspends it for `2 × E`.
+  Demand is kept in a fixed-size set off the request path and written to the index at most once
+  per block per epoch (two new index tables, filled at the first start of an older index). With
+  demand eviction on, block responses carry `s-maxage` and `CDN-Cache-Control` of `E / 2`; a `507`
+  above the high-water mark carries `Retry-After`. `/info` gains `demand_eviction`. New counters,
+  gauges and the `demand_evicted`, `demand_stuck` and `demand_suspended` events. An archive relay
+  is `demand_eviction = false` with `block_ttl_ms = 0`. `deploy/README.md`: retention modes and the
+  Cloudflare cache rules. The `small` profile's computed memory bound is 14,747,092 bytes.
 
 ### Fixed
 

@@ -152,7 +152,8 @@ test("publish: one mining at the highest usable /info difficulty, hostile and sl
   const slow = await fakeRelay("slow");
   const set = new RelaySet([a.base, hostile.base, slow.base, b.base], { makeRelay });
   const plan = await publishDifficulty(set, null);
-  assert.equal(plan.difficulty, 10); // the max of 8 and 10; 30 is above the maximum of 24
+  // The max of 8 and 10 (30 is above the maximum of 24), raised to D_NET = 16 (ADR 0045 rule 5).
+  assert.equal(plan.difficulty, 16);
   assert.deepEqual(plan.skipped.map((s) => s.base), [hostile.base]);
   assert.deepEqual(plan.infoFailed.map((f) => f.base), [slow.base]); // timed out: still a target
   assert.equal(plan.infoFailed[0].error.kind, "timeout");

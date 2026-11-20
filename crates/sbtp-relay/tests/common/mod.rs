@@ -122,11 +122,15 @@ impl TestServer {
         std::fs::create_dir_all(data).unwrap();
         let index_file = data.join("index.redb");
         let store = Store::open(data, index_file, settings.max_store_bytes).unwrap();
+        index.configure_demand(settings.demand_epoch_ms).unwrap();
         reconcile(&store, &*index).unwrap();
         let pool = IndexPool::start(&index, settings).unwrap();
         drop(index); // Held by the index threads from here on.
-        let relay =
-            std::sync::Arc::new(Relay::new(settings, store, pool.handle()).with_clock(clock));
+        let relay = std::sync::Arc::new(
+            Relay::new(settings, store, pool.handle())
+                .unwrap()
+                .with_clock(clock),
+        );
         let swept = std::sync::Arc::clone(&relay);
         let sweeper = Box::new(move || sbtp_relay::sweep::sweep_once(&swept, 1_000));
         let app = sbtp_relay::api::layered(

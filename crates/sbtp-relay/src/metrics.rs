@@ -157,6 +157,8 @@ pub enum IndexOp {
     Remove,
     /// A durable commit.
     Flush,
+    /// A flush of the demand set, or the demand of a `PUT` answered `200` (ADR 0046 rules 12 and 14).
+    Demand,
 }
 
 impl IndexOp {
@@ -167,6 +169,7 @@ impl IndexOp {
             Self::Insert => "insert",
             Self::Remove => "remove",
             Self::Flush => "flush",
+            Self::Demand => "demand",
         }
     }
 }
@@ -236,7 +239,7 @@ static REFUSED: [AtomicU64; Refused::ALL.len()] = zeros();
 /// `accept_errors_total{class}`.
 static ACCEPT_ERRORS: [AtomicU64; 2] = zeros();
 /// `index_write_errors_total{op}`.
-static INDEX_WRITE_ERRORS: [AtomicU64; 3] = zeros();
+static INDEX_WRITE_ERRORS: [AtomicU64; 4] = zeros();
 /// `index_read_errors_total{op}` (ADR 0021 clarification X3).
 static INDEX_READ_ERRORS: [AtomicU64; IndexReadOp::COUNT] = zeros();
 /// `store_errors_total{op}`.
@@ -274,6 +277,19 @@ static SWEEP_LAST_DURATION_MS: AtomicU64 = AtomicU64::new(0);
 /// with `op=remove`). Not in the table of rule 41, added so that a failing sweeper shows in the
 /// counters, not only in throttled lines.
 static SWEEP_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// ADR 0046 rule 29: demand eviction counters and gauges.
+static DEMAND_EVICTED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static DEMAND_EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEMAND_RUNS: AtomicU64 = AtomicU64::new(0);
+static DEMAND_STUCK: AtomicU64 = AtomicU64::new(0);
+static DEMAND_FLUSHES: AtomicU64 = AtomicU64::new(0);
+static DEMAND_FLUSH_UPDATES: AtomicU64 = AtomicU64::new(0);
+static DEMAND_LOST: AtomicU64 = AtomicU64::new(0);
+static DEMAND_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static DEMAND_TOUCH_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static DEMAND_COLDEST_MS: AtomicU64 = AtomicU64::new(0);
+/// `block_not_modified_total`: `304` answers of `/block`.
+static BLOCK_NOT_MODIFIED: AtomicU64 = AtomicU64::new(0);
 // HOOK(1c-b): `storage_full_total` reasons `disk`, `inodes`, `read_only`; `store_max_bytes`,
 // `disk_free_bytes`, `disk_state`, `build_info`; `log_lines_total{level}` and
 // `log_lines_dropped_total{event, cause}` (kept by the logger, `log::Logger::dropped`).
@@ -544,6 +560,89 @@ pub fn sweep_totals() -> (u64, u64, u64) {
     )
 }
 
+/// Counts one demand eviction run that deleted `blocks` blocks of `bytes` bytes (ADR 0046 rule
+/// 29).
+pub fn demand_run(blocks: u64, bytes: u64) {
+    DEMAND_RUNS.fetch_add(1, Relaxed);
+    DEMAND_EVICTED_BLOCKS.fetch_add(blocks, Relaxed);
+    DEMAND_EVICTED_BYTES.fetch_add(bytes, Relaxed);
+}
+
+/// Counts a demand eviction run that found no candidate above the low-water mark.
+pub fn demand_stuck() {
+    DEMAND_STUCK.fetch_add(1, Relaxed);
+}
+
+/// Counts one flush of the demand set that updated `updates` index entries.
+pub fn demand_flush(updates: u64) {
+    DEMAND_FLUSHES.fetch_add(1, Relaxed);
+    DEMAND_FLUSH_UPDATES.fetch_add(updates, Relaxed);
+}
+
+/// Counts `n` lost demands (ADR 0046 rule 13).
+pub fn demand_lost(n: u64) {
+    DEMAND_LOST.fetch_add(n, Relaxed);
+}
+
+/// Sets the `demand_suspended` gauge.
+pub fn set_demand_suspended(on: bool) {
+    DEMAND_SUSPENDED.store(u64::from(on), Relaxed);
+}
+
+/// Sets the `demand_touch_entries` gauge.
+pub fn set_demand_touch_entries(n: u64) {
+    DEMAND_TOUCH_ENTRIES.store(n, Relaxed);
+}
+
+/// Sets the `demand_coldest_ms` gauge (0 when there is no block).
+pub fn set_demand_coldest_ms(ms: u64) {
+    DEMAND_COLDEST_MS.store(ms, Relaxed);
+}
+
+/// Counts a `304` of `/block`.
+pub fn block_not_modified() {
+    BLOCK_NOT_MODIFIED.fetch_add(1, Relaxed);
+}
+
+/// The demand counters and gauges, by their ADR 0046 rule 29 names (tests, `/metrics` later).
+#[must_use]
+pub fn demand_snapshot() -> [(&'static str, u64); 11] {
+    [
+        (
+            "demand_evicted_blocks_total",
+            DEMAND_EVICTED_BLOCKS.load(Relaxed),
+        ),
+        (
+            "demand_evicted_bytes_total",
+            DEMAND_EVICTED_BYTES.load(Relaxed),
+        ),
+        ("demand_runs_total", DEMAND_RUNS.load(Relaxed)),
+        ("demand_stuck_total", DEMAND_STUCK.load(Relaxed)),
+        ("demand_flushes_total", DEMAND_FLUSHES.load(Relaxed)),
+        (
+            "demand_flush_updates_total",
+            DEMAND_FLUSH_UPDATES.load(Relaxed),
+        ),
+        ("demand_lost_total", DEMAND_LOST.load(Relaxed)),
+        ("demand_suspended", DEMAND_SUSPENDED.load(Relaxed)),
+        ("demand_touch_entries", DEMAND_TOUCH_ENTRIES.load(Relaxed)),
+        ("demand_coldest_ms", DEMAND_COLDEST_MS.load(Relaxed)),
+        ("block_not_modified_total", BLOCK_NOT_MODIFIED.load(Relaxed)),
+    ]
+}
+
+/// `demand_lost_total` since start-up.
+#[must_use]
+pub fn demand_lost_total() -> u64 {
+    DEMAND_LOST.load(Relaxed)
+}
+
+/// `block_not_modified_total` since start-up.
+#[must_use]
+pub fn block_not_modified_total() -> u64 {
+    BLOCK_NOT_MODIFIED.load(Relaxed)
+}
+
 /// Counts a panic: once, by the `500` path for a caught request panic, by the panic hook for
 /// any other.
 pub fn panicked() {
@@ -634,6 +733,10 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("sweeps", SWEEPS.load(Relaxed)),
         ("sweep_removed", SWEEP_REMOVED.load(Relaxed)),
         ("sweep_failures", SWEEP_FAILURES.load(Relaxed)),
+        ("demand_evicted", DEMAND_EVICTED_BLOCKS.load(Relaxed)),
+        ("demand_lost", DEMAND_LOST.load(Relaxed)),
+        ("demand_suspended", DEMAND_SUSPENDED.load(Relaxed)),
+        ("not_modified", BLOCK_NOT_MODIFIED.load(Relaxed)),
         // HOOK(1c-b): `disk_free_bytes`, `disk_state`.
         ("accept_errors", sum(&ACCEPT_ERRORS)),
         ("index_write_errors", sum(&INDEX_WRITE_ERRORS)),

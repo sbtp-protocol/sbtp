@@ -14,7 +14,7 @@
 
 import { LIMITS } from "./bounds.js";
 import { checkRelayUrl, RelayRequestError } from "./http.js";
-import { InvalidResponse, Relay, RelayStatus } from "./relay.js";
+import { InvalidResponse, NETWORK_POW_DIFFICULTY, Relay, RelayStatus } from "./relay.js";
 import { backoffMs, walk } from "./walk.js";
 
 const MAX_URL_LEN = 2048;
@@ -143,7 +143,8 @@ function checkAborted(signal) {
 /**
  * The difficulty to mine one block at for every relay of `set`. An explicit value (0 to 256) is used
  * as is, without /info, and every relay is a target. Otherwise each available relay's /info is read
- * in parallel and the block is mined once at the highest `min_pow_difficulty` among them:
+ * in parallel and the block is mined once at the highest `min_pow_difficulty` among them, and at
+ * least at the network difficulty `D_NET` (ADR 0045 rule 5):
  * - a relay asking for more than `max` (ADR 0029 rule 13) is skipped: no mining for it, no PUT;
  * - a relay whose /info fails stays a target (its PUT will tell), but sets no difficulty.
  * Throws when no relay gave a usable difficulty.
@@ -197,7 +198,7 @@ export async function publishDifficulty(set, explicit, { max = LIMITS.maxInfoDif
   // Keep the user's order among targets.
   const order = set.bases;
   targets.sort((a, b) => order.indexOf(a) - order.indexOf(b));
-  return { difficulty: Math.max(...known), targets, skipped, infoFailed };
+  return { difficulty: Math.max(NETWORK_POW_DIFFICULTY, ...known), targets, skipped, infoFailed };
 }
 
 /**

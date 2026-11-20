@@ -12,6 +12,13 @@ use crate::layout::HASH_LEN;
 /// rejects every block above it (C1); mining refuses it at once.
 pub const MAX_DIFFICULTY: u32 = 256;
 
+/// The network difficulty `D_NET` (spec §3.3, ADR 0045): the `min_pow_difficulty` a relay SHOULD
+/// use, and the most a relay that takes part in replication may ask for. A sender that wants its
+/// block accepted by every such relay mines at this value or above. A value of the protocol, not
+/// ambient state: validation still takes the difficulty as an argument (ADR 0007 rule 7). It
+/// changes only by a revision of the specification.
+pub const NETWORK_POW_DIFFICULTY: u32 = 16;
+
 /// A 32-byte BLAKE3 `block_id`. Parent hashes have the same type: a parent is a `block_id`.
 ///
 /// The identifier is public data; comparisons need not be constant-time.

@@ -84,7 +84,9 @@ fn info_has_exactly_the_adr_members() {
             "max_future_ms": 300_000,
             "block_versions": [1],
             "max_query_limit": 500,
-            "block_ttl_ms": 2_592_000_000_u64,
+            // ADR 0046 rules 1, 2 and 4: keep by default, demand eviction on.
+            "block_ttl_ms": null,
+            "demand_eviction": true,
         })
     );
     // ADR 0019 rule 25: no header carries the name or version of the relay.
@@ -94,14 +96,22 @@ fn info_has_exactly_the_adr_members() {
     }
 }
 
-/// ADR 0019 rule 7: with eviction by age disabled, `/info` publishes `null`, never 0.
+/// ADR 0019 rule 7: with eviction by age disabled, `/info` publishes `null`, never 0. ADR 0046
+/// rules 3 and 4: an archive relay (both evictions off) publishes `"demand_eviction": false`; a
+/// relay with eviction by age publishes its value.
 #[test]
 fn info_publishes_null_when_eviction_is_disabled() {
-    let relay = server(&[("BLOCK_TTL_MS", "0")]);
+    let relay = server(&[("BLOCK_TTL_MS", "0"), ("DEMAND_EVICTION", "false")]);
     let mut c = relay.connect();
     let r = http_get(&mut c, "/sbtp/v1/info", "");
     assert_eq!(r.json()["block_ttl_ms"], serde_json::Value::Null);
     assert!(r.json().as_object().unwrap().contains_key("block_ttl_ms"));
+    assert_eq!(r.json()["demand_eviction"], serde_json::Value::Bool(false));
+    let relay = server(&[("BLOCK_TTL_MS", "2592000000")]);
+    let mut c = relay.connect();
+    let r = http_get(&mut c, "/sbtp/v1/info", "");
+    assert_eq!(r.json()["block_ttl_ms"], 2_592_000_000_u64);
+    assert_eq!(r.json()["demand_eviction"], serde_json::Value::Bool(true));
 }
 
 /// ADR 0019 rule 29: a direct peer (not in `trusted_proxies`) holds at most

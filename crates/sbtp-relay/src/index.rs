@@ -1,10 +1,18 @@
 //! Relay index on redb (ADR 0013 rules 1 to 5 and 22 to 24; `architecture.md` §2 "Index").
 //!
-//! Derived data only: block files are the source of truth (rule 1). Three tables:
+//! Derived data only: block files are the source of truth (rule 1). Five tables:
 //!
 //! - `blocks`: position → `block_id` ‖ length (u32, big-endian) ‖ parents (32 bytes each);
 //! - `ids`: `block_id` → position;
-//! - `edges`: (parent, position) → child `block_id`.
+//! - `edges`: (parent, position) → child `block_id`;
+//! - `demand`: position → `last_demand` (ADR 0046 rule 26), the start of the demand epoch in which
+//!   the block was last demanded;
+//! - `demand_order`: (`last_demand`, position) → `()`, the order of demand eviction (rule 6).
+//!
+//! The two demand tables are written in the transaction that writes the other entries of a block
+//! and removed with them. An index written before ADR 0046 gets them at the first start
+//! ([`IndexBackend::configure_demand`]). The `meta` table also records whether the index was
+//! closed cleanly (`open`), for the suspension of ADR 0046 rule 13.
 //!
 //! Keys are 32-byte values taken from validated blocks; no path is built from them.
 //!
@@ -50,7 +58,17 @@ const BLOCKS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("blocks"
 const IDS: TableDefinition<&Id, (u64, u32)> = TableDefinition::new("ids");
 const EDGES: TableDefinition<(&Id, u64, u32), &Id> = TableDefinition::new("edges");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const DEMAND: TableDefinition<(u64, u32), u64> = TableDefinition::new("demand");
+const DEMAND_ORDER: TableDefinition<(u64, u64, u32), ()> = TableDefinition::new("demand_order");
 const EPOCH_KEY: &str = "epoch";
+/// `1` once every block has its demand entries (ADR 0046 implementation plan, step 2).
+const DEMAND_KEY: &str = "demand";
+/// `1` while a relay has the index open, `0` after a clean close (ADR 0046 rule 13).
+const OPEN_KEY: &str = "open";
+/// The default demand epoch, one day (ADR 0046 rule 24), until [`IndexBackend::configure_demand`].
+const DEFAULT_DEMAND_EPOCH_MS: u64 = 86_400_000;
+/// Blocks given demand entries per transaction of the start-up migration.
+const MIGRATION_BATCH: usize = 10_000;
 /// Length of the fixed part of a `blocks` value: `block_id` and length.
 const ROW_HEAD: usize = 36;
 
@@ -113,6 +131,19 @@ pub enum FileState {
     Created,
     /// Its file was already held (the repair path of rule 9). An existing entry is kept.
     AlreadyHeld,
+}
+
+/// A block that demand eviction may delete (ADR 0046 rules 6 and 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// The start of the epoch of its last demand.
+    pub last_demand: u64,
+    /// Its position.
+    pub position: Position,
+    /// Its `block_id`.
+    pub id: BlockId,
+    /// Its length in bytes.
+    pub len: u32,
 }
 
 /// One page of `/query` (ADR 0012 rule 10), before JSON encoding.
@@ -292,6 +323,62 @@ pub trait IndexBackend: Send + Sync + Sized {
     /// Backend errors.
     fn len(&self) -> Result<u64, Self::Error>;
 
+    /// ADR 0046, at start-up before the index is shared: sets the demand epoch `epoch_ms` used to
+    /// quantise `last_demand` on insert, and gives demand entries to every block that has none
+    /// (an index written before ADR 0046), with `last_demand` its `received_at` quantised to its
+    /// epoch. Returns the number of blocks given entries. A backend without demand entries does
+    /// nothing (the default).
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn configure_demand(&self, _epoch_ms: u64) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
+    /// ADR 0046 rule 12: moves `last_demand` of each held block of `ids` forward to
+    /// `epoch_start`, in one transaction. A block not indexed, or whose `last_demand` is already
+    /// `epoch_start` or later, is skipped: at most one update per block per epoch. Returns the
+    /// number of blocks updated.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn record_demand(&self, _ids: &[BlockId], _epoch_start: u64) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
+    /// ADR 0046 rules 6 and 7: up to `max` blocks with `last_demand ≤ bound`, in increasing order
+    /// of `(last_demand, position)`. `max` is clamped to `1..=MAX_QUERY_LIMIT`. None by default.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn demand_candidates(&self, _bound: u64, _max: usize) -> Result<Vec<Candidate>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// The position and `last_demand` of `id`, if indexed (the re-check of ADR 0046 rule 22).
+    /// A block without a demand entry has `last_demand = u64::MAX`: never a candidate. `None` by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn demand_state(&self, _id: &BlockId) -> Result<Option<(Position, u64)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// The smallest `last_demand` of the index (the `demand_coldest_ms` gauge, ADR 0046 rule
+    /// 29), `None` when empty or by default.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn coldest_demand(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+
     /// `true` when no block is indexed.
     ///
     /// # Errors
@@ -315,6 +402,10 @@ pub struct RedbIndex {
     /// Changed only by [`IndexBackend::renew_epoch`], during the start-up walk (ADR 0024).
     epoch: AtomicU64,
     writer: Mutex<WriterState>,
+    /// The demand epoch `E` (ADR 0046 rule 9), set by [`IndexBackend::configure_demand`].
+    demand_epoch_ms: AtomicU64,
+    /// The index was open, not closed cleanly, when this process opened it (ADR 0046 rule 13).
+    unclean: bool,
 }
 
 impl IndexBackend for RedbIndex {
@@ -339,8 +430,9 @@ impl IndexBackend for RedbIndex {
     /// redb errors, or an error reading the system random source.
     fn open(path: &Path, cache_bytes: usize) -> Result<Self, IndexError> {
         let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
+        // The default durability (`Immediate`): the `open` mark is on disk before any request.
         let txn = db.begin_write()?;
-        let (epoch, last) = {
+        let (epoch, last, unclean) = {
             let mut meta = txn.open_table(META)?;
             let stored = meta.get(EPOCH_KEY)?.map(|g| g.value());
             let epoch = if let Some(epoch) = stored {
@@ -350,11 +442,20 @@ impl IndexBackend for RedbIndex {
                 meta.insert(EPOCH_KEY, epoch)?;
                 epoch
             };
+            // ADR 0046 rule 13: still marked open means the last run did not close it.
+            let unclean = meta.get(OPEN_KEY)?.map(|g| g.value()) == Some(1);
+            meta.insert(OPEN_KEY, 1)?;
             txn.open_table(IDS)?;
             txn.open_table(EDGES)?;
+            txn.open_table(DEMAND)?;
+            txn.open_table(DEMAND_ORDER)?;
             let blocks = txn.open_table(BLOCKS)?;
             let last = blocks.last()?.map(|(k, _)| Position::from_key(k.value()));
-            (epoch, last)
+            // A new index has nothing to migrate.
+            if last.is_none() && meta.get(DEMAND_KEY)?.is_none() {
+                meta.insert(DEMAND_KEY, 1)?;
+            }
+            (epoch, last, unclean)
         };
         txn.commit()?;
         Ok(Self {
@@ -365,6 +466,8 @@ impl IndexBackend for RedbIndex {
                 last_durable: Instant::now(),
                 pending: false,
             }),
+            demand_epoch_ms: AtomicU64::new(DEFAULT_DEMAND_EPOCH_MS),
+            unclean,
         })
     }
 
@@ -428,27 +531,33 @@ impl IndexBackend for RedbIndex {
         }
         {
             let id = id.as_bytes();
-            let mut blocks = txn.open_table(BLOCKS)?;
-            let mut ids = txn.open_table(IDS)?;
-            let mut edges = txn.open_table(EDGES)?;
-            let existing = ids.get(id)?.map(|g| Position::from_key(g.value()));
+            let mut t = Tables::open(&txn)?;
+            let existing = t.ids.get(id)?.map(|g| Position::from_key(g.value()));
             if let Some(old) = existing {
                 if state == FileState::AlreadyHeld {
-                    drop((blocks, ids, edges));
+                    drop(t);
                     txn.abort()?;
                     return Ok(None);
                 }
-                remove_entries(&mut blocks, &mut ids, &mut edges, old)?;
+                t.remove_entries(old)?;
             }
-            ids.insert(id, pos.key())?;
+            t.ids.insert(id, pos.key())?;
             let mut row = Vec::with_capacity(ROW_HEAD + 32 * parents.len());
             row.extend_from_slice(id);
             row.extend_from_slice(&len.to_be_bytes());
+            // ADR 0046 rule 10: the acceptance is a demand of the block, and of each held parent.
+            let demand = crate::demand::epoch_start(
+                pos.received_at,
+                self.demand_epoch_ms.load(Ordering::Relaxed),
+            );
             for parent in parents {
                 row.extend_from_slice(parent.as_bytes());
-                edges.insert((parent.as_bytes(), pos.received_at, pos.n), id)?;
+                t.edges
+                    .insert((parent.as_bytes(), pos.received_at, pos.n), id)?;
+                t.demand_forward(parent.as_bytes(), demand)?;
             }
-            blocks.insert(pos.key(), row.as_slice())?;
+            t.blocks.insert(pos.key(), row.as_slice())?;
+            t.set_demand(pos, None, demand)?;
         }
         txn.commit()?;
         w.last = Some(pos);
@@ -596,11 +705,9 @@ impl IndexBackend for RedbIndex {
         let txn = self.db.begin_write()?;
         let mut removed = 0;
         {
-            let mut blocks = txn.open_table(BLOCKS)?;
-            let mut ids = txn.open_table(IDS)?;
-            let mut edges = txn.open_table(EDGES)?;
+            let mut t = Tables::open(&txn)?;
             for pos in positions {
-                removed += usize::from(remove_entries(&mut blocks, &mut ids, &mut edges, *pos)?);
+                removed += usize::from(t.remove_entries(*pos)?);
             }
         }
         txn.commit()?;
@@ -616,9 +723,172 @@ impl IndexBackend for RedbIndex {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(BLOCKS)?.len()?)
     }
+
+    /// Sets `E`, then, unless `meta` says it is done, gives demand entries to every block that has
+    /// none, [`MIGRATION_BATCH`] blocks per durable transaction: an interrupted migration resumes
+    /// at the next start, skipping the blocks already done. Marked done at the end.
+    fn configure_demand(&self, epoch_ms: u64) -> Result<u64, IndexError> {
+        let epoch_ms = epoch_ms.max(1);
+        self.demand_epoch_ms.store(epoch_ms, Ordering::Relaxed);
+        let _w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let done = self.db.begin_read()?.open_table(META)?.get(DEMAND_KEY)?;
+        if done.is_some_and(|g| g.value() == 1) {
+            return Ok(0);
+        }
+        let mut filled = 0u64;
+        let mut from = Position::default();
+        loop {
+            let txn = self.db.begin_write()?;
+            let more = {
+                let mut t = Tables::open(&txn)?;
+                let batch: Vec<Position> = t
+                    .blocks
+                    .range(from.key()..)?
+                    .take(MIGRATION_BATCH)
+                    .map(|r| r.map(|(k, _)| Position::from_key(k.value())))
+                    .collect::<Result<_, _>>()?;
+                for pos in &batch {
+                    if t.demand.get(pos.key())?.is_none() {
+                        let at = crate::demand::epoch_start(pos.received_at, epoch_ms);
+                        t.set_demand(*pos, None, at)?;
+                        filled += 1;
+                    }
+                }
+                match batch.last() {
+                    Some(last) if batch.len() == MIGRATION_BATCH => {
+                        from = last.next();
+                        true
+                    }
+                    _ => {
+                        txn.open_table(META)?.insert(DEMAND_KEY, 1)?;
+                        false
+                    }
+                }
+            };
+            txn.commit()?;
+            if !more {
+                return Ok(filled);
+            }
+        }
+    }
+
+    /// One transaction for `ids`, non-durable like an insert (rule 10 of ADR 0013): a crash
+    /// before the next durable commit is an unclean start, which suspends demand eviction (ADR
+    /// 0046 rule 13).
+    fn record_demand(&self, ids: &[BlockId], epoch_start: u64) -> Result<u64, IndexError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let durable = w.last_durable.elapsed() >= DURABLE_COMMIT_INTERVAL;
+        let mut txn = self.db.begin_write()?;
+        if !durable {
+            txn.set_durability(Durability::None)?;
+        }
+        let mut updated = 0;
+        {
+            let mut t = Tables::open(&txn)?;
+            for id in ids {
+                updated += u64::from(t.demand_forward(id.as_bytes(), epoch_start)?);
+            }
+        }
+        txn.commit()?;
+        if durable {
+            w.last_durable = Instant::now();
+            w.pending = false;
+        } else {
+            w.pending = true;
+        }
+        Ok(updated)
+    }
+
+    fn demand_candidates(&self, bound: u64, max: usize) -> Result<Vec<Candidate>, IndexError> {
+        let txn = self.db.begin_read()?;
+        let order = txn.open_table(DEMAND_ORDER)?;
+        let blocks = txn.open_table(BLOCKS)?;
+        let max = max.clamp(1, MAX_QUERY_LIMIT);
+        let mut out = Vec::with_capacity(max);
+        for item in order.range(..=(bound, u64::MAX, u32::MAX))?.take(max) {
+            let (k, _) = item?;
+            let (last_demand, received_at, n) = k.value();
+            let position = Position { received_at, n };
+            // Written in the same transaction as the row: a missing row is not a candidate.
+            let Some(row) = blocks.get(position.key())? else {
+                continue;
+            };
+            let row = row.value();
+            let id = row.get(..32).and_then(|b| Id::try_from(b).ok());
+            let len = row
+                .get(32..ROW_HEAD)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_be_bytes);
+            let (Some(id), Some(len)) = (id, len) else {
+                return Err(IndexError::CorruptRow);
+            };
+            out.push(Candidate {
+                last_demand,
+                position,
+                id: BlockId(id),
+                len,
+            });
+        }
+        Ok(out)
+    }
+
+    fn demand_state(&self, id: &BlockId) -> Result<Option<(Position, u64)>, IndexError> {
+        let txn = self.db.begin_read()?;
+        let ids = txn.open_table(IDS)?;
+        let Some(pos) = ids
+            .get(id.as_bytes())?
+            .map(|g| Position::from_key(g.value()))
+        else {
+            return Ok(None);
+        };
+        let demand = txn.open_table(DEMAND)?;
+        let last = demand.get(pos.key())?.map_or(u64::MAX, |g| g.value());
+        Ok(Some((pos, last)))
+    }
+
+    fn coldest_demand(&self) -> Result<Option<u64>, IndexError> {
+        let txn = self.db.begin_read()?;
+        Ok(txn
+            .open_table(DEMAND_ORDER)?
+            .first()?
+            .map(|(k, _)| k.value().0))
+    }
 }
 
 impl RedbIndex {
+    /// Whether the index was still marked open when this process opened it: the previous run
+    /// ended without a clean shutdown (ADR 0046 rule 13; ADR 0013 rule 9).
+    #[must_use]
+    pub fn unclean_start(&self) -> bool {
+        self.unclean
+    }
+
+    /// Records a clean shutdown, durably: call once every write is done and durable, right before
+    /// [`RedbIndex::close`]. An index closed without it is an unclean start at the next open.
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    pub fn mark_clean(&self) -> Result<(), IndexError> {
+        let _w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = self.db.begin_write()?;
+        txn.open_table(META)?.insert(OPEN_KEY, 0)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Closes the index at graceful shutdown and returns the error that dropping it would ignore
     /// (redb 4.5.0 `Database::close`). redb 4.6.0 also makes a pending non-durable commit durable
     /// here; the relay still calls [`IndexBackend::flush`] first, so that a failure to make the
@@ -636,36 +906,81 @@ impl RedbIndex {
 
 type Table<'t, K, V> = redb::Table<'t, K, V>;
 
-/// Removes the `blocks` row at `pos`, its edges, and `ids[id]` if it still points at `pos` (a
-/// re-submission may own it at a newer position, rule 13). Returns whether a row existed.
-fn remove_entries(
-    blocks: &mut Table<'_, (u64, u32), &'static [u8]>,
-    ids: &mut Table<'_, &'static Id, (u64, u32)>,
-    edges: &mut Table<'_, (&'static Id, u64, u32), &'static Id>,
-    pos: Position,
-) -> Result<bool, IndexError> {
-    let Some(row) = blocks.remove(pos.key())? else {
-        return Ok(false);
-    };
-    let row = row.value();
-    let (head, parents) = row
-        .split_at_checked(ROW_HEAD)
-        .ok_or(IndexError::CorruptRow)?;
-    let id = head
-        .get(..32)
-        .and_then(|b| Id::try_from(b).ok())
-        .ok_or(IndexError::CorruptRow)?;
-    let (parents, rest) = parents.as_chunks::<32>();
-    if !rest.is_empty() {
-        return Err(IndexError::CorruptRow);
+/// The tables of one write transaction.
+struct Tables<'t> {
+    blocks: Table<'t, (u64, u32), &'static [u8]>,
+    ids: Table<'t, &'static Id, (u64, u32)>,
+    edges: Table<'t, (&'static Id, u64, u32), &'static Id>,
+    demand: Table<'t, (u64, u32), u64>,
+    order: Table<'t, (u64, u64, u32), ()>,
+}
+
+impl<'t> Tables<'t> {
+    fn open(txn: &'t redb::WriteTransaction) -> Result<Self, IndexError> {
+        Ok(Self {
+            blocks: txn.open_table(BLOCKS)?,
+            ids: txn.open_table(IDS)?,
+            edges: txn.open_table(EDGES)?,
+            demand: txn.open_table(DEMAND)?,
+            order: txn.open_table(DEMAND_ORDER)?,
+        })
     }
-    for parent in parents {
-        edges.remove((parent, pos.received_at, pos.n))?;
+
+    /// Sets the demand entries of `pos` to `last` (ADR 0046 rule 26), replacing `old`.
+    fn set_demand(&mut self, pos: Position, old: Option<u64>, last: u64) -> Result<(), IndexError> {
+        if let Some(old) = old {
+            self.order.remove((old, pos.received_at, pos.n))?;
+        }
+        self.demand.insert(pos.key(), last)?;
+        self.order.insert((last, pos.received_at, pos.n), ())?;
+        Ok(())
     }
-    if ids.get(&id)?.map(|g| g.value()) == Some(pos.key()) {
-        ids.remove(&id)?;
+
+    /// Moves `last_demand` of the indexed block `id` forward to `at` (ADR 0046 rule 11: never
+    /// back). Returns whether an entry changed; an unknown block changes nothing.
+    fn demand_forward(&mut self, id: &Id, at: u64) -> Result<bool, IndexError> {
+        let Some(pos) = self.ids.get(id)?.map(|g| Position::from_key(g.value())) else {
+            return Ok(false);
+        };
+        let old = self.demand.get(pos.key())?.map(|g| g.value());
+        if old.is_some_and(|old| old >= at) {
+            return Ok(false);
+        }
+        self.set_demand(pos, old, at)?;
+        Ok(true)
     }
-    Ok(true)
+
+    /// Removes the `blocks` row at `pos`, its edges, its demand entries, and `ids[id]` if it still
+    /// points at `pos` (a re-submission may own it at a newer position, rule 13). Edges in which
+    /// the block is the parent belong to its children and stay (ADR 0046 rule 22). Returns
+    /// whether a row existed.
+    fn remove_entries(&mut self, pos: Position) -> Result<bool, IndexError> {
+        if let Some(last) = self.demand.remove(pos.key())?.map(|g| g.value()) {
+            self.order.remove((last, pos.received_at, pos.n))?;
+        }
+        let Some(row) = self.blocks.remove(pos.key())? else {
+            return Ok(false);
+        };
+        let row = row.value();
+        let (head, parents) = row
+            .split_at_checked(ROW_HEAD)
+            .ok_or(IndexError::CorruptRow)?;
+        let id = head
+            .get(..32)
+            .and_then(|b| Id::try_from(b).ok())
+            .ok_or(IndexError::CorruptRow)?;
+        let (parents, rest) = parents.as_chunks::<32>();
+        if !rest.is_empty() {
+            return Err(IndexError::CorruptRow);
+        }
+        for parent in parents {
+            self.edges.remove((parent, pos.received_at, pos.n))?;
+        }
+        if self.ids.get(&id)?.map(|g| g.value()) == Some(pos.key()) {
+            self.ids.remove(&id)?;
+        }
+        Ok(true)
+    }
 }
 
 /// 64 random bits from the operating system (index epoch, rule 5).
@@ -890,6 +1205,87 @@ mod tests {
         let idx = RedbIndex::open(&path, DEFAULT_INDEX_CACHE_BYTES).unwrap();
         assert_eq!(idx.len().unwrap(), 1);
         idx.close().unwrap();
+    }
+
+    /// ADR 0046 rules 6, 7 and 26: candidates in increasing `(last_demand, position)`, bounded;
+    /// `last_demand` only moves forward; removal drops the demand entries with the others; a
+    /// child's insert refreshes its held parent.
+    #[test]
+    fn demand_order_and_entries() {
+        let idx = RedbIndex::open(&tmp("demand"), DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        let e = 1_000;
+        idx.configure_demand(e).unwrap();
+        let a = put(&idx, 1, &[], 10_500).unwrap();
+        let b = put(&idx, 2, &[], 10_600).unwrap();
+        let c = put(&idx, 3, &[], 12_100).unwrap();
+        let ld = |b: u8| idx.demand_state(&id(b)).unwrap().unwrap().1;
+        assert_eq!((ld(1), ld(2), ld(3)), (10_000, 10_000, 12_000), "quantised");
+        let order = |bound| -> Vec<_> {
+            idx.demand_candidates(bound, 10)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.last_demand, c.position, c.id, c.len))
+                .collect()
+        };
+        assert_eq!(
+            order(11_999),
+            vec![(10_000, a, id(1), 100), (10_000, b, id(2), 100)]
+        );
+        assert_eq!(order(12_000).len(), 3);
+        assert_eq!(idx.demand_candidates(u64::MAX, 0).unwrap().len(), 1);
+        // Forward only, once per epoch.
+        assert_eq!(idx.record_demand(&[id(1), id(9)], 13_000).unwrap(), 1);
+        assert_eq!(idx.record_demand(&[id(1)], 13_000).unwrap(), 0);
+        assert_eq!(idx.record_demand(&[id(1)], 11_000).unwrap(), 0);
+        assert_eq!(ld(1), 13_000);
+        assert_eq!(
+            order(12_999).iter().map(|c| c.2).collect::<Vec<_>>(),
+            [id(2), id(3)]
+        );
+        // A child refreshes its held parent; an unknown parent changes nothing.
+        put(&idx, 4, &[id(2), id(8)], 14_200).unwrap();
+        assert_eq!(ld(2), 14_000);
+        assert_eq!(idx.coldest_demand().unwrap(), Some(12_000));
+        assert_eq!(idx.remove(&[c]).unwrap(), 1);
+        assert_eq!(idx.demand_state(&id(3)).unwrap(), None);
+        assert_eq!(idx.coldest_demand().unwrap(), Some(13_000));
+        // A re-acceptance (`Created`) replaces the old entries, demand included.
+        let again = put(&idx, 1, &[], 20_100).unwrap();
+        assert_eq!(idx.demand_state(&id(1)).unwrap(), Some((again, 20_000)));
+        assert_eq!(order(u64::MAX).len(), 3);
+    }
+
+    /// ADR 0046 implementation plan, step 2: an index written before the demand tables gets them
+    /// at the first start, `last_demand` its quantised `received_at`; once, then never again.
+    #[test]
+    fn demand_migration_fills_old_indexes_once() {
+        let path = tmp("migrate");
+        let idx = RedbIndex::open(&path, DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        for b in 1..=5u8 {
+            put(&idx, b, &[], 1_000 * u64::from(b) + 7);
+        }
+        // What an index written before ADR 0046 looks like.
+        let txn = idx.db.begin_write().unwrap();
+        txn.delete_table(DEMAND).unwrap();
+        txn.delete_table(DEMAND_ORDER).unwrap();
+        txn.open_table(META).unwrap().remove(DEMAND_KEY).unwrap();
+        txn.commit().unwrap();
+        idx.close().unwrap();
+        let idx = RedbIndex::open(&path, DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        assert_eq!(idx.demand_state(&id(2)).unwrap().unwrap().1, u64::MAX);
+        assert_eq!(idx.configure_demand(2_000).unwrap(), 5);
+        for b in 1..=5u8 {
+            let at = 1_000 * u64::from(b) + 7;
+            assert_eq!(
+                idx.demand_state(&id(b)).unwrap().unwrap().1,
+                at - at % 2_000
+            );
+        }
+        assert_eq!(idx.demand_candidates(u64::MAX, 10).unwrap().len(), 5);
+        assert_eq!(idx.configure_demand(2_000).unwrap(), 0, "done once");
+        idx.close().unwrap();
+        let idx = RedbIndex::open(&path, DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        assert_eq!(idx.configure_demand(2_000).unwrap(), 0);
     }
 
     /// ADR 0024 rules 2 and 3: a new epoch differs from the old one and is durable as soon as

@@ -1,6 +1,8 @@
 //! `PUT /sbtp/v1/block` and `GET /sbtp/v1/block/{block_id}` (spec §4; ADR 0003 rules 9 to 11,
-//! ADR 0007, ADR 0008, ADR 0013 rules 7 to 9 and 18 to 21, ADR 0018 rules 18, 28 to 32, ADR 0023).
+//! ADR 0007, ADR 0008, ADR 0013 rules 7 to 9 and 18 to 21, ADR 0018 rules 18, 28 to 32, ADR 0023;
+//! demand recording and shared-cache headers of ADR 0046 rules 10 to 16).
 
+use std::collections::TryReserveError;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -8,7 +10,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
 use sbtp_core::layout::MAX_BLOCK_LEN;
@@ -19,6 +21,7 @@ use crate::api::read_body;
 use crate::cache::BlockCache;
 use crate::client::Counts;
 use crate::config::Settings;
+use crate::demand::{Demand, epoch_start};
 use crate::error::ApiError;
 use crate::index::{FileState, IndexBackend, Position};
 use crate::log::{self, Event, Level, Throttle, Value};
@@ -117,6 +120,18 @@ pub struct Relay<I> {
     max_future_ms: u64,
     body_timeout: Duration,
     retry_after_s: u64,
+    /// ADR 0046 rules 9 to 14: the demand set and the suspension of demand eviction.
+    demand: Demand,
+    /// ADR 0046 rules 15 and 16: the `Cache-Control` of a `200` or `304` of `/block`, and the
+    /// `CDN-Cache-Control` sent with it when demand eviction is on.
+    cache_control: HeaderValue,
+    cdn_cache_control: Option<HeaderValue>,
+    /// ADR 0046 rule 5: the watermarks, in percent of `max_store_bytes`.
+    high_water_pct: u64,
+    low_water_pct: u64,
+    /// ADR 0046 rule 8: `Retry-After` of a `507` above the high-water mark, `sweep_interval_ms`
+    /// in seconds rounded up.
+    sweep_retry_after_s: u64,
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -124,10 +139,15 @@ pub struct Relay<I> {
 
 impl<I: IndexBackend + 'static> Relay<I> {
     /// The block routes' state over an open store and index.
-    #[must_use]
-    pub fn new(s: &Settings, store: Store, index: IndexHandle<I>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The demand set of ADR 0046 rule 25 could not be allocated.
+    pub fn new(s: &Settings, store: Store, index: IndexHandle<I>) -> Result<Self, TryReserveError> {
         let queue = Duration::from_millis(s.queue_timeout_ms);
-        Self {
+        let demand = Demand::new(s)?;
+        let (cache_control, cdn_cache_control) = cache_headers(&demand);
+        Ok(Self {
             store,
             index,
             cache: BlockCache::new(usize::try_from(s.block_cache_bytes).unwrap_or(usize::MAX)),
@@ -155,8 +175,50 @@ impl<I: IndexBackend + 'static> Relay<I> {
             max_future_ms: s.max_future_ms,
             body_timeout: Duration::from_millis(s.body_timeout_ms),
             retry_after_s: s.shed_retry_after_s,
+            demand,
+            cache_control,
+            cdn_cache_control,
+            high_water_pct: s.demand_high_water_pct,
+            low_water_pct: s.demand_low_water_pct,
+            sweep_retry_after_s: s.sweep_interval_ms.div_ceil(1_000),
             #[cfg(test)]
             before_insert: Mutex::new(None),
+        })
+    }
+
+    /// The demand state (ADR 0046).
+    #[must_use]
+    pub fn demand(&self) -> &Demand {
+        &self.demand
+    }
+
+    /// ADR 0046 rule 5: the high-water and low-water marks, in bytes of the admission total
+    /// ([`Store::admission_total`]).
+    pub(crate) fn watermarks(&self) -> (u64, u64) {
+        let max = u128::from(self.store.max_bytes());
+        let at = |pct: u64| u64::try_from(max * u128::from(pct) / 100).unwrap_or(u64::MAX);
+        (at(self.high_water_pct), at(self.low_water_pct))
+    }
+
+    /// ADR 0046 rule 14: the demand of a `PUT` answered `200`, recorded by the index writer
+    /// before the response, never through the set. Under the lock of `id`. A failed or refused
+    /// write is a lost demand (rule 13).
+    fn put_demand(&self, id: &BlockId) {
+        if !self.demand.enabled() {
+            return;
+        }
+        let now = (self.clock)();
+        let (ids, at) = ([*id], epoch_start(now, self.demand.epoch_ms()));
+        let written = self
+            .index
+            .write_blocking(move |i| i.record_demand(&ids, at));
+        match written {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                crate::demand::write_failed(I::io_error(&e).and_then(log::errno));
+                self.demand.lost(1, now);
+            }
+            Err(_) => self.demand.lost(1, now),
         }
     }
 
@@ -303,13 +365,30 @@ impl<I: IndexBackend + 'static> Relay<I> {
         *seen = Some(id);
         // Held until the index insert: one `PUT` of a given block at a time.
         let _id = self.lock_id(&id);
+        let result = self.decide(bytes, id, &block, checked);
+        // ADR 0046 rules 10 and 14: a `PUT` answered `200` is a demand of the block. A `201`
+        // records its demand in its index insert.
+        if matches!(result, Ok(Accepted::Known)) {
+            self.put_demand(&id);
+        }
+        result
+    }
+
+    /// Steps 4 and 5 of the `PUT` pipeline, under the lock of `id`.
+    fn decide<'a>(
+        &self,
+        bytes: &[u8],
+        id: BlockId,
+        block: &BlockRef<'a>,
+        checked: PowChecked<'a, Submitted>,
+    ) -> Result<Accepted, Rejection> {
         // C2 and C3 of the submitted bytes, run at most once.
         let mut verified = None;
-        let replaced = match self.settle(&id, &block, checked, &mut verified)? {
+        let replaced = match self.settle(&id, block, checked, &mut verified)? {
             Settled::Known => return Ok(Accepted::Known),
             // ADR 0043 rule 3: an expired block is not held; the file is kept, the block gets a
             // new position. No quota check: nothing is written to the store.
-            Settled::Reaccept => return self.index_new(&id, &block),
+            Settled::Reaccept => return self.index_new(&id, block),
             Settled::Create { replaced } => replaced,
         };
         // C2, C3 (ADR 0023 rule 8.6: the normal create path).
@@ -324,22 +403,22 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 // expired entry is not a holding (ADR 0043 rule 3): the block is new, `201`.
                 metrics::store_replaced();
                 match self.held(&id) {
-                    Held::Unindexed => self.index_orphan(&id, &block),
+                    Held::Unindexed => self.index_orphan(&id, block),
                     // Counts the acceptance after its insert.
-                    Held::Expired => return self.index_new(&id, &block),
+                    Held::Expired => return self.index_new(&id, block),
                     Held::Live | Held::Unknown => self.store.publish_gauges(),
                 }
                 // A new file: an acceptance, counted once the index is settled (see `accepted`).
                 self.bump_accepted(&id);
                 Ok(Accepted::Known)
             }
-            Ok(Stored::Created) => self.index_new(&id, &block),
+            Ok(Stored::Created) => self.index_new(&id, block),
             // A file appeared under the final name since the lookup (ADR 0008 rule 6). It is
             // indexed only if it holds the bytes just verified (ADR 0023 rule 15).
             Ok(Stored::AlreadyPresent) => {
                 if matches!(self.store.read(&id), Ok(Some(b)) if b == bytes) && self.unindexed(&id)
                 {
-                    self.index_orphan(&id, &block);
+                    self.index_orphan(&id, block);
                 }
                 Ok(Accepted::Known)
             }
@@ -729,6 +808,12 @@ impl<I: IndexBackend + 'static> Relay<I> {
                     &[("reason", Value::Str(r.reason()))],
                     None,
                 );
+                // ADR 0046 rule 8 (MAY): above the high-water mark the next sweeper run makes
+                // room, unless no block is a candidate (`demand_stuck`).
+                let (high, _) = self.watermarks();
+                if self.demand.enabled() && self.store.admission_total() > high {
+                    return ApiError::storage_full_retry(self.sweep_retry_after_s).into_response();
+                }
                 return ApiError::storage_full().into_response();
             }
             Rejection::Internal => return ApiError::internal().into_response(),
@@ -842,7 +927,7 @@ pub async fn get_block<I: IndexBackend + 'static>(
             .into_response();
     };
     if let Some(bytes) = relay.cache.get(&id) {
-        return block_response(bytes, &id, &headers);
+        return relay.block_response(bytes, &id, &headers);
     }
     let permit = match relay.read.acquire().await {
         Ok(p) => p,
@@ -859,7 +944,7 @@ pub async fn get_block<I: IndexBackend + 'static>(
     match loaded {
         Ok(Ok(Some(bytes))) => {
             relay.cache_loaded(&id, bytes.clone(), evicted);
-            block_response(bytes, &id, &headers)
+            relay.block_response(bytes, &id, &headers)
         }
         Ok(Ok(None)) => ApiError::not_found().into_response(),
         Ok(Err(())) => ApiError::internal().into_response(),
@@ -867,10 +952,56 @@ pub async fn get_block<I: IndexBackend + 'static>(
     }
 }
 
-/// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`.
-fn block_response(bytes: Bytes, id: &BlockId, request: &HeaderMap) -> Response {
+impl<I: IndexBackend + 'static> Relay<I> {
+    /// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`.
+    /// Either is a demand of the block (ADR 0046 rule 10), recorded in the demand set, never in
+    /// the index (rule 12).
+    fn block_response(&self, bytes: Bytes, id: &BlockId, request: &HeaderMap) -> Response {
+        let r = block_response(
+            bytes,
+            id,
+            request,
+            &self.cache_control,
+            self.cdn_cache_control.as_ref(),
+        );
+        self.demand.touch(id, (self.clock)());
+        r
+    }
+}
+
+/// ADR 0046 rules 15 and 16: the `Cache-Control` of a block response, and the
+/// `CDN-Cache-Control` sent with it when demand eviction is on. `S = E / 2` seconds.
+fn cache_headers(demand: &Demand) -> (HeaderValue, Option<HeaderValue>) {
+    if !demand.enabled() {
+        return (
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+            None,
+        );
+    }
+    let shared = demand.shared_max_age_s();
+    // Digits and ASCII only: always valid header values; the fallback is never used.
+    let value =
+        |v: String| HeaderValue::from_str(&v).unwrap_or(HeaderValue::from_static("no-store"));
+    (
+        value(format!(
+            "public, max-age=31536000, s-maxage={shared}, immutable"
+        )),
+        Some(value(format!("public, max-age={shared}, must-revalidate"))),
+    )
+}
+
+/// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`, with
+/// `cache_control` and, when given, `CDN-Cache-Control` (ADR 0046 rules 15 and 16).
+fn block_response(
+    bytes: Bytes,
+    id: &BlockId,
+    request: &HeaderMap,
+    cache_control: &HeaderValue,
+    cdn_cache_control: Option<&HeaderValue>,
+) -> Response {
     let etag = format!("\"{}\"", store::hex(id));
     let mut r = if none_match(request, &etag) {
+        metrics::block_not_modified();
         let mut r = Response::new(Body::empty());
         *r.status_mut() = StatusCode::NOT_MODIFIED;
         r
@@ -884,11 +1015,12 @@ fn block_response(bytes: Bytes, id: &BlockId, request: &HeaderMap) -> Response {
     };
     let h = r.headers_mut();
     // ADR 0012 rule 32, ADR 0023 rule 13: only bytes that passed full validation, or C2 and C3,
-    // reach this point.
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
+    // reach this point. ADR 0046 rules 15 and 16: with demand eviction on, shared caches keep it
+    // at most `S` without revalidation; private caches keep the one-year lifetime.
+    h.insert(header::CACHE_CONTROL, cache_control.clone());
+    if let Some(cdn) = cdn_cache_control {
+        h.insert(HeaderName::from_static("cdn-cache-control"), cdn.clone());
+    }
     // 64 hexadecimal digits in quotes: always a valid header value.
     if let Ok(v) = HeaderValue::from_str(&etag) {
         h.insert(header::ETAG, v);
@@ -969,7 +1101,7 @@ mod tests {
         let index = Arc::new(RedbIndex::open(&index_file, 1 << 20).unwrap());
         let pool = IndexPool::start(&index, &settings).unwrap();
         let store = Store::open(&dir, index_file, settings.max_store_bytes).unwrap();
-        let relay = Relay::new(&settings, store, pool.handle());
+        let relay = Relay::new(&settings, store, pool.handle()).unwrap();
         assert!(pool.shutdown().is_ok());
         let k = sbtp_core::SigningKey::from_bytes(&[9; 32]);
         let bytes = sbtp_core::BlockBuilder::for_key(&k)

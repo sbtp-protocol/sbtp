@@ -71,8 +71,8 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
         .fallback(|| async { ApiError::not_found() })
 }
 
-/// The JSON body of `GET /sbtp/v1/info`: the members of ADR 0007 rule 11 and ADR 0012 rule 20,
-/// nothing else (ADR 0018 rule 38). `software` (ADR 0012 rule 21, optional) is not published
+/// The JSON body of `GET /sbtp/v1/info`: the members of ADR 0007 rule 11, ADR 0012 rule 20 and
+/// ADR 0046 rule 4, nothing else (ADR 0018 rule 38). `software` (ADR 0012 rule 21, optional) is not published
 /// (ADR 0019 rule 25).
 fn info_body(s: &Settings) -> String {
     serde_json::json!({
@@ -82,6 +82,8 @@ fn info_body(s: &Settings) -> String {
         "max_query_limit": s.max_query_limit,
         // ADR 0019 rule 7: `null` when eviction by age is disabled, never 0.
         "block_ttl_ms": s.block_ttl_ms,
+        // ADR 0046 rule 4.
+        "demand_eviction": s.demand_eviction,
     })
     .to_string()
 }

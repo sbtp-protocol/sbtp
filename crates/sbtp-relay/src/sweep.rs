@@ -44,6 +44,19 @@
 //!
 //! `GET /block` keeps serving an expired block until its file is deleted (ADR 0013 rule 15 MAY):
 //! the `GET` path does not read the index, so it keeps working while the index does not.
+//!
+//! **Demand (ADR 0046).** The same task flushes the demand set ([`flush_demand`]) when it is
+//! half full or an epoch ended (a request of [`crate::demand::Demand`]), at the start of every
+//! run (rule 12), and once more at a clean shutdown (`crate::run`). After the age pass, a run
+//! evicts by demand ([`demand_pass`], rules 5 to 8): when the admission total of the store is
+//! above `demand_high_water_pct` of `max_store_bytes`, and until it is at or below
+//! `demand_low_water_pct`, at most `sweep_batch` blocks per run, least recently demanded first,
+//! only blocks whose `last_demand + 3 × E ≤ now`, never while rule 13 suspends it. Each candidate
+//! is checked again under the `PUT` lock of its `block_id` (rule 22): not in the demand set, and
+//! the index still holds it at the listed position with a `last_demand` within the bound, so a
+//! `PUT` answered `200` (rule 14, recorded under the same lock) or a re-acceptance between the
+//! listing and the deletion keeps the block. All flushes run on this task, so no flush is in
+//! progress while a demand pass checks the set.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,7 +66,8 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use crate::blocks::{ID_STRIPES, Relay, stripe};
-use crate::index::{IndexBackend, Position};
+use crate::demand::FLUSH_CHUNK;
+use crate::index::{Candidate, IndexBackend, Position};
 use crate::log::{self, Event, Level, Throttle, Value};
 use crate::metrics::{self, IndexOp};
 use crate::query::expiry_floor;
@@ -105,15 +119,20 @@ impl Failure {
 pub fn sweep_once<I: IndexBackend + 'static>(relay: &Relay<I>, batch: usize) -> Option<u64> {
     let start = Instant::now();
     let now = (relay.clock())();
+    // ADR 0046 rule 12: at every run.
+    flush_demand(relay);
     // ADR 0023 rule 6: at every run, also with eviction by age disabled.
     if let Err(e) = relay.store().purge_quarantine(now) {
         store::log_store_failed(e.op, &e.error);
     }
-    let (removed, failure) = match list(relay, batch, now) {
+    let (aged, failure) = match list(relay, batch, now) {
         Ok(Some(listing)) => apply(relay, listing),
         Ok(None) => (0, None),
         Err(f) => (0, Some(f)),
     };
+    let (demanded, demand_failure) = demand_pass(relay, batch, now);
+    let removed = aged.saturating_add(demanded);
+    let failure = failure.or(demand_failure);
     let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     metrics::sweep_done(removed, ms);
     if log::global().enabled(Level::Debug) {
@@ -205,10 +224,209 @@ pub(crate) fn apply<I: IndexBackend + 'static>(
     }
 }
 
+/// What [`flush_demand`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flushed {
+    /// Index entries moved forward (at most one per block per epoch).
+    pub updates: u64,
+    /// Demands lost: chunks the writer refused or failed to write.
+    pub lost: u64,
+}
+
+/// ADR 0046 rule 12: moves the demand set into the index, [`FLUSH_CHUNK`] identifiers per write
+/// job of the index writer, every identifier recorded at the epoch of the latest touch. A chunk
+/// that the writer refuses or fails to write is lost (rule 13: counted, eviction suspended).
+/// Runs on the sweeper task only, and once at shutdown after it has stopped.
+pub fn flush_demand<I: IndexBackend + 'static>(relay: &Relay<I>) -> Flushed {
+    let demand = relay.demand();
+    let mut out = Flushed::default();
+    if !demand.enabled() || demand.is_empty() {
+        return out;
+    }
+    demand.begin_flush();
+    let mut buf = Vec::with_capacity(FLUSH_CHUNK);
+    while let Some(epoch) = demand.drain_chunk(&mut buf) {
+        if buf.is_empty() {
+            continue;
+        }
+        let chunk = std::mem::take(&mut buf);
+        let n = chunk.len() as u64;
+        let written = relay.index().write_blocking(move |i| {
+            let r = i.record_demand(&chunk, epoch);
+            (chunk, r)
+        });
+        match written {
+            Ok((chunk, Ok(u))) => {
+                out.updates = out.updates.saturating_add(u);
+                buf = chunk;
+            }
+            Ok((chunk, Err(e))) => {
+                crate::demand::write_failed(I::io_error(&e).and_then(log::errno));
+                demand.lost(n, (relay.clock())());
+                out.lost = out.lost.saturating_add(n);
+                buf = chunk;
+            }
+            // The writer refuses only while the relay stops.
+            Err(_) => {
+                demand.lost(n, (relay.clock())());
+                out.lost = out.lost.saturating_add(n);
+                buf = Vec::with_capacity(FLUSH_CHUNK);
+            }
+        }
+    }
+    metrics::demand_flush(out.updates);
+    out
+}
+
+/// One listed batch of demand candidates and the bound they were listed with.
+pub(crate) struct DemandListing {
+    bound: u64,
+    candidates: Vec<Candidate>,
+}
+
+/// ADR 0046 rules 5, 7 and 13: whether a demand pass runs at `now` (not suspended, above the
+/// high-water mark or still draining toward the low-water mark), then at most `batch` candidates
+/// with `last_demand + 3 × E ≤ now`, least recently demanded first. `Ok(None)` when no pass runs
+/// or the reader queue refused the job.
+pub(crate) fn demand_list<I: IndexBackend + 'static>(
+    relay: &Relay<I>,
+    batch: usize,
+    now: u64,
+) -> Result<Option<DemandListing>, Failure> {
+    let demand = relay.demand();
+    if !demand.enabled() {
+        return Ok(None);
+    }
+    if let Ok(Ok(coldest)) = relay.index().read_blocking(I::coldest_demand) {
+        metrics::set_demand_coldest_ms(coldest.unwrap_or(0));
+    }
+    // Rule 13: only demand eviction stops; age eviction, `PUT` and reads are unchanged.
+    if demand.suspended(now) {
+        return Ok(None);
+    }
+    let (high, low) = relay.watermarks();
+    let total = relay.store().admission_total();
+    if total > high {
+        demand.set_draining(true);
+    }
+    if total <= low {
+        demand.set_draining(false);
+    }
+    if !demand.draining() {
+        return Ok(None);
+    }
+    // Rule 7. Before `3 × E` after the Unix epoch nothing can be a candidate.
+    let Some(bound) = now.checked_sub(demand.epoch_ms().saturating_mul(3)) else {
+        return Ok(Some(DemandListing {
+            bound: 0,
+            candidates: Vec::new(),
+        }));
+    };
+    match relay
+        .index()
+        .read_blocking(move |i| i.demand_candidates(bound, batch))
+    {
+        Ok(Ok(candidates)) => Ok(Some(DemandListing { bound, candidates })),
+        Ok(Err(e)) => Err(Failure::List(I::io_error(&e).and_then(log::errno))),
+        // Load: the next run retries.
+        Err(_) => Ok(None),
+    }
+}
+
+/// ADR 0046 rules 8 and 22: deletes the listed candidates, least recently demanded first, until
+/// the admission total is at or below the low-water mark. Each one is checked again under the
+/// lock of its `block_id`: not in the demand set, still indexed at the listed position, with a
+/// `last_demand` within the bound. Then removes their index entries in one write job. Returns the
+/// entries removed and the first failure.
+pub(crate) fn demand_apply<I: IndexBackend + 'static>(
+    relay: &Relay<I>,
+    listing: DemandListing,
+) -> (u64, Option<Failure>) {
+    static STUCK_LOG: Throttle = Throttle::new();
+    let start = Instant::now();
+    let (demand, store) = (relay.demand(), relay.store());
+    let (_, low) = relay.watermarks();
+    let DemandListing { bound, candidates } = listing;
+    let (mut done, mut bytes, mut failure) = (Vec::with_capacity(candidates.len()), 0u64, None);
+    for c in &candidates {
+        if store.admission_total() <= low {
+            break;
+        }
+        let id = c.id;
+        let _lock = relay.lock_id(&id);
+        // Rule 22: still a candidate at deletion time, the in-memory set included.
+        if demand.contains(&id) {
+            continue;
+        }
+        match relay.index().read_blocking(move |i| i.demand_state(&id)) {
+            Ok(Ok(Some((at, last)))) if at == c.position && last <= bound => {}
+            // Re-accepted, demanded since the listing, gone, or unknown: kept for this run.
+            _ => continue,
+        }
+        match relay.evict_locked(&id) {
+            Ok(_) => {
+                done.push(c.position);
+                bytes = bytes.saturating_add(u64::from(c.len));
+            }
+            // Skipped for the rest of the run, entries kept.
+            Err(e) => failure = failure.or(Some(Failure::Delete(log::errno(&e)))),
+        }
+    }
+    store.publish_gauges();
+    let blocks = done.len() as u64;
+    let removed = if done.is_empty() {
+        0
+    } else {
+        match relay.index().write_blocking(move |i| i.remove(&done)) {
+            Ok(Ok(n)) => u64::try_from(n).unwrap_or(u64::MAX),
+            Ok(Err(e)) => {
+                failure = failure.or(Some(Failure::Remove(I::io_error(&e).and_then(log::errno))));
+                0
+            }
+            // The writer refuses only while the relay stops: the entries stay as phantoms.
+            Err(_) => 0,
+        }
+    };
+    if store.admission_total() <= low {
+        demand.set_draining(false);
+    }
+    metrics::demand_run(blocks, bytes);
+    if blocks > 0 {
+        let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        log::emit(
+            Event::DemandEvicted,
+            &[
+                ("blocks", Value::Int(blocks)),
+                ("bytes", Value::Int(bytes)),
+                ("duration_ms", Value::Int(ms)),
+            ],
+        );
+    } else if candidates.is_empty() {
+        // Rule 8: nothing to evict; new blocks get `507` until blocks become candidates.
+        metrics::demand_stuck();
+        log::throttled(&STUCK_LOG, Event::DemandStuck, &[], None);
+    }
+    (removed, failure)
+}
+
+/// One demand pass: [`demand_list`], then [`demand_apply`].
+pub(crate) fn demand_pass<I: IndexBackend + 'static>(
+    relay: &Relay<I>,
+    batch: usize,
+    now: u64,
+) -> (u64, Option<Failure>) {
+    match demand_list(relay, batch, now) {
+        Ok(Some(listing)) => demand_apply(relay, listing),
+        Ok(None) => (0, None),
+        Err(f) => (0, Some(f)),
+    }
+}
+
 /// The sweeper task: a run every `interval` (the first one `interval` after the start, the
-/// start-up walk having just purged the quarantine), until `stop` changes or its sender is
-/// dropped. A run that is still going when `stop` changes is waited for. Returns early only if
-/// a run panicked, which the caller treats as the end of a supervised thread (ADR 0018 rule 37).
+/// start-up walk having just purged the quarantine), and a flush of the demand set when one is
+/// requested (ADR 0046 rule 12), until `stop` changes or its sender is dropped. A run that is
+/// still going when `stop` changes is waited for. Returns early only if a run panicked, which
+/// the caller treats as the end of a supervised thread (ADR 0018 rule 37).
 pub async fn run<I: IndexBackend + 'static>(
     relay: Arc<Relay<I>>,
     interval: Duration,
@@ -218,15 +436,17 @@ pub async fn run<I: IndexBackend + 'static>(
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = tick.tick() => {}
-            _ = stop.changed() => return,
-        }
         let r = Arc::clone(&relay);
-        if tokio::task::spawn_blocking(move || sweep_once(&r, batch))
-            .await
-            .is_err()
-        {
+        let job = tokio::select! {
+            _ = tick.tick() => tokio::task::spawn_blocking(move || {
+                sweep_once(&r, batch);
+            }),
+            () = relay.demand().flush_requested() => tokio::task::spawn_blocking(move || {
+                flush_demand(&r);
+            }),
+            _ = stop.changed() => return,
+        };
+        if job.await.is_err() {
             return;
         }
     }
@@ -277,9 +497,14 @@ mod tests {
         let index_file = dir.join("index.redb");
         let index = Arc::new(RedbIndex::open(&index_file, 1 << 20).unwrap());
         let store = Store::open(&dir, index_file, settings.max_store_bytes).unwrap();
+        index.configure_demand(settings.demand_epoch_ms).unwrap();
         store::reconcile(&store, &*index).unwrap();
         let pool = IndexPool::start(&index, &settings).unwrap();
-        let relay = Arc::new(Relay::new(&settings, store, pool.handle()).with_clock(clock));
+        let relay = Arc::new(
+            Relay::new(&settings, store, pool.handle())
+                .unwrap()
+                .with_clock(clock),
+        );
         Fixture {
             relay,
             dir,
@@ -625,5 +850,503 @@ mod tests {
         assert_eq!(put(&f, &first).await, StatusCode::CREATED);
         assert_eq!(position(&f, &id).unwrap().received_at, T0 + TTL);
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+/// ADR 0046: demand eviction, deterministic with the injectable clock (no sleeps). Every test has
+/// its own clock, data directory and relay; metrics are process-wide, so counters are compared
+/// with `>`, never for equality.
+#[cfg(test)]
+mod demand_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use axum::body::Body;
+    use axum::extract::{Request, State};
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+    use axum::response::Response;
+
+    use crate::blocks::{get_block, put_block};
+    use crate::config::Settings;
+    use crate::index::RedbIndex;
+    use crate::pool::IndexPool;
+    use crate::store::Store;
+
+    /// The smallest epoch (rule 24): 4 hours.
+    const E: u64 = 14_400_000;
+    /// Epoch-aligned start.
+    const T0: u64 = 1_000 * E;
+
+    struct Fixture {
+        relay: Arc<Relay<RedbIndex>>,
+        dir: std::path::PathBuf,
+        _pool: IndexPool<RedbIndex>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn settings(extra: &[(&str, &str)]) -> Settings {
+        let mut env = vec![
+            ("SBTP_RELAY_MIN_POW_DIFFICULTY".to_owned(), "0".to_owned()),
+            ("SBTP_RELAY_DEMAND_EPOCH_MS".to_owned(), E.to_string()),
+            (
+                "SBTP_RELAY_MAX_STORE_BYTES".to_owned(),
+                "8388608".to_owned(),
+            ),
+            (
+                "SBTP_RELAY_DEMAND_HIGH_WATER_PCT".to_owned(),
+                "50".to_owned(),
+            ),
+            (
+                "SBTP_RELAY_DEMAND_LOW_WATER_PCT".to_owned(),
+                "10".to_owned(),
+            ),
+        ];
+        env.extend(
+            extra
+                .iter()
+                .map(|(k, v)| (format!("SBTP_RELAY_{k}"), (*v).to_owned())),
+        );
+        let env = env
+            .into_iter()
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        Settings::load(Vec::<std::ffi::OsString>::new(), env).unwrap()
+    }
+
+    fn fixture(name: &str, clock: fn() -> u64, extra: &[(&str, &str)]) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("sbtp-demand-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = settings(extra);
+        let index_file = dir.join("index.redb");
+        let index = Arc::new(RedbIndex::open(&index_file, 1 << 20).unwrap());
+        index.configure_demand(settings.demand_epoch_ms).unwrap();
+        let store = Store::open(&dir, index_file, settings.max_store_bytes).unwrap();
+        store::reconcile(&store, &*index).unwrap();
+        let pool = IndexPool::start(&index, &settings).unwrap();
+        let relay = Arc::new(
+            Relay::new(&settings, store, pool.handle())
+                .unwrap()
+                .with_clock(clock),
+        );
+        Fixture {
+            relay,
+            dir,
+            _pool: pool,
+        }
+    }
+
+    /// A block of `len` payload bytes, distinct per `n`, with `parents`.
+    fn block(n: u32, len: usize, parents: &[BlockId]) -> (Vec<u8>, BlockId) {
+        let k = sbtp_core::SigningKey::from_bytes(&[5; 32]);
+        let mut payload = vec![0u8; len.max(4)];
+        payload[..4].copy_from_slice(&n.to_be_bytes());
+        let bytes = sbtp_core::BlockBuilder::for_key(&k)
+            .timestamp(1)
+            .parents(parents)
+            .payload(&payload)
+            .build(&k, 0)
+            .unwrap();
+        let id = sbtp_core::parse(&bytes).unwrap().block_id();
+        (bytes, id)
+    }
+
+    async fn put(f: &Fixture, bytes: &[u8]) -> Response {
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/sbtp/v1/block")
+            .body(Body::from(bytes.to_vec()))
+            .unwrap();
+        put_block(State(Arc::clone(&f.relay)), req).await
+    }
+
+    async fn get(f: &Fixture, id: &BlockId, if_none_match: Option<&str>) -> Response {
+        let uri = format!("/sbtp/v1/block/{id}").parse().unwrap();
+        let mut h = HeaderMap::new();
+        if let Some(v) = if_none_match {
+            h.insert(header::IF_NONE_MATCH, HeaderValue::from_str(v).unwrap());
+        }
+        get_block(State(Arc::clone(&f.relay)), uri, h).await
+    }
+
+    fn state(f: &Fixture, id: &BlockId) -> Option<(Position, u64)> {
+        let id = *id;
+        f.relay
+            .index()
+            .read_blocking(move |i| i.demand_state(&id))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn held(f: &Fixture, id: &BlockId) -> bool {
+        f.relay.store().path(id).exists()
+    }
+
+    async fn blocking<R: Send + 'static>(
+        f: &Fixture,
+        job: impl FnOnce(&Relay<RedbIndex>) -> R + Send + 'static,
+    ) -> R {
+        let r = Arc::clone(&f.relay);
+        tokio::task::spawn_blocking(move || job(&r)).await.unwrap()
+    }
+
+    async fn sweep(f: &Fixture) -> Option<u64> {
+        blocking(f, |r| sweep_once(r, 1_000)).await
+    }
+
+    /// Stores blocks of 60 kB from `first` at `at` until the admission total is above the
+    /// high-water mark; returns them in acceptance order.
+    async fn fill(f: &Fixture, first: u32, at: &AtomicU64) -> Vec<BlockId> {
+        let (high, _) = f.relay.watermarks();
+        let mut ids = Vec::new();
+        let mut n = first;
+        while f.relay.store().admission_total() <= high {
+            at.fetch_add(1, Ordering::SeqCst);
+            let (b, id) = block(n, 60_000, &[]);
+            assert_eq!(put(f, &b).await.status(), StatusCode::CREATED, "block {n}");
+            ids.push(id);
+            n += 1;
+            assert!(n < first + 200, "the high-water mark is reached");
+        }
+        ids
+    }
+
+    /// Rules 1 to 7 and 10: above the high-water mark, the blocks nobody requested for `3 × E`
+    /// go, least recently demanded first (rule 6), down to the low-water mark; a block requested
+    /// in the last `E`, by a `200` or a `304`, stays. Rules 15: the headers of a demand relay.
+    #[tokio::test]
+    async fn popular_blocks_survive_and_cold_blocks_go() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("popular", now, &[("DEMAND_LOW_WATER_PCT", "40")]);
+        let ids = fill(&f, 0, &NOW).await;
+        assert!(ids.len() >= 6, "{}", ids.len());
+        // Three epochs later, every other block is requested: by a `200`, then by a `304` (a
+        // shared cache revalidating).
+        NOW.store(T0 + 3 * E, Ordering::SeqCst);
+        for (k, id) in ids.iter().enumerate().filter(|(k, _)| k % 2 == 1) {
+            let r = if k % 4 == 1 {
+                get(&f, id, None).await
+            } else {
+                get(&f, id, Some(&format!("\"{id}\""))).await
+            };
+            assert!(
+                matches!(r.status(), StatusCode::OK | StatusCode::NOT_MODIFIED),
+                "{}",
+                r.status()
+            );
+            // Rule 15 with `E` = 4 h: `S` = 7,200 s.
+            assert_eq!(
+                r.headers()[header::CACHE_CONTROL],
+                "public, max-age=31536000, s-maxage=7200, immutable"
+            );
+            assert_eq!(
+                r.headers()["cdn-cache-control"],
+                "public, max-age=7200, must-revalidate"
+            );
+        }
+        NOW.store(T0 + 3 * E + 1, Ordering::SeqCst);
+        let evicted_before = metrics::demand_snapshot()[0].1;
+        assert!(sweep(&f).await.unwrap() > 0);
+        assert!(metrics::demand_snapshot()[0].1 > evicted_before);
+        let popular: Vec<bool> = ids
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|id| held(&f, id))
+            .collect();
+        assert!(popular.iter().all(|h| *h), "{popular:?}");
+        // Only cold blocks went, the oldest first: the deleted ones are a prefix of the cold ones.
+        let cold: Vec<bool> = ids.iter().step_by(2).map(|id| held(&f, id)).collect();
+        let gone = cold.iter().take_while(|h| !**h).count();
+        assert!(gone > 0);
+        assert!(cold[gone..].iter().all(|h| *h), "{cold:?}");
+        // The run stopped at the low-water mark, before the last cold blocks (the index file,
+        // which grows with the removals, makes the exact total after the run vary).
+        let (high, _) = f.relay.watermarks();
+        assert!(gone < cold.len(), "stopped at the low-water mark");
+        assert!(f.relay.store().admission_total() < high);
+        // An evicted block is gone from the index and answers `404`.
+        assert_eq!(state(&f, &ids[0]), None);
+        assert_eq!(get(&f, &ids[0], None).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Rule 7 at its exact millisecond: a block whose last demand is the epoch `T0` is not a
+    /// candidate at `T0 + 3 × E − 1`, and is at `T0 + 3 × E`.
+    #[tokio::test]
+    async fn three_epochs_protect_to_the_millisecond() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("exact", now, &[]);
+        let ids = fill(&f, 0, &NOW).await;
+        assert_eq!(state(&f, &ids[0]).unwrap().1, T0);
+        NOW.store(T0 + 3 * E - 1, Ordering::SeqCst);
+        assert_eq!(sweep(&f).await, Some(0));
+        assert!(ids.iter().all(|id| held(&f, id)));
+        NOW.store(T0 + 3 * E, Ordering::SeqCst);
+        assert!(sweep(&f).await.unwrap() > 0);
+        assert!(!held(&f, &ids[0]));
+    }
+
+    /// Rule 13: a demand lost to a full set is counted and suspends demand eviction for `2 × E`;
+    /// age eviction, reads and `PUT` are unchanged.
+    #[tokio::test]
+    async fn a_full_set_suspends_eviction_for_two_epochs() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("full-set", now, &[("DEMAND_TOUCH_MAX", "1024")]);
+        let ids = fill(&f, 0, &NOW).await;
+        let at = T0 + 3 * E;
+        NOW.store(at, Ordering::SeqCst);
+        // 1,024 other held blocks requested before a flush: stand-ins in the set.
+        for n in 0..1_024u32 {
+            let mut b = [9u8; 32];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            f.relay.demand().touch(&BlockId(b), at);
+        }
+        let lost = metrics::demand_lost_total();
+        // One more distinct block requested: the set is full, the demand is lost.
+        assert_eq!(get(&f, &ids[1], None).await.status(), StatusCode::OK);
+        assert!(metrics::demand_lost_total() > lost);
+        assert!(f.relay.demand().suspended(at));
+        assert_eq!(f.relay.demand().suspended_until(), at + 2 * E);
+        // Reads and writes go on.
+        let (b, _) = block(10_000, 10, &[]);
+        assert_eq!(put(&f, &b).await.status(), StatusCode::CREATED);
+        // Every block is a candidate, but nothing goes until `at + 2 × E`.
+        NOW.store(at + 2 * E - 1, Ordering::SeqCst);
+        assert_eq!(sweep(&f).await, Some(0));
+        assert!(ids.iter().all(|id| held(&f, id)));
+        NOW.store(at + 2 * E, Ordering::SeqCst);
+        assert!(sweep(&f).await.unwrap() > 0);
+        assert!(!held(&f, &ids[0]));
+    }
+
+    /// Rule 13: a start after an unclean shutdown suspends for `2 × E`; a clean close does not
+    /// and keeps `last_demand`.
+    #[test]
+    fn unclean_start_suspends_and_a_clean_restart_keeps_demand() {
+        let dir = std::env::temp_dir().join(format!("sbtp-demand-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.redb");
+        let id = BlockId([3; 32]);
+        let idx = RedbIndex::open(&path, 1 << 20).unwrap();
+        assert!(!idx.unclean_start(), "a new index");
+        idx.configure_demand(E).unwrap();
+        idx.insert(&id, 100, &[], T0 + 5, crate::index::FileState::Created)
+            .unwrap();
+        assert_eq!(idx.record_demand(&[id], T0 + 3 * E).unwrap(), 1);
+        idx.flush().unwrap();
+        // Closed without the clean mark: a crash, as seen at the next open.
+        idx.close().unwrap();
+        let idx = RedbIndex::open(&path, 1 << 20).unwrap();
+        assert!(idx.unclean_start());
+        idx.mark_clean().unwrap();
+        idx.close().unwrap();
+        let idx = RedbIndex::open(&path, 1 << 20).unwrap();
+        assert!(!idx.unclean_start(), "clean close");
+        let (_, last) = idx.demand_state(&id).unwrap().unwrap();
+        assert_eq!(last, T0 + 3 * E, "kept across a clean restart");
+        idx.close().unwrap();
+        // The relay side: suspended until `start + 2 × E`.
+        let d = crate::demand::Demand::new(&settings(&[])).unwrap();
+        d.unclean_start(T0);
+        assert!(d.suspended(T0 + 2 * E - 1));
+        assert!(!d.suspended(T0 + 2 * E));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rules 11 and 12: repeated requests in one epoch make at most one index update per block;
+    /// a `304` counts; a `404` does not reach the set.
+    #[tokio::test]
+    async fn one_update_per_block_per_epoch() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("once", now, &[]);
+        let (a, ida) = block(1, 10, &[]);
+        assert_eq!(put(&f, &a).await.status(), StatusCode::CREATED);
+        NOW.store(T0 + E + 7, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert_eq!(get(&f, &ida, None).await.status(), StatusCode::OK);
+        }
+        let etag = format!("\"{ida}\"");
+        let not_modified = metrics::block_not_modified_total();
+        assert_eq!(
+            get(&f, &ida, Some(&etag)).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert!(metrics::block_not_modified_total() > not_modified);
+        assert_eq!(f.relay.demand().len(), 1);
+        let missing = BlockId([0x44; 32]);
+        assert_eq!(
+            get(&f, &missing, None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!f.relay.demand().contains(&missing), "a 404 is not demand");
+        let flushed = blocking(&f, flush_demand).await;
+        assert_eq!(
+            flushed,
+            Flushed {
+                updates: 1,
+                lost: 0
+            }
+        );
+        assert_eq!(state(&f, &ida).unwrap().1, T0 + E);
+        // Again in the same epoch: nothing to update.
+        assert_eq!(
+            get(&f, &ida, Some(&etag)).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(blocking(&f, flush_demand).await.updates, 0);
+        // The next epoch moves it once more.
+        NOW.store(T0 + 2 * E, Ordering::SeqCst);
+        assert_eq!(get(&f, &ida, None).await.status(), StatusCode::OK);
+        assert_eq!(blocking(&f, flush_demand).await.updates, 1);
+        assert_eq!(state(&f, &ida).unwrap().1, T0 + 2 * E);
+    }
+
+    /// Rule 10: a `PUT` answered `200` is recorded by the writer before the response (rule 14);
+    /// the acceptance of a child refreshes a held parent. Rule 22: `/query?parent=` of an
+    /// evicted parent still lists its held children.
+    #[tokio::test]
+    async fn put_and_children_are_demand() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("children", now, &[]);
+        let (p, idp) = block(1, 10, &[]);
+        let (q, idq) = block(2, 10, &[]);
+        assert_eq!(put(&f, &p).await.status(), StatusCode::CREATED);
+        assert_eq!(put(&f, &q).await.status(), StatusCode::CREATED);
+        NOW.store(T0 + E, Ordering::SeqCst);
+        assert_eq!(put(&f, &q).await.status(), StatusCode::OK);
+        assert_eq!(
+            state(&f, &idq).unwrap().1,
+            T0 + E,
+            "recorded before the response"
+        );
+        assert!(f.relay.demand().is_empty(), "not through the set");
+        NOW.store(T0 + 2 * E + 3, Ordering::SeqCst);
+        let (c, idc) = block(3, 10, &[idp]);
+        assert_eq!(put(&f, &c).await.status(), StatusCode::CREATED);
+        assert_eq!(state(&f, &idp).unwrap().1, T0 + 2 * E, "parent refreshed");
+        assert_eq!(state(&f, &idc).unwrap().1, T0 + 2 * E);
+        // The child is read an epoch later; the parent goes by demand (filler blocks push the
+        // store above the high-water mark), the child stays.
+        NOW.store(T0 + 3 * E, Ordering::SeqCst);
+        assert_eq!(get(&f, &idc, None).await.status(), StatusCode::OK);
+        fill(&f, 100, &NOW).await;
+        NOW.store(T0 + 5 * E + 3, Ordering::SeqCst);
+        assert!(sweep(&f).await.unwrap() > 0);
+        assert!(!held(&f, &idp));
+        assert!(held(&f, &idc), "read at T0 + 3 E: protected until T0 + 6 E");
+        let page = f
+            .relay
+            .index()
+            .read_blocking(move |i| i.query(Some(&idp), Position::default(), 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.entries.iter().map(|e| e.1).collect::<Vec<_>>(),
+            vec![idc]
+        );
+    }
+
+    /// Rule 22: a `PUT` answered `200` between the listing and the deletion keeps the block (its
+    /// demand is recorded under the lock the sweeper takes); a `PUT` after a demand eviction is
+    /// a new block, `201`, with a new position and `last_demand` of the current epoch.
+    #[tokio::test]
+    async fn put_racing_a_demand_eviction_and_reacceptance() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("race", now, &[]);
+        let (a, ida) = block(1, 60_000, &[]);
+        assert_eq!(put(&f, &a).await.status(), StatusCode::CREATED);
+        let ids = fill(&f, 10, &NOW).await;
+        NOW.store(T0 + 3 * E, Ordering::SeqCst);
+        let listing = blocking(&f, |r| demand_list(r, 1_000, now()).unwrap().unwrap()).await;
+        assert_eq!(listing.candidates[0].id, ida, "the oldest first");
+        assert_eq!(put(&f, &a).await.status(), StatusCode::OK);
+        let (_, failure) = blocking(&f, move |r| demand_apply(r, listing)).await;
+        assert_eq!(failure, None);
+        assert!(held(&f, &ida), "demanded since the listing");
+        assert!(!held(&f, &ids[0]), "the next candidate goes");
+        // Now `a` goes by demand, and comes back as a new block.
+        let first = state(&f, &ida).unwrap().0;
+        fill(&f, 500, &NOW).await;
+        NOW.store(T0 + 7 * E, Ordering::SeqCst);
+        assert!(sweep(&f).await.unwrap() > 0);
+        assert!(!held(&f, &ida));
+        assert_eq!(state(&f, &ida), None);
+        NOW.store(T0 + 7 * E + 9, Ordering::SeqCst);
+        assert_eq!(put(&f, &a).await.status(), StatusCode::CREATED);
+        let (pos, last) = state(&f, &ida).unwrap();
+        assert!(pos > first);
+        assert_eq!(pos.received_at, T0 + 7 * E + 9);
+        assert_eq!(last, T0 + 7 * E);
+        assert_eq!(get(&f, &ida, None).await.status(), StatusCode::OK);
+    }
+
+    /// Rules 3 and 16: an archive relay (both evictions off) deletes nothing, sends the one-year
+    /// headers and no `CDN-Cache-Control`, and records no demand.
+    #[tokio::test]
+    async fn archive_relay_deletes_nothing() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture(
+            "archive",
+            now,
+            &[("DEMAND_EVICTION", "false"), ("BLOCK_TTL_MS", "0")],
+        );
+        let ids = fill(&f, 0, &NOW).await;
+        NOW.store(T0 + 1_000 * E, Ordering::SeqCst);
+        let r = get(&f, &ids[0], None).await;
+        assert_eq!(
+            r.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(r.headers().get("cdn-cache-control").is_none());
+        let r = get(&f, &ids[0], Some(&format!("\"{}\"", ids[0]))).await;
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+        assert!(r.headers().get("cdn-cache-control").is_none());
+        assert!(f.relay.demand().is_empty());
+        assert_eq!(sweep(&f).await, Some(0));
+        assert!(ids.iter().all(|id| held(&f, id)));
+    }
+
+    /// Rule 8: above the high-water mark with no candidate, nothing is evicted and the run is
+    /// counted as stuck.
+    #[tokio::test]
+    async fn nothing_evictable_is_stuck() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("stuck", now, &[]);
+        let ids = fill(&f, 0, &NOW).await;
+        let stuck = metrics::demand_snapshot()[3].1;
+        NOW.store(T0 + E, Ordering::SeqCst);
+        assert_eq!(sweep(&f).await, Some(0));
+        assert!(metrics::demand_snapshot()[3].1 > stuck);
+        assert!(ids.iter().all(|id| held(&f, id)));
     }
 }

@@ -207,7 +207,9 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
 /// sender SHOULD read `/info` before mining). With several relays the block is mined once, at the
 /// highest difficulty among them; a relay asking for more than [`MAX_RELAY_DIFFICULTY`] is left out
 /// (ADR 0029 rule 13: no mining for it), and a relay whose `/info` fails sets nothing. Refused when
-/// no relay gives a usable difficulty.
+/// no relay gives a usable difficulty. A difficulty read from relays is raised to the network
+/// difficulty `D_NET` (ADR 0045 rule 5), so that the block can be copied to any relay of the
+/// network; an explicit `--difficulty` is used as given.
 fn target_difficulty(difficulty: Option<u32>, relays: Option<&[Relay]>) -> Result<u32, Fail> {
     match (difficulty, relays) {
         (Some(_), Some(_)) => Err(Fail::usage(
@@ -246,10 +248,19 @@ fn target_difficulty(difficulty: Option<u32>, relays: Option<&[Relay]>) -> Resul
             match chosen {
                 Some(d) => {
                     warn_all(&failures);
-                    if several {
+                    // ADR 0045 rule 5: never below `D_NET`. `D_NET` is below the cap of ADR 0029
+                    // rule 13, which applies to the values read from relays.
+                    let net = sbtp_core::NETWORK_POW_DIFFICULTY;
+                    let mined = d.max(net);
+                    if mined > d {
+                        eprintln!(
+                            "Mining at difficulty {mined}, the network difficulty, so that every \
+                             relay of the network accepts the block."
+                        );
+                    } else if several {
                         eprintln!("Mining once at difficulty {d}, the highest of these relays.");
                     }
-                    Ok(d)
+                    Ok(mined)
                 }
                 None => Err(all_failed("no usable difficulty", failures)),
             }
