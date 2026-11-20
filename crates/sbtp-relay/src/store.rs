@@ -377,6 +377,22 @@ impl Store {
         fs::metadata(&self.index_file).map_or(0, |m| m.len())
     }
 
+    /// The quota limit, `max_store_bytes`.
+    #[must_use]
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// The total a new block is admitted against (ADR 0013 rule 18; security review M-1): the
+    /// quota bytes of the store plus the index file and the room reserved for its growth
+    /// ([`index_reserve`]). The watermarks of demand eviction compare it with `max_store_bytes`
+    /// (ADR 0046 rule 5), so that eviction makes room before `PUT`s get `507`.
+    #[must_use]
+    pub fn admission_total(&self) -> u64 {
+        self.used_bytes()
+            .saturating_add(index_reserve(self.index_bytes()))
+    }
+
     fn publish(&self, index: u64) {
         metrics::set_store_bytes(self.used_bytes(), index);
     }

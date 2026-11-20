@@ -47,7 +47,18 @@ fn defaults_are_the_small_vps_column() {
     assert_eq!(s.max_future_ms, 300_000);
     assert_eq!(s.max_query_limit, 1_000);
     assert_eq!(s.cors_allow_origins, CorsOrigins::Any);
-    assert_eq!(s.block_ttl_ms, Some(2_592_000_000));
+    // ADR 0046 rules 1, 2 and 24.
+    assert_eq!(s.block_ttl_ms, None);
+    assert!(s.demand_eviction);
+    assert_eq!(
+        (
+            s.demand_high_water_pct,
+            s.demand_low_water_pct,
+            s.demand_epoch_ms,
+            s.demand_touch_max
+        ),
+        (90, 80, 86_400_000, 16_384)
+    );
     assert_eq!(s.profile, Profile::Small);
     assert_eq!(
         (
@@ -483,16 +494,18 @@ fn block_ttl_zero_disables_eviction() {
 
 /// ADR 0019 rule 37 and its open-file figures. The memory bound is the row "with the log queue,
 /// `/metrics` off" of ADR 0027 clarification T1 (limiter entry 192 bytes; per-client tables and
-/// pins 4 × `max_connections` × 64 bytes; log queue 262,144 bytes, ADR 0021 rule 45). The log
-/// bound is the figure of ADR 0021 rule 23.
+/// pins 4 × `max_connections` × 64 bytes; log queue 262,144 bytes, ADR 0021 rule 45), plus the
+/// demand set of ADR 0046 rule 25 as laid out (`2 × demand_touch_max` slots of 32 bytes, rounded
+/// up to a power of two, and one flush chunk of 32,768 bytes): 1,081,344 bytes on `small`. The
+/// `small` bound stays under 15 MB. The log bound is the figure of ADR 0021 rule 23.
 #[test]
 fn profiles_set_exactly_the_adr_values() {
     for (name, profile, memory, files, blocking, log_bound) in [
-        ("small", Profile::Small, 13_665_748, 72, 10, 90_071_040),
+        ("small", Profile::Small, 14_747_092, 72, 10, 90_071_040),
         (
             "standard",
             Profile::Standard,
-            100_972_368,
+            109_393_744,
             312,
             26,
             444_149_760,
@@ -500,7 +513,7 @@ fn profiles_set_exactly_the_adr_values() {
         (
             "large",
             Profile::Large,
-            1_224_232_608,
+            1_291_374_240,
             4_176,
             50,
             1_771_560_960,
@@ -775,7 +788,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 51, "one line per setting");
+    assert_eq!(lines.len(), 56, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1028,5 +1041,137 @@ fn logging_settings() {
             &[]
         ),
         Format::Text
+    );
+}
+
+/// ADR 0046 rule 24: the demand settings, their ranges from both sources, the low < high
+/// constraint (checked with demand eviction off too), the boolean, and the profile row of
+/// `demand_touch_max`.
+#[test]
+fn demand_settings_and_network_difficulty() {
+    for (key, refused, accepted) in [
+        (
+            "demand_high_water_pct",
+            &["49", "100"][..],
+            &["81", "99"][..],
+        ),
+        ("demand_low_water_pct", &["9", "99"][..], &["10", "49"][..]),
+        (
+            "demand_epoch_ms",
+            &["14399999", "2592000001"][..],
+            &["14400000", "2592000000"][..],
+        ),
+        (
+            "demand_touch_max",
+            &["1023", "16777217"][..],
+            &["1024", "16777216"][..],
+        ),
+    ] {
+        for v in refused {
+            for r in both(key, v) {
+                assert!(r.is_err(), "{key} = {v} accepted");
+            }
+        }
+        for v in accepted {
+            for r in both(key, v) {
+                assert!(r.is_ok(), "{key} = {v}: {}", r.unwrap_err());
+            }
+        }
+    }
+    for pairs in [
+        &[("DEMAND_LOW_WATER_PCT", "90")][..],
+        &[
+            ("DEMAND_HIGH_WATER_PCT", "60"),
+            ("DEMAND_LOW_WATER_PCT", "70"),
+        ][..],
+        &[
+            ("DEMAND_EVICTION", "false"),
+            ("DEMAND_HIGH_WATER_PCT", "60"),
+            ("DEMAND_LOW_WATER_PCT", "60"),
+        ][..],
+    ] {
+        let e = err(&[], pairs);
+        assert!(
+            matches!(&e, ConfigError::Constraint(m)
+                if m.contains("demand_low_water_pct") && m.contains("demand_high_water_pct")),
+            "{e}"
+        );
+    }
+    // The boolean: `true` or `false` in the environment, a TOML boolean in the file.
+    assert!(
+        !load(&[], &[("DEMAND_EVICTION", "false")])
+            .unwrap()
+            .demand_eviction
+    );
+    assert!(
+        load(&[], &[("DEMAND_EVICTION", "true")])
+            .unwrap()
+            .demand_eviction
+    );
+    for bad in ["1", "yes", "False", ""] {
+        let e = err(&[], &[("DEMAND_EVICTION", bad)]);
+        assert!(e.to_string().contains("demand_eviction"), "{bad}: {e}");
+    }
+    let path = file("demand-bool", "demand_eviction = false\n");
+    let s = load(&["--config", &path], &[]).unwrap();
+    assert!(!s.demand_eviction);
+    assert_eq!(s.source("demand_eviction"), Some(Source::File));
+    let path = file("demand-str", "demand_eviction = \"false\"\n");
+    assert!(load(&["--config", &path], &[]).is_err());
+    // Rule 24: `demand_touch_max` is a profile row; the policy settings are not.
+    for (name, touch) in [
+        ("small", 16_384),
+        ("standard", 131_072),
+        ("large", 1_048_576),
+    ] {
+        let s = load(&[], &[("PROFILE", name)]).unwrap();
+        assert_eq!(s.demand_touch_max, touch, "{name}");
+        assert_eq!(
+            (
+                s.demand_high_water_pct,
+                s.demand_epoch_ms,
+                s.demand_eviction
+            ),
+            (90, 86_400_000, true)
+        );
+    }
+    // Off: the demand set is not allocated, so not in the memory bound.
+    let on = load(&[], &[]).unwrap().memory_bound_bytes();
+    let off = load(&[], &[("DEMAND_EVICTION", "false")])
+        .unwrap()
+        .memory_bound_bytes();
+    assert_eq!(on - off, 1_081_344);
+}
+
+/// ADR 0045 rules 2 and 3: the default is `D_NET`; a difficulty above it warns.
+#[test]
+fn difficulty_above_the_network_value_warns() {
+    // ADR 0045 rule 3.
+    let above = |d: &str| {
+        warnings(&load(&[], &[("MIN_POW_DIFFICULTY", d)]).unwrap())
+            .iter()
+            .any(|w| w.contains("outside the network difficulty"))
+    };
+    assert!(above("17"));
+    assert!(!above("16"));
+    assert!(!above("12"));
+    assert_eq!(
+        Settings::load(Vec::<OsString>::new(), Vec::new())
+            .unwrap()
+            .min_pow_difficulty,
+        sbtp_core::NETWORK_POW_DIFFICULTY
+    );
+}
+
+/// The memory target of the `small` profile, as a CI gate: the computed worst case of the default
+/// settings stays under 15 MB (ADR 0018 rule 35, ADR 0046 rule 25).
+#[test]
+fn small_profile_memory_bound_is_under_15_mb() {
+    let s = Settings::load(Vec::<OsString>::new(), Vec::new()).unwrap();
+    assert_eq!(s.profile, Profile::Small);
+    assert!(
+        s.memory_bound_bytes() < 15_000_000,
+        "{}",
+        s.memory_bound_bytes()
     );
 }

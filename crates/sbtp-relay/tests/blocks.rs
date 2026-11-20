@@ -94,9 +94,14 @@ fn new_known_and_served() {
         assert_eq!(r.status, 200);
         assert_eq!(r.body, b);
         assert_eq!(r.header("content-type"), Some("application/octet-stream"));
+        // ADR 0046 rule 15: demand eviction is on by default, `E` one day, `S` 43,200 s.
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, immutable")
+            Some("public, max-age=31536000, s-maxage=43200, immutable")
+        );
+        assert_eq!(
+            r.header("cdn-cache-control"),
+            Some("public, max-age=43200, must-revalidate")
         );
     }
     let missing = BlockId([0x11; 32]);
@@ -130,7 +135,11 @@ fn etag_and_not_modified() {
         assert_eq!(r.header("etag"), Some(etag.as_str()));
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, immutable")
+            Some("public, max-age=31536000, s-maxage=43200, immutable")
+        );
+        assert_eq!(
+            r.header("cdn-cache-control"),
+            Some("public, max-age=43200, must-revalidate")
         );
         assert_eq!(r.header("access-control-allow-origin"), Some("*"));
     }
@@ -357,10 +366,22 @@ fn shortcut_only_for_identical_bytes() {
 }
 
 /// ADR 0013 rules 18 to 21: `507` once the quota is reached, nothing written; known blocks and
-/// reads still served.
+/// reads still served. ADR 0046 rule 8: with demand eviction on (the default) the `507` above the
+/// high-water mark carries `Retry-After` (`sweep_interval_ms` in seconds); an archive relay (both
+/// evictions off) sends none (ADR 0023 rule 18).
 #[test]
 fn quota_gives_507() {
-    let relay = start(&[("MIN_POW_DIFFICULTY", "0"), ("MAX_STORE_BYTES", "4194304")]);
+    for (demand, retry) in [("true", Some("60")), ("false", None)] {
+        quota_gives_507_with(demand, retry);
+    }
+}
+
+fn quota_gives_507_with(demand: &str, retry: Option<&str>) {
+    let relay = start(&[
+        ("MIN_POW_DIFFICULTY", "0"),
+        ("MAX_STORE_BYTES", "4194304"),
+        ("DEMAND_EVICTION", demand),
+    ]);
     let mut c = relay.connect();
     let mut stored = Vec::new();
     let full = (0u8..80).find_map(|n| {
@@ -377,7 +398,7 @@ fn quota_gives_507() {
     assert_eq!((r.status, error(&r).as_str()), (507, "StorageFull"));
     // ADR 0023 rules 13 and 18.
     assert_eq!(r.header("cache-control"), Some("no-store"));
-    assert_eq!(r.header("retry-after"), None);
+    assert_eq!(r.header("retry-after"), retry, "demand_eviction = {demand}");
     assert!(!path_of(&relay.data, &id_of(&refused)).exists());
     let first = stored.first().expect("at least one block fits");
     assert_eq!(

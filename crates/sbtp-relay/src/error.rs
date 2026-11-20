@@ -101,6 +101,16 @@ impl ApiError {
         Self::new(StatusCode::INSUFFICIENT_STORAGE, "StorageFull")
     }
 
+    /// `507 StorageFull` with `Retry-After: retry_after_s`: demand eviction is on and the store
+    /// is above its high-water mark, so the next sweeper run makes room (ADR 0046 rule 8).
+    #[must_use]
+    pub fn storage_full_retry(retry_after_s: u64) -> Self {
+        Self {
+            retry_after_s: Some(retry_after_s),
+            ..Self::storage_full()
+        }
+    }
+
     /// `500 Internal`. No detail is disclosed.
     #[must_use]
     pub fn internal() -> Self {

@@ -181,6 +181,11 @@ events! {
     StoreReconciled => "store_reconciled", Info, Startup;
     // ADR 0021 clarification X1 (adds a row to rule 7): after the rows of ADR 0023.
     IndexReadFailed => "index_read_failed", Error, Bounded;
+    // ADR 0046 rule 29 (adds three rows to rule 7; the ADR names them without a table, the
+    // levels are this implementation's): after the row of X1.
+    DemandEvicted => "demand_evicted", Info, Bounded;
+    DemandStuck => "demand_stuck", Warn, Bounded;
+    DemandSuspended => "demand_suspended", Warn, Bounded;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1129,6 +1134,18 @@ mod tests {
             "X1 adds one event"
         );
         table.extend_from_slice(&own[1]);
+        // ADR 0046 rule 29 names three events without a level table: each must appear there.
+        let adr0046 =
+            include_str!("../../../docs/decisions/0046-keep-by-default-demand-eviction.md");
+        let demand = [
+            ("demand_evicted", "info"),
+            ("demand_stuck", "warn"),
+            ("demand_suspended", "warn"),
+        ];
+        for (name, _) in demand {
+            assert!(adr0046.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&demand);
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))

@@ -834,6 +834,8 @@ fn build_refuses_a_difficulty_above_256_at_once() {
         );
     }
     assert_eq!(sbtp_core::MAX_DIFFICULTY, 256);
+    // ADR 0045 rule 1: the network difficulty.
+    assert_eq!(sbtp_core::NETWORK_POW_DIFFICULTY, 16);
 }
 
 #[test]

@@ -94,8 +94,39 @@ docker run -d --name sbtp-relay \
   needs neither. Each probe takes a token from the probing address's `block` bucket (burst 200,
   3,000 per minute by default), so one probe every 10 seconds costs nothing noticeable.
 - **Memory.** About 3 MiB resident when idle (measured, `docker stats`, arm64). The start-up line
-  `memory_bound` gives the computed worst case of the settings in use (about 13.7 MB with the
-  `small` profile). A container limit of 32 MiB leaves room.
+  `memory_bound` gives the computed worst case of the settings in use (14,747,092 bytes, about
+  14.7 MB, with the `small` profile, the demand set of ADR 0046 included). A container limit of
+  32 MiB leaves room.
+
+## Retention: keep, demand eviction, archive
+
+By default the relay keeps what it receives (ADR 0046): `block_ttl_ms = 0` (no eviction by age)
+and `demand_eviction = true`. When the store passes `demand_high_water_pct` (90 %) of
+`max_store_bytes`, the sweeper deletes the blocks requested least recently, down to
+`demand_low_water_pct` (80 %); a block requested in the last `demand_epoch_ms` (one day), directly
+or through at most two shared caches in series, is never deleted, and a new block stays at least
+three epochs. A `PUT` never deletes anything: a new block that does not fit gets `507`, with a
+`Retry-After` of one sweeper interval while the store is above the high-water mark.
+
+- **Archive relay.** Set `demand_eviction = false` and leave `block_ttl_ms = 0`. Nothing is ever
+  deleted; a full store answers `507` (ADR 0013 rule 19). `/info` publishes
+  `"block_ttl_ms": null` and `"demand_eviction": false`, which is how clients and mirrors recognise
+  an archive (ADR 0043 rule 1, as amended). Size `max_store_bytes` for the data you intend to keep
+  and watch `store_bytes` and `storage_full_total`.
+- **Age-only relay.** `demand_eviction = false` and a `block_ttl_ms` of your choice (at least
+  60,000 ms).
+- **Privacy.** With demand eviction on, the index records, per block, the epoch in which it was
+  last requested (never by whom). An operator who does not want this turns demand eviction off.
+- **Restarts.** A stop that is not clean (`SIGKILL`, a crash, a power loss) suspends demand
+  eviction for two epochs after the next start, because demands kept in memory were lost; reads
+  and writes are unaffected and a full store answers `507` meanwhile. Stop with `SIGTERM`.
+- **Response headers.** With demand eviction on, a block response carries
+  `Cache-Control: public, max-age=31536000, s-maxage=<E/2>, immutable` and
+  `CDN-Cache-Control: public, max-age=<E/2>, must-revalidate` (`E/2` in seconds, 43,200 by
+  default), so that a shared cache revalidates each requested block at least twice per epoch and
+  the relay sees that demand. Browsers keep the one-year lifetime. The relay computes these
+  values; nothing is configured for them. With demand eviction off, the one-year
+  `Cache-Control` alone, as before.
 
 ## Pulling the CI image
 
@@ -324,7 +355,20 @@ documentation and source read through Context7 on 2026-11-20):
     the HTTP-to-HTTPS redirect (a `3xx`, or a loop). "Always Use HTTPS" is fine.
   - No challenge, Bot Fight Mode or "Under Attack" rule on `/sbtp/v1/*` (add a WAF skip rule for
     that path): their HTML challenge pages can exceed the 16,384-byte error-body ceiling.
-  - Cache rule "bypass" on `/sbtp/v1/*`, explicitly.
+  - Cache rules on `/sbtp/v1/*`. Either bypass the cache for the whole path (every request reaches
+    the relay), or:
+    - bypass for every path except `GET /sbtp/v1/block/*`;
+    - for `/sbtp/v1/block/*`: "Eligible for cache"; Edge TTL "Use cache-control header if present,
+      bypass cache if not"; Browser TTL "Respect origin". Never "Ignore cache-control header and use
+      this TTL", and no Cache Response Rule that sets `Cache-Control` on this path: either one
+      overrides the lifetime that the relay sets for demand eviction (ADR 0046 rule 15);
+    - Tiered Cache with Smart Topology on, so that one upper tier contacts the relay.
+    - `client_ip_header = "CF-Connecting-IP"` on the relay (ADR 0044).
+
+    No more than two caches in series may sit in front of a relay with demand eviction on (an edge
+    and one upper tier, ADR 0046 rule 17); with more, turn demand eviction off. `/sbtp/v1/info`
+    and `/sbtp/v1/query` are always bypassed: `/info` is `no-store`, and a cached `/query` page
+    would hide new blocks.
 
 ## Logs and client addresses
 
@@ -351,8 +395,10 @@ What the relay logs (ADR 0021 rules 10 to 15), on standard error only:
   or linked across restarts.
 
 The relay's own lines therefore hold no client address. Their retention is the log sink's
-(journald, Docker's log driver, the cluster's log collector): it SHOULD NOT exceed `block_ttl_ms`
-(30 days by default, rule 15), so that logs do not outlive the blocks they mention.
+(journald, Docker's log driver, the cluster's log collector). On a relay with eviction by age it
+SHOULD NOT exceed `block_ttl_ms` (rule 15), so that logs do not outlive the blocks they mention; by
+default there is no age limit (ADR 0046), and 30 days remains a reasonable retention for these
+lines.
 
 What a reverse proxy logs, and what to do about it:
 

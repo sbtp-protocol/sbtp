@@ -28,6 +28,8 @@ const TOML_MAX: u64 = (1 << 63) - 1;
 const MIN_BLOCK_TTL_MS: u64 = 60_000;
 /// `stats_interval_ms`: 0 (off) or this value to the maximum (ADR 0021 rule 46).
 const MIN_STATS_INTERVAL_MS: u64 = 10_000;
+/// The default of `min_pow_difficulty`: the network difficulty `D_NET` (ADR 0045 rules 1 and 2).
+const NETWORK_POW: u64 = sbtp_core::NETWORK_POW_DIFFICULTY as u64;
 
 /// Prefix of every environment variable of a setting (ADR 0018 rule 6).
 pub const ENV_PREFIX: &str = "SBTP_RELAY_";
@@ -85,10 +87,12 @@ macro_rules! int_settings {
 }
 
 int_settings! {
-    min_pow_difficulty: 0, 256, Some(16);
+    // ADR 0045 rule 2: the default is `D_NET`.
+    min_pow_difficulty: 0, 256, Some(NETWORK_POW);
     max_future_ms: 1_000, 86_400_000, Some(300_000);
     max_query_limit: 1, MAX_QUERY_LIMIT, Some(MAX_QUERY_LIMIT);
-    block_ttl_ms: 0, 315_360_000_000, Some(2_592_000_000);
+    // ADR 0046 rule 1: no eviction by age by default.
+    block_ttl_ms: 0, 315_360_000_000, Some(0);
     // ADR 0025 rule 16: the tree charge alone is 1,060,864 bytes.
     max_store_bytes: 4_194_304, TOML_MAX, Some(1 << 30);
     sweep_interval_ms: 1_000, 3_600_000, Some(60_000);
@@ -127,12 +131,17 @@ int_settings! {
     log_rate_per_min: 6, 6_000, Some(60);
     log_burst: 16, 3_000, Some(120);
     stats_interval_ms: 0, 86_400_000, Some(300_000);
+    // ADR 0046 rule 24. The low-water bound below the high-water mark is a constraint.
+    demand_high_water_pct: 50, 99, Some(90);
+    demand_low_water_pct: 10, 98, Some(80);
+    demand_epoch_ms: 14_400_000, 2_592_000_000, Some(86_400_000);
+    demand_touch_max: 1_024, 16_777_216, Some(16_384);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 19] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 20] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -153,6 +162,8 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 19] = [
     // ADR 0021 rule 23.
     ("log_rate_per_min", [300, 1_200]),
     ("log_burst", [300, 600]),
+    // ADR 0046 rule 24 (amends rule 37).
+    ("demand_touch_max", [131_072, 1_048_576]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -220,7 +231,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 11] = [
+const OTHER_KEYS: [&str; 12] = [
     "profile",
     "listen",
     "data_dir",
@@ -232,6 +243,7 @@ const OTHER_KEYS: [&str; 11] = [
     "log_timestamp",
     "log_client_tag",
     "client_ip_header",
+    "demand_eviction",
 ];
 
 /// An address block in CIDR notation (`192.0.2.0/24`, `2001:db8::/32`). Host bits must be zero.
@@ -426,6 +438,14 @@ pub struct Settings {
     pub log_burst: u64,
     /// 0: no `stats` line.
     pub stats_interval_ms: u64,
+    // ADR 0046 rule 24.
+    /// Eviction by least recent demand under disk pressure; default `true`.
+    pub demand_eviction: bool,
+    pub demand_high_water_pct: u64,
+    pub demand_low_water_pct: u64,
+    /// The demand epoch `E`.
+    pub demand_epoch_ms: u64,
+    pub demand_touch_max: u64,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -620,6 +640,7 @@ impl Settings {
         Self::finish(values)
     }
 
+    #[allow(clippy::too_many_lines)] // One field per setting.
     fn finish(mut values: BTreeMap<String, Raw>) -> Result<Self, ConfigError> {
         let source = |r: &Option<Raw>| r.as_ref().map_or(Source::Default, Raw::source);
         // Rule 36.1: the profile first.
@@ -656,6 +677,7 @@ impl Settings {
             false,
         )?;
         let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
+        let demand_eviction = parse_bool(other("demand_eviction"), "demand_eviction")?;
         // Strings of one fixed set each (ADR 0021 rule 46), parsed by the `choice!` of `log`.
         macro_rules! choice {
             ($t:ident, $k:literal) => {
@@ -720,6 +742,11 @@ impl Settings {
             log_rate_per_min: v(ints.log_rate_per_min),
             log_burst: v(ints.log_burst),
             stats_interval_ms: v(ints.stats_interval_ms),
+            demand_eviction: demand_eviction.unwrap_or(true),
+            demand_high_water_pct: v(ints.demand_high_water_pct),
+            demand_low_water_pct: v(ints.demand_low_water_pct),
+            demand_epoch_ms: v(ints.demand_epoch_ms),
+            demand_touch_max: v(ints.demand_touch_max),
             sources,
         };
         s.check_constraints()?;
@@ -752,6 +779,7 @@ impl Settings {
                     "log_timestamp" => Some(self.log_timestamp.name().to_owned()),
                     "log_client_tag" => Some(self.log_client_tag.name().to_owned()),
                     "client_ip_header" => Some(self.client_ip_header.clone().unwrap_or_default()),
+                    "demand_eviction" => Some(self.demand_eviction.to_string()),
                     _ => None,
                 }
             };
@@ -795,7 +823,11 @@ impl Settings {
             block_cache_bytes,
             log_rate_per_min,
             log_burst,
-            stats_interval_ms
+            stats_interval_ms,
+            demand_high_water_pct,
+            demand_low_water_pct,
+            demand_epoch_ms,
+            demand_touch_max
         )
     }
 
@@ -806,6 +838,20 @@ impl Settings {
     pub fn config_warnings(&self) -> Vec<Warning> {
         let mut w = Vec::new();
         let mut add = |code, setting, msg: String| w.push(Warning { code, setting, msg });
+        // ADR 0045 rule 3.
+        if self.min_pow_difficulty > sbtp_core::NETWORK_POW_DIFFICULTY {
+            add(
+                "pow_above_network",
+                "min_pow_difficulty",
+                format!(
+                    "min_pow_difficulty = {} is above the network difficulty {}: this relay is \
+                     outside the network difficulty; blocks accepted by other relays may be \
+                     refused (ADR 0045 rule 3)",
+                    self.min_pow_difficulty,
+                    sbtp_core::NETWORK_POW_DIFFICULTY
+                ),
+            );
+        }
         if self.min_pow_difficulty == 0 {
             add(
                 "no_pow",
@@ -997,6 +1043,13 @@ impl Settings {
             self.max_connections_per_client <= self.max_connections,
             "max_connections_per_client must not exceed max_connections",
         )?;
+        // ADR 0046 rule 24: checked whether or not `demand_eviction` is on.
+        if self.demand_low_water_pct >= self.demand_high_water_pct {
+            return Err(ConfigError::Constraint(format!(
+                "demand_low_water_pct ({}) must be less than demand_high_water_pct ({})",
+                self.demand_low_water_pct, self.demand_high_water_pct
+            )));
+        }
         // ADR 0018 clarification M5 (ADR 0027 rule 4): at most `max_connections` keys are pinned,
         // so at least half of the limiter table can always be dropped once full. The message
         // names both settings and their effective values.
@@ -1066,6 +1119,12 @@ impl Settings {
                 .saturating_mul(4 * EST_CLIENT_COUNT_ENTRY),
             // ADR 0021 rule 45.
             LOG_QUEUE_BYTES,
+            // ADR 0046 rule 25: the demand set, allocated once at start-up, and one flush chunk.
+            if self.demand_eviction {
+                crate::demand::memory_bytes(self.demand_touch_max)
+            } else {
+                0
+            },
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -1203,6 +1262,21 @@ pub fn early_log_format(args: &[OsString], env: &[(OsString, OsString)]) -> Form
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|t| t.get("log_format")?.as_str().and_then(Format::parse))
         .unwrap_or(Format::Text)
+}
+
+/// A boolean setting: a TOML boolean, or `true` or `false` in the environment; `None` when it is
+/// not set.
+fn parse_bool(r: Option<Raw>, setting: &'static str) -> Result<Option<bool>, ConfigError> {
+    match r {
+        None => Ok(None),
+        Some(Raw::Toml(toml::Value::Boolean(b))) => Ok(Some(b)),
+        Some(Raw::Env(s)) if s == "true" => Ok(Some(true)),
+        Some(Raw::Env(s)) if s == "false" => Ok(Some(false)),
+        Some(_) => Err(ConfigError::Invalid {
+            setting,
+            reason: "expected true or false".into(),
+        }),
+    }
 }
 
 fn parse_listen(r: Option<Raw>) -> Result<SocketAddr, ConfigError> {
@@ -1365,9 +1439,9 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 40 integer settings plus the 11 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021 and
-        // 0044.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 51);
+        // 44 integer settings plus the 12 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044
+        // and 0046.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 56);
     }
 
     /// ADR 0044 rule 1: a field name of 1 to 64 token bytes, kept lowercase; the two address
