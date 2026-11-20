@@ -7,6 +7,9 @@
 - Amends: ADR 0016 rule 21 (the parent positions of an `sbtp.enc_key` become a grammar
   validation rule) and the `sbtp.enc` row of its mapping table (closed edge set); ADR 0032 rule 4 (one
   more kind with a closed edge set). Nothing else in ADR 0016 or ADR 0032 changes
+- Clarification: 2026-11-20 (owner): with rule 4, the `sbtp.enc` length rule (payload = 90 bytes +
+  ciphertext) always holds at the four bucket lengths; `l2-grammar.md` §5.2 says so and keeps the check
+  as optional defence in depth
 - Depends on: ADR 0015 (grammar, coverage and order of edges), ADR 0016 (sealed envelope, key
   directory), ADR 0032 (kind rows, closed edge sets, validation inputs)
 - Impact: `l2-grammar.md` §2.1, §5.2, §5.5 (rules 1 to 4, "Spec change on acceptance", applied on acceptance), §1.3 and §5.5

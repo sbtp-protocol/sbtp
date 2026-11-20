@@ -365,6 +365,9 @@ the envelope through the tags it defines (§5.4).
 - **Length buckets.** Payload Len MUST be 512, 2,048, 8,192 or 65,535 bytes. The payload is 90 bytes plus
   the ciphertext, and the ciphertext is the plaintext plus 16 bytes: plaintexts are 406, 1,942, 8,086 or
   65,429 bytes. Sealed blocks are 662 to 65,685 bytes.
+- The rule "payload = 90 bytes + ciphertext" is implied by the closed edge set and the four bucket
+  lengths: in a valid outer payload, only `ct` varies in length, so a valid bucket length fixes it.
+  Implementations MAY keep the length check as defence in depth.
 - `validate_l2_invariants` checks this subsection from the payload and the header, with no key.
 
 ### 5.3 Plaintext and inner signature
@@ -385,8 +388,10 @@ the envelope through the tags it defines (§5.4).
 - **Order of checks.** The first failure makes the recipient ignore the block silently, and it tells no
   one which check failed: (1) layer 0 (core spec §3.4); (2) §2.4; (3) the tag is one it polls; (4) HPKE
   Open with each of its private keys for that purpose published no later than the end of the day after
-  the outer block's day, newest first; (5) padding; (6) the item; (7) `sig`; (8) `msg`; (9) the tag check
-  of the application that defines the tag (§5.4); (10) the checks of the kind.
+  the outer block's day, newest first; (5) padding; (6) the item, then its `from` differs from the
+  outer PubKey (§5.2); (7) `sig`; (8) `msg`; (9) the tag check of the application that defines the tag
+  (§5.4); (10) the checks of the kind. Since every failure is silent, the order cannot be observed from
+  outside; it is given so that the list is complete.
 
 ### 5.4 Tags and the verb `tagged`
 - A tag is a 32-byte BLAKE3 `derive_key` output under a context of core spec §3.5 or a context of the
@@ -423,8 +428,10 @@ the envelope through the tags it defines (§5.4).
   identity's directory. (ADR 0039 rule 6)
 - A sender MUST seal to the current key it holds and MUST NOT seal to a retracted key (a retraction of
   any version retracts the chain, §4.2). A user SHOULD rotate at least every 90 days. A recipient keeps
-  older private keys as long as it wants to read messages sealed to them, and MAY erase one once no relay
-  it uses can still hold such a message and it has kept the plaintexts.
+  older private keys as long as it wants to read messages sealed to them. It MAY erase an old key after a
+  retention period it chooses, once it has kept the plaintexts it wants. A relay can still hold a message
+  sealed to an erased key, and anyone can submit it again (ADR 0043): a copy received later is
+  unreadable.
 - A client MUST submit its current key block again (the same bytes) to each relay with a TTL once it
   has expired there (`architecture.md` §2, "Eviction"), or rotate at that interval. (ADR 0043)
 - **Storage.** In the web client, X25519 private keys are raw bytes in IndexedDB: an injected script can
