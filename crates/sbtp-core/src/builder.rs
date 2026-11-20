@@ -110,8 +110,10 @@ impl From<Error> for BuildError {
 /// with a full payload than on a root block. Counted in bytes, the cost of one call does not depend
 /// on the block's size (spec §4, "Client bounds": what a relay can make a client spend depends on
 /// the client's settings). At the measured 5.9 M attempts/s of a native build on root blocks
-/// (one 64-byte BLAKE3 block each, about 380 MB/s), the budget bounds a call to about 45 s; BLAKE3
-/// hashes longer inputs at least as fast per byte, so larger blocks stay under that bound. A WASM
+/// (one 64-byte BLAKE3 block each), the budget bounds a call to about 45 s. BLAKE3 pays one
+/// compression per started 64-byte block, so the bytes are counted rounded up to a multiple of 64
+/// (review fixes L-1); per compressed byte, longer inputs hash at least as fast, so larger blocks
+/// stay under that bound. A WASM
 /// build is slower, by a factor that depends on the engine and SIMD support: such a caller mines
 /// with [`mine`] in slices.
 ///
@@ -130,13 +132,18 @@ const HASH_BLOCK_LEN: u64 = 64;
 pub const DEFAULT_MAX_ATTEMPTS: u64 = DEFAULT_MINING_BUDGET_BYTES / HASH_BLOCK_LEN;
 
 /// The attempt budget that [`DEFAULT_MINING_BUDGET_BYTES`] gives a block of `block_len` bytes:
-/// the budget divided by the bytes each attempt hashes (the block without its signature, counted
-/// as at least 64), and at least 1. This is what [`BlockBuilder::build`] uses unless
+/// the budget divided by the bytes each attempt compresses (the block without its signature,
+/// rounded up to a multiple of 64, BLAKE3's block size), and at least 1. This is what [`BlockBuilder::build`] uses unless
 /// [`BlockBuilder::max_attempts`] is set.
 #[must_use]
 pub fn default_max_attempts(block_len: usize) -> u64 {
     let hashed = u64::try_from(block_len.saturating_sub(SIGNATURE_LEN)).unwrap_or(u64::MAX);
-    (DEFAULT_MINING_BUDGET_BYTES / hashed.max(HASH_BLOCK_LEN)).max(1)
+    // BLAKE3 compresses whole 64-byte blocks: a started block costs a full compression.
+    let compressed = hashed
+        .div_ceil(HASH_BLOCK_LEN)
+        .saturating_mul(HASH_BLOCK_LEN)
+        .max(HASH_BLOCK_LEN);
+    (DEFAULT_MINING_BUDGET_BYTES / compressed).max(1)
 }
 
 /// Builds the bytes of a block. Parents and payload are borrowed, not copied.

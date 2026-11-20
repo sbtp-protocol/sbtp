@@ -80,7 +80,8 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
         Some(path) => read_bounded(&path, MAX_PAYLOAD_LEN, "payload")?,
         None => Vec::new(),
     };
-    let difficulty = target_difficulty(p.number::<u32>("difficulty")?, p.text("relay")?)?;
+    let explicit = p.number::<u32>("difficulty")?;
+    let difficulty = target_difficulty(explicit, p.text("relay")?)?;
     let timestamp = match p.number::<u64>("timestamp")? {
         Some(t) => t,
         None => now_ms()?,
@@ -95,10 +96,12 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
         .map_err(build_fail)?;
     let started = Instant::now();
     // spec §3.3: increment the nonce from 0 until the block_id has `difficulty` leading zeros.
-    let budget = if difficulty > 26 {
+    // An explicit `--difficulty` is the user's own choice: no attempt bound. A difficulty read from a
+    // relay is bounded by the default budget (spec §4, "Client bounds"), which is counted in hashed
+    // bytes so that the time bound does not depend on the block's size.
+    let budget = if explicit.is_some() {
         u64::MAX
     } else {
-        // The default budget is in hashed bytes, so large blocks get fewer attempts (same time bound).
         default_max_attempts(block.len())
     };
     let (nonce, id) = mine(&mut block, difficulty, budget).map_err(build_fail)?;
@@ -546,7 +549,7 @@ fn build_fail(e: BuildError) -> Fail {
             Fail::usage(format!("cannot build the block: {e}"))
         }
         BuildError::PowNotFound => Fail::failed(format!(
-            "cannot mine the block: {e} within the attempt budget; lower the difficulty"
+            "cannot mine the block: {e} within the default attempt budget; pass `--difficulty <D>` explicitly to mine without a bound"
         )),
         _ => Fail::failed(format!("cannot build the block: {e}")),
     }

@@ -992,13 +992,15 @@ fn default_mining_budget_is_independent_of_block_size() {
     // The largest block hashes 65,845 bytes: attempts times bytes stays within the budget.
     let hashed = (MAX_BLOCK_LEN - 64) as u64;
     assert_eq!(hashed, 65_845);
+    // Rounded up to whole 64-byte BLAKE3 blocks: 65,856 bytes compressed per attempt.
+    let compressed = hashed.div_ceil(64) * 64;
     let attempts = default_max_attempts(MAX_BLOCK_LEN);
-    assert_eq!(attempts, DEFAULT_MINING_BUDGET_BYTES / hashed);
-    assert!(attempts * hashed <= DEFAULT_MINING_BUDGET_BYTES);
+    assert_eq!(attempts, DEFAULT_MINING_BUDGET_BYTES / compressed);
+    assert!(attempts * compressed <= DEFAULT_MINING_BUDGET_BYTES);
     assert!(attempts > 1 << 17);
-    for len in [MIN_BLOCK_LEN, 200, 1_088, 4_096, 30_000, MAX_BLOCK_LEN] {
+    for len in [MIN_BLOCK_LEN, 129, 200, 1_088, 4_096, 30_000, MAX_BLOCK_LEN] {
         let a = default_max_attempts(len);
-        let per = ((len - 64) as u64).max(64);
+        let per = ((len - 64) as u64).div_ceil(64).max(1) * 64;
         assert!(a * per <= DEFAULT_MINING_BUDGET_BYTES, "len {len}");
         assert!((a + 1) * per > DEFAULT_MINING_BUDGET_BYTES, "len {len}");
     }
