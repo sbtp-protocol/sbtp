@@ -22,14 +22,18 @@
 //! whose stripe counter has moved by the time it holds the lock, it looks the block up again
 //! (one `contains` job) and skips the file when the block now has another position. A block whose
 //! counter has not moved has not been accepted since the listing: the listing already reflects
-//! every acceptance made before it, since the acceptance indexes the block before it releases the
-//! lock. A re-acceptance after the file was deleted finds no file and stores a new one (`201`);
+//! every acceptance counted before it, since an acceptance increments the counter only after its
+//! index insert has returned (security review 2026-11-20 M-1). An acceptance whose insert had not
+//! committed when the listing ran increments the counter after the sweeper read it, so the
+//! sweeper looks the block up again. A re-acceptance after the file was deleted finds no file and stores a new one (`201`);
 //! its index insert replaces the old entry, so the sweeper's removal of the old position is a
 //! no-op on it (`index::remove_entries` keeps an `ids` entry that points elsewhere).
 //!
-//! **Failures.** A run stops at the first failed file deletion; the positions already processed
-//! still have their index entries removed. A failed listing or deletion is `sweep_failed` (error,
-//! throttled, with `errno`); a failed removal is `index_write_failed` with `op=remove` (ADR 0021
+//! **Failures.** A failed file deletion skips that position for the rest of the run, which goes on
+//! with the next ones (security review 2026-11-20 L-1: a deletion that keeps failing on the oldest
+//! entry must not stop all eviction); its index entries stay. The positions processed still have
+//! their index entries removed. A failed listing or deletion is `sweep_failed` (error, throttled,
+//! with `errno` of the first failed deletion of the run), counted once per run; a failed removal is `index_write_failed` with `op=remove` (ADR 0021
 //! rule 7). Both count `sweep_failures_total`. A job refused by a full queue or an expired wait is
 //! load, not a failure: the run ends and the next one retries (ADR 0018 rule 13). The sweeper's
 //! index calls never count toward the fatal exit (ADR 0018 clarification M6). The entries left by
@@ -66,7 +70,7 @@ pub(crate) struct Listing {
 pub(crate) enum Failure {
     /// The `expired` job failed (`sweep_failed`).
     List(Option<u64>),
-    /// A file deletion failed (`sweep_failed`).
+    /// A file deletion failed (`sweep_failed`); the first of the run.
     Delete(Option<u64>),
     /// The removal of the index entries failed (`index_write_failed`, `op=remove`).
     Remove(Option<u64>),
@@ -154,7 +158,7 @@ pub(crate) fn list<I: IndexBackend + 'static>(
     }
 }
 
-/// Steps 3 and 4 for `listing`. Returns the entries removed and the failure that stopped the run.
+/// Steps 3 and 4 for `listing`. Returns the entries removed and the first failure of the run.
 pub(crate) fn apply<I: IndexBackend + 'static>(
     relay: &Relay<I>,
     listing: Listing,
@@ -180,9 +184,9 @@ pub(crate) fn apply<I: IndexBackend + 'static>(
         }
         match relay.evict_locked(&id) {
             Ok(_) => done.push(at),
+            // Skipped for the rest of the run, entries kept: the next positions still go.
             Err(e) => {
-                failure = Some(Failure::Delete(log::errno(&e)));
-                break;
+                failure = failure.or(Some(Failure::Delete(log::errno(&e))));
             }
         }
     }
@@ -493,6 +497,95 @@ mod tests {
             "cache entry of `a` kept"
         );
         assert_eq!(get(&f, &idb).await, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Security review 2026-11-20 M-1, ADR 0043 rule 4: a sweeper that lists while an acceptance
+    /// of the block is between its start and its index insert sees the old, expired position.
+    /// Once the `PUT` has its `201`, the sweeper must keep the block. Both acceptance paths that
+    /// insert a new position: the re-acceptance of a held expired block, and a new file for a
+    /// phantom entry whose file is gone.
+    #[tokio::test]
+    async fn listing_during_the_insert_of_an_acceptance_keeps_the_block() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("insert-race", now, &[]);
+        let (a, ida) = block(6);
+        let (b, idb) = block(7);
+        assert_eq!(put(&f, &a).await, StatusCode::CREATED);
+        NOW.store(T0 + 1, Ordering::SeqCst);
+        assert_eq!(put(&f, &b).await, StatusCode::CREATED);
+        // `a` expires first, then `b`; the file of `b` is lost, leaving a phantom entry.
+        for (at, bytes, id, phantom) in [(T0 + TTL, &a, ida, false), (T0 + TTL + 1, &b, idb, true)]
+        {
+            NOW.store(at, Ordering::SeqCst);
+            if phantom {
+                std::fs::remove_file(file(&f, &id)).unwrap();
+            }
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let (relay, out) = (Arc::downgrade(&f.relay), Arc::clone(&slot));
+            f.relay.set_before_insert(move || {
+                let relay = relay.upgrade().unwrap();
+                *out.lock().unwrap() = Some(list(&relay, 1_000, now()).unwrap().unwrap());
+            });
+            assert_eq!(
+                put(&f, bytes).await,
+                StatusCode::CREATED,
+                "phantom={phantom}"
+            );
+            let listing = slot.lock().unwrap().take().unwrap();
+            assert_eq!(listing.batch.len(), 1);
+            assert_eq!(listing.batch[0].1, id, "the old, expired position");
+            let new = position(&f, &id).unwrap();
+            assert_eq!(new.received_at, at);
+            let r = Arc::clone(&f.relay);
+            let (_, failure) = tokio::task::spawn_blocking(move || apply(&r, listing))
+                .await
+                .unwrap();
+            assert_eq!(failure, None);
+            assert!(
+                file(&f, &id).exists(),
+                "accepted file kept, phantom={phantom}"
+            );
+            assert_eq!(position(&f, &id), Some(new));
+            assert_eq!(get(&f, &id).await, StatusCode::OK);
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Security review 2026-11-20 L-1: a deletion that fails on the oldest entry skips it for the
+    /// run; the later positions are still swept, the failure is reported and counted, and the
+    /// skipped block goes once its deletion succeeds.
+    #[tokio::test]
+    async fn failed_deletion_skips_the_position_and_the_run_goes_on() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("skip", now, &[]);
+        let (a, ida) = block(8);
+        let (b, idb) = block(9);
+        assert_eq!(put(&f, &a).await, StatusCode::CREATED);
+        NOW.store(T0 + 1, Ordering::SeqCst);
+        assert_eq!(put(&f, &b).await, StatusCode::CREATED);
+        // A directory under the final name of the oldest block: its deletion fails.
+        std::fs::remove_file(file(&f, &ida)).unwrap();
+        std::fs::create_dir(file(&f, &ida)).unwrap();
+        NOW.store(T0 + 2 * TTL, Ordering::SeqCst);
+        for _ in 0..2 {
+            let (_, _, failures) = metrics::sweep_totals();
+            assert_eq!(sweep(&f).await, None, "the failure is reported");
+            assert!(metrics::sweep_totals().2 > failures, "and counted");
+            assert!(file(&f, &ida).is_dir());
+            assert!(position(&f, &ida).is_some(), "the failed position stays");
+            assert!(!file(&f, &idb).exists(), "the next one is still swept");
+            assert_eq!(position(&f, &idb), None);
+        }
+        std::fs::remove_dir(file(&f, &ida)).unwrap();
+        assert_eq!(sweep(&f).await, Some(1));
+        assert_eq!(position(&f, &ida), None);
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 

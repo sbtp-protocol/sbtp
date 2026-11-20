@@ -88,6 +88,16 @@ Initial public version. Pre-release software: no version is supported for produc
   at most 7 days, for any log that holds addresses), and how to drop or mask addresses in Caddy and
   Traefik access logs.
 
+### Fixed
+
+- `sbtp-relay`: the sweeper could delete a block that had just been answered `201` when it listed
+  the expired position while the acceptance's index insert was still being written (pre-push review
+  2026-11-20 M-1, ADR 0043 rule 4). An acceptance now counts itself only after its index insert
+  returns.
+- `sbtp-relay`: a file deletion that keeps failing (for example a directory under a block's final
+  name) no longer stops eviction by age: the sweeper skips that position for the run and goes on
+  with the next ones, still logging `sweep_failed` and counting `sweep_failures` (review L-1).
+
 ### Security
 
 - Independent security reviews of the decoder, the cryptography, the relay and the clients are in
