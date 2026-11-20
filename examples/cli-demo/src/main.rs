@@ -222,8 +222,9 @@ With several relays, each is walked in turn with its own cursor (a cursor is onl
 relay that issued it), and each block_id is printed once over all of them. The 1,000,000
 deduplication bound is shared among the relays. The cursors are printed as
 `cursor: <RELAY_URL>=<CURSOR>`, one per relay, and given back the same way with --cursor. A
-relay whose walk fails is shown as a warning with its resume cursor; the command fails only
-when every relay fails.
+relay whose walk fails is shown as a warning with its resume cursor and is not asked again in
+that run (with --follow too); the command fails when every relay has failed. The block_ids
+printed over all relays are bounded by the same 1,000,000.
 
 OPTIONS:
     --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required). Repeat,

@@ -164,15 +164,16 @@ falls back to `http://127.0.0.1:8080`. Code: `src/relays.js`.
   trusted: every block is validated whatever relay served it, and an invalid one is never stored. A block
   below the client's own floor is refused at once (its proof of work is a property of its `block_id`).
 - **`/query`.** Each relay is walked with its own cursor (ADR 0012, ADR 0024), in parallel; the ids are
-  merged in the list's order and deduplicated by `block_id`. A relay whose ids were cut by the overall
-  bound keeps its starting cursor.
+  merged round-robin across the relays (so one relay cannot fill the view) and deduplicated by
+  `block_id`. A relay whose ids were cut by the overall bound keeps its starting cursor.
 - **Bounds.** Per relay, every bound of the table below; overall: 8 relays, 200 ids merged in a view,
   4 `GET /block` in flight in all, 800 `GET /block` per operation, failovers included.
 - **Health (in memory).** A failed request, a transient refusal or an invalid block counts as a relay
   fault (ADR 0029 rule 16); a `404` or a refused `PUT` does not. From 3 faults in a row the relay is left
   aside for an exponential back-off (1 s doubling, capped at 5 minutes, with jitter) and is not asked
-  meanwhile. A `Retry-After` in seconds always holds the relay back that long. A reload starts every
-  relay healthy. The page shows each relay's state under the list.
+  meanwhile. A `Retry-After` in seconds always holds the relay back that long, even when a success
+  that was already in flight arrives after it, and it is checked again before each `GET`. A reload
+  starts every relay healthy. The page shows each relay's state under the list.
 
 ## Proof-of-work measurement (Q-28)
 

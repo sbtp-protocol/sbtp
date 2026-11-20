@@ -9,7 +9,7 @@ import { after, before, test } from "node:test";
 
 import { LIMITS } from "../src/bounds.js";
 import { RelayRequestError } from "../src/http.js";
-import { Relay } from "../src/relay.js";
+import { Relay, RelayStatus } from "../src/relay.js";
 import {
   fetchBlocksFrom, fetchOne, isRelayFault, parseRelayList, publishAll, publishDifficulty, RelaySet,
   retryPlan, retryTargets, walkAll,
@@ -335,4 +335,55 @@ test("retry plan: pending blocks to every relay, partial ones to the relays that
   ];
   assert.deepEqual(retryPlan(metas, bases).map((p) => p.id), ["y", "v", "x"]);
   assert.deepEqual(retryPlan(metas, bases, 2).map((p) => p.id), ["y", "v"]);
+});
+
+/** A relay double: `get` runs `onGet(id)` and resolves its result; every call is counted. */
+function stubRelay(onGet) {
+  const r = { calls: 0 };
+  r.get = async (id) => {
+    r.calls += 1;
+    return onGet(id);
+  };
+  return r;
+}
+
+test("Retry-After received during a fetch: no GET to that relay, a success does not lift it (review L-1)", async () => {
+  const clock = 1_000_000;
+  const stubs = new Map();
+  const set = new RelaySet(["https://a.example.org", "https://b.example.org"], {
+    now: () => clock, makeRelay: (b) => stubs.set(b, stubRelay(() => null)).get(b),
+  });
+  const [a, b] = set.entries;
+  // While a's 404 is in flight, another worker gets 429 Retry-After 30 s from b.
+  stubs.get(a.base).get = async () => {
+    set.fail(b, new RelayStatus(429, "RateLimited", { ms: 30_000 }));
+    return null;
+  };
+  const r = await fetchOne(set, "11".repeat(32), () => assert.fail("nothing to validate"));
+  assert.equal(stubs.get(b.base).calls, 0, "b was asked inside its Retry-After");
+  assert.deepEqual(r.tried, [{ base: a.base, notFound: true }, { base: b.base, backingOff: true }]);
+  assert.equal(r.status, "not-found");
+  // A success on b that was already in flight keeps the Retry-After.
+  set.ok(b);
+  assert.equal(set.waitMs(b), 30_000);
+});
+
+test("merged walk: round-robin, so the first relay cannot fill the view (review L-2)", async () => {
+  const id = (n) => n.toString(16).padStart(64, "0");
+  const pages = new Map([
+    ["https://a.example.org", Array.from({ length: 10 }, (_, i) => id(100 + i))], // floods
+    ["https://b.example.org", [id(1), id(2)]],
+    ["https://c.example.org", [id(2), id(3)]],
+  ]);
+  const makeRelay = (base) => ({
+    queryPage: async () => ({ blockIds: pages.get(base), cursor: "end", more: false }),
+  });
+  const set = new RelaySet([...pages.keys()], { makeRelay });
+  const r = await walkAll(set, {}, { ...fastWalk, maxTotalIds: 5 });
+  assert.deepEqual(r.ids, [id(100), id(1), id(2), id(101), id(3)]);
+  // a was cut: it keeps its starting cursor; b and c were taken whole.
+  assert.equal(r.cursors.get("https://a.example.org"), null);
+  assert.equal(r.cursors.get("https://b.example.org"), "end");
+  assert.equal(r.cursors.get("https://c.example.org"), "end");
+  assert.equal(r.partial, true);
 });

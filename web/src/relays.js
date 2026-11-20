@@ -98,9 +98,12 @@ export class RelaySet {
     return Math.max(0, e.until - this.now());
   }
 
+  /**
+   * Records a success. `until` is left as is: a success that was in flight when another request got
+   * a Retry-After must not lift it (security review 2026-11-21, L-1).
+   */
   ok(e) {
     e.failures = 0;
-    e.until = 0;
     e.lastError = null;
   }
 
@@ -250,6 +253,12 @@ export async function fetchOne(set, id, validate, { budget, signal } = {}) {
   if (candidates.length === 0) return { status: "unavailable", tried };
   for (const e of candidates) {
     checkAborted(signal);
+    // Checked again before each GET: another worker may have received a Retry-After from this
+    // relay meanwhile (security review 2026-11-21, L-1).
+    if (set.waitMs(e) > 0) {
+      tried.push({ base: e.base, backingOff: true });
+      continue;
+    }
     if (budget && budget.left <= 0) return { status: "bound", tried };
     if (budget) budget.left -= 1;
     let bytes;
@@ -279,7 +288,8 @@ export async function fetchOne(set, id, validate, { budget, signal } = {}) {
     set.ok(e);
     return { status: "ok", block, base: e.base, tried };
   }
-  const allNotFound = tried.length > 0 && tried.every((t) => t.notFound);
+  if (tried.every((t) => t.backingOff)) return { status: "unavailable", tried };
+  const allNotFound = tried.every((t) => t.notFound || t.backingOff);
   return { status: allNotFound ? "not-found" : "failed", tried };
 }
 
@@ -327,8 +337,9 @@ export async function fetchBlocksFrom(set, ids, validate, {
 
 /**
  * Walks /query on every available relay of `set` in parallel, each with its own cursor from
- * `cursors` (a Map base → cursor) and its own walk bound `perRelayMaxIds`, then merges the ids in
- * the user's relay order, deduplicated by block_id, at most `maxTotalIds` in all.
+ * `cursors` (a Map base → cursor) and its own walk bound `perRelayMaxIds`, then merges the ids
+ * round-robin across the relays (in the user's order within a round), deduplicated by block_id, at
+ * most `maxTotalIds` in all.
  *
  * Resolves with `{ ids, runs, cursors, partial, backingOff }`: `runs` holds each relay's walk
  * result (`base`, `stop`, `error`, `ids`, `cursor`); `cursors` maps each walked base to the cursor to
@@ -350,24 +361,27 @@ export async function walkAll(set, filter = {}, {
     else if (w.stop !== "aborted") set.ok(e);
     return { base: e.base, start, ...w };
   }));
+  // Round-robin over the relays, so that one relay (hostile, or just large) cannot fill the whole
+  // budget and hide the others (security review 2026-11-21, L-2).
   const seen = new Set();
   const ids = [];
-  const out = new Map(cursors);
-  let cut = false;
-  for (const run of runs) {
-    let dropped = false;
-    for (const id of run.ids) {
-      if (seen.has(id)) continue;
+  const dropped = new Set();
+  const longest = Math.max(0, ...runs.map((r) => r.ids.length));
+  for (let i = 0; i < longest; i += 1) {
+    for (const run of runs) {
+      const id = run.ids[i];
+      if (id === undefined || seen.has(id)) continue;
       if (ids.length >= maxTotalIds) {
-        dropped = true;
+        dropped.add(run.base);
         continue;
       }
       seen.add(id);
       ids.push(id);
     }
-    cut ||= dropped;
-    out.set(run.base, dropped ? run.start : run.cursor);
   }
+  const out = new Map(cursors);
+  for (const run of runs) out.set(run.base, dropped.has(run.base) ? run.start : run.cursor);
+  const cut = dropped.size > 0;
   const partial = cut || backingOff.length > 0 || runs.some((r) => r.stop !== "done");
   return { ids, runs, cursors: out, partial, backingOff };
 }
