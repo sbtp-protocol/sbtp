@@ -980,3 +980,240 @@ fn query_keeps_the_cursor_and_backs_off_after_a_server_error() {
     assert!(!err.contains("walking again"), "{err}");
     assert!(err.contains("cursor: c2"), "{err}");
 }
+
+/// A loopback URL where nothing listens: the port was bound, then released.
+fn dead_relay() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
+}
+
+/// Several relays: one mining at the highest difficulty, publish to all in parallel, `get` with
+/// failover on 404, `query` merged across relays with one cursor per relay.
+#[test]
+fn several_relays_publish_get_and_query() {
+    let a = TestRelay::start();
+    let b = TestRelay::start();
+    let dir = tmp_dir("multi");
+    let (key, _) = test_key_file(&dir, 23);
+    let both = format!("{},{}", a.url, b.url);
+
+    // `mine` reads both /info and mines once.
+    let shared = dir.join("shared.sbtp");
+    let o = cli(&[
+        "mine",
+        "--key",
+        s(&key),
+        "--relay",
+        &a.url,
+        "--relay",
+        &b.url,
+        "--out",
+        s(&shared),
+    ]);
+    assert_ok(&o);
+    assert!(
+        stderr(&o).contains(&format!("Mining once at difficulty {RELAY_DIFFICULTY}")),
+        "{}",
+        stderr(&o)
+    );
+    let shared_id = stdout(&o).trim().to_owned();
+
+    // Publish to both (a comma list): two 201s, the block_id once.
+    let o = cli(&["publish", "--relay", &both, s(&shared)]);
+    assert_ok(&o);
+    assert_eq!(stdout(&o).trim(), shared_id);
+    assert_eq!(
+        stderr(&o).matches("201 Created").count(),
+        2,
+        "{}",
+        stderr(&o)
+    );
+
+    // Blocks held by one relay only.
+    let only_a = mine_and_publish(&a.url, &key, &dir, None, 11);
+    let only_b = mine_and_publish(&b.url, &key, &dir, None, 12);
+
+    // `get` asks a first, gets 404, then b, which serves it; the block is verified.
+    let o = cli(&["get", "--relay", &a.url, "--relay", &b.url, &only_b]);
+    assert_ok(&o);
+    assert!(stdout(&o).contains(&format!("block_id:   {only_b}")));
+    let err = stderr(&o);
+    assert!(
+        err.contains("404") && err.contains(&format!("Served by relay {}", b.url)),
+        "{err}"
+    );
+    // Not held anywhere: every relay's 404, status 3.
+    let o = cli(&["get", "--relay", &both, &"ee".repeat(32)]);
+    assert_code(&o, 3);
+    assert!(stderr(&o).contains("on any relay"), "{}", stderr(&o));
+    assert!(stderr(&o).matches("404").count() >= 2, "{}", stderr(&o));
+
+    // `query` over both: every block once, though `shared` is on both; a cursor per relay.
+    let o = cli(&["query", "--relay", &both]);
+    assert_ok(&o);
+    let mut all = vec![shared_id.clone(), only_a.clone(), only_b.clone()];
+    all.sort();
+    assert_eq!(sorted_lines(&stdout(&o)), all);
+    let cursors: Vec<String> = stderr(&o)
+        .lines()
+        .filter_map(|l| l.strip_prefix("cursor: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(cursors.len(), 2, "{}", stderr(&o));
+    assert!(
+        cursors[0].starts_with(&format!("{}=", a.url)),
+        "{cursors:?}"
+    );
+    assert!(
+        cursors[1].starts_with(&format!("{}=", b.url)),
+        "{cursors:?}"
+    );
+
+    // A poll from both cursors: only what was stored since, on whichever relay.
+    let late = mine_and_publish(&b.url, &key, &dir, None, 13);
+    let o = cli(&[
+        "query",
+        "--relay",
+        &both,
+        "--cursor",
+        &cursors[0],
+        "--cursor",
+        &cursors[1],
+    ]);
+    assert_ok(&o);
+    assert_eq!(stdout(&o).trim(), late);
+
+    // A bare cursor with several relays, a cursor that names no relay of the list, two cursors for
+    // one relay: usage errors.
+    let cursor_a = cursors[0].rsplit_once('=').unwrap().1;
+    for bad in [
+        vec!["--cursor", cursor_a],
+        vec!["--cursor", "http://127.0.0.1:1=abc"],
+        vec!["--cursor", &cursors[0], "--cursor", &cursors[0]],
+    ] {
+        let mut args = vec!["query", "--relay", &both];
+        args.extend(bad);
+        assert_code(&cli(&args), 2);
+    }
+
+    // `info` on both.
+    let o = cli(&["info", "--relay", &both]);
+    assert_ok(&o);
+    assert_eq!(stdout(&o).matches("min_pow_difficulty").count(), 2);
+}
+
+/// Publishing succeeds when one relay acknowledges; the others are named with a retry command.
+/// Every relay down: status 1. A relay list is checked as a whole before anything is sent.
+#[test]
+fn several_relays_publish_partial_failure_and_list_checks() {
+    let a = TestRelay::start();
+    let dir = tmp_dir("multi-fail");
+    let (key, _) = test_key_file(&dir, 24);
+    let block = dir.join("b.sbtp");
+    assert_ok(&cli(&[
+        "mine",
+        "--key",
+        s(&key),
+        "--difficulty",
+        RELAY_DIFFICULTY,
+        "--out",
+        s(&block),
+    ]));
+    let dead = dead_relay();
+    let o = cli(&["publish", "--relay", &dead, "--relay", &a.url, s(&block)]);
+    assert_ok(&o);
+    let err = stderr(&o);
+    assert!(err.contains("Published on 1 of 2 relays"), "{err}");
+    assert!(
+        err.contains(&format!("cli-demo publish --relay {dead} ")),
+        "{err}"
+    );
+    assert_eq!(stdout(&o).trim().len(), 64);
+
+    let o = cli(&[
+        "publish",
+        "--relay",
+        &format!("{dead},{}", dead_relay()),
+        s(&block),
+    ]);
+    assert_code(&o, 1);
+    assert!(
+        stderr(&o).contains("not stored on any relay"),
+        "{}",
+        stderr(&o)
+    );
+
+    // `mine` with an unreachable relay among reachable ones uses the others.
+    let o = cli(&[
+        "mine",
+        "--key",
+        s(&key),
+        "--relay",
+        &format!("{dead},{}", a.url),
+        "--out",
+        s(&dir.join("m.sbtp")),
+    ]);
+    assert_ok(&o);
+
+    // Empty element, https in the list, more than 8 relays: usage errors.
+    let nine: Vec<String> = (1..=9).map(|p| format!("http://127.0.0.1:{p}")).collect();
+    for list in [
+        format!("{},", a.url),
+        format!("{},https://relay.example.org", a.url),
+        nine.join(","),
+    ] {
+        assert_code(&cli(&["publish", "--relay", &list, s(&block)]), 2);
+    }
+    // The same relay twice is used once.
+    let o = cli(&["publish", "--relay", &format!("{0},{0}/", a.url), s(&block)]);
+    assert_ok(&o);
+    assert_eq!(stderr(&o).matches("200 OK").count(), 1, "{}", stderr(&o));
+}
+
+/// A hostile relay first in the list serves a wrong block: it is reported and the next relay's
+/// valid block is used. Only hostile or unreachable relays: status 4, nothing written.
+#[test]
+fn several_relays_get_skips_a_hostile_relay() {
+    let good = TestRelay::start();
+    let dir = tmp_dir("multi-hostile");
+    let (key, _) = test_key_file(&dir, 25);
+    let id = mine_and_publish(&good.url, &key, &dir, None, 21);
+    let other = SigningKey::from_bytes(&[26u8; 32]);
+    let wrong = BlockBuilder::for_key(&other)
+        .payload(b"not the one asked for")
+        .build(&other, 0)
+        .unwrap();
+
+    let (hostile, t) = fake_relay(wrong.clone(), 1);
+    let out = dir.join("got.sbtp");
+    let list = format!("{hostile},{}", good.url);
+    let o = cli(&["get", "--relay", &list, "--out", s(&out), &id]);
+    t.join().unwrap();
+    assert_ok(&o);
+    let err = stderr(&o);
+    assert!(
+        err.contains("BlockIdMismatch") && err.contains("Served by relay"),
+        "{err}"
+    );
+    assert!(stdout(&o).contains(&format!("block_id:   {id}")));
+    assert!(out.exists());
+
+    let (hostile, t) = fake_relay(wrong, 1);
+    let out = dir.join("none.sbtp");
+    let dead = dead_relay();
+    let o = cli(&[
+        "get",
+        "--relay",
+        &hostile,
+        "--relay",
+        &dead,
+        "--out",
+        s(&out),
+        &id,
+    ]);
+    t.join().unwrap();
+    assert_code(&o, 4);
+    assert!(stderr(&o).contains("no valid block"), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert!(!out.exists());
+}

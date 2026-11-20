@@ -18,6 +18,8 @@ export class StoreFull extends Error {
 }
 
 const TOTALS = "totals";
+/** Relay bases remembered per own block for a retry (`failedOn`). */
+const MAX_FAILED_ON = 2 * LIMITS.maxRelays;
 const isPending = (m) => m.own && !m.acked;
 
 function totalsOf(metas) {
@@ -85,17 +87,27 @@ export class BlockStore {
     });
   }
 
-  /** Marks an own block acknowledged by a relay (200 or 201): it may be evicted from now on. */
-  ack(id) {
+  /**
+   * Records one PUT round of an own block: `acked`, the relay bases that answered 200 or 201, and
+   * `failed`, the ones that did not. From the first acknowledgement the block may be evicted; the
+   * relays it failed on are kept in `failedOn` (at most `maxFailedOn`) so that it is sent to them
+   * again.
+   */
+  recordPublish(id, acked, failed) {
     return tx(this.db, ["blockMeta", "stats"], "readwrite", async (s) => {
-      const totals = await readTotals(s);
       const m = await s.blockMeta.get(id);
-      if (m && !m.acked) {
+      if (!m) return;
+      const failedOn = new Set(m.failedOn ?? []);
+      for (const b of acked) failedOn.delete(b);
+      for (const b of failed) failedOn.add(b);
+      m.failedOn = [...failedOn].slice(-MAX_FAILED_ON);
+      if (acked.length > 0 && !m.acked) {
+        const totals = await readTotals(s);
         totals.pending -= isPending(m) ? 1 : 0;
         m.acked = true;
-        await s.blockMeta.put(m);
         await s.stats.put(totals);
       }
+      await s.blockMeta.put(m);
     });
   }
 

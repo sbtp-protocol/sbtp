@@ -1,6 +1,7 @@
 //! The subcommands. Every layer 0 operation goes through `sbtp-core`: building, mining, signing,
 //! parsing and validating blocks.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -9,12 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sbtp_core::layout::{MAX_BLOCK_LEN, MAX_PAYLOAD_LEN};
 use sbtp_core::{
-    BlockBuilder, BlockId, BlockRef, BuildError, default_max_attempts, mine, sign_block,
-    validate_requested, validate_submitted,
+    BlockBuilder, BlockId, BlockRef, BuildError, Requested, ValidatedBlock, default_max_attempts,
+    mine, sign_block, validate_requested, validate_submitted,
 };
 
 use crate::args::{Kind, Parsed, parse as parse_args};
-use crate::fail::{Fail, untrusted};
+use crate::fail::{self, Fail, untrusted};
 use crate::relay::{Relay, Stored};
 use crate::walk::{self, Event, Filter, Policy, Walker};
 use crate::{hex, keyfile, output};
@@ -23,6 +24,80 @@ use crate::{hex, keyfile, output};
 /// 2^24 hashes, a few seconds. A relay announcing more is refused rather than obeyed
 /// (`BlockBuilder` documents the same concern for hostile relays).
 const MAX_RELAY_DIFFICULTY: u32 = 24;
+
+/// Most relays one command uses (`--relay` repeated or a comma list). Every per-relay bound (request
+/// deadline, body ceilings, walk) is multiplied by at most this.
+const MAX_RELAYS: usize = 8;
+
+/// The relays of `--relay`, repeated and/or comma-separated, in order, without duplicates (same
+/// base URL). `None` when the option is absent.
+fn relay_list(p: &Parsed) -> Result<Option<Vec<Relay>>, Fail> {
+    let mut relays: Vec<Relay> = Vec::new();
+    for value in p.values("relay") {
+        let text = value
+            .to_str()
+            .ok_or_else(|| Fail::usage("`--relay`: the value is not UTF-8"))?;
+        for url in text.split(',').map(str::trim) {
+            if url.is_empty() {
+                return Err(Fail::usage(
+                    "`--relay`: an empty URL in the list (separate URLs with one comma)",
+                ));
+            }
+            let relay = Relay::new(url)?;
+            if !relays.iter().any(|r| r.base() == relay.base()) {
+                relays.push(relay);
+            }
+        }
+    }
+    if relays.len() > MAX_RELAYS {
+        return Err(Fail::usage(format!(
+            "{} relays given; this client uses at most {MAX_RELAYS}",
+            relays.len()
+        )));
+    }
+    Ok(if relays.is_empty() {
+        None
+    } else {
+        Some(relays)
+    })
+}
+
+/// [`relay_list`], required.
+fn required_relays(p: &Parsed) -> Result<Vec<Relay>, Fail> {
+    relay_list(p)?.ok_or_else(|| Fail::usage("`--relay <URL>` is required"))
+}
+
+/// The failures of some relays, when the command still succeeds on others.
+fn warn_all(failures: &[Fail]) {
+    for f in failures {
+        eprintln!("warning: {f}");
+    }
+}
+
+/// One failure for several relays that all failed: every message, and an exit status that says
+/// the most: 4 when a relay served an invalid block (a relay fault worth noticing), else the
+/// status they share, else 1. With one relay, its failure unchanged.
+fn all_failed(what: &str, mut failures: Vec<Fail>) -> Fail {
+    if failures.len() == 1
+        && let Some(only) = failures.pop()
+    {
+        return only;
+    }
+    let code = if failures.iter().any(|f| f.code == fail::EXIT_INVALID) {
+        fail::EXIT_INVALID
+    } else {
+        match failures.first().map(|f| f.code) {
+            Some(c) if failures.iter().all(|f| f.code == c) => c,
+            _ => fail::EXIT_FAILURE,
+        }
+    };
+    let mut message = format!("{what} on any relay:");
+    for f in &failures {
+        message.push_str("\n- ");
+        message.push_str(&f.message.replace('\n', "\n  "));
+    }
+    Fail { code, message }
+}
 
 /// `keygen --out <FILE>`.
 pub fn keygen(args: &[OsString]) -> Result<(), Fail> {
@@ -56,7 +131,7 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
             ("payload", Kind::Value),
             ("parent", Kind::Repeated),
             ("difficulty", Kind::Value),
-            ("relay", Kind::Value),
+            ("relay", Kind::Repeated),
             ("timestamp", Kind::Value),
             ("force", Kind::Switch),
         ],
@@ -81,7 +156,7 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
         None => Vec::new(),
     };
     let explicit = p.number::<u32>("difficulty")?;
-    let difficulty = target_difficulty(explicit, p.text("relay")?)?;
+    let difficulty = target_difficulty(explicit, relay_list(&p)?.as_deref())?;
     let timestamp = match p.number::<u64>("timestamp")? {
         Some(t) => t,
         None => now_ms()?,
@@ -128,10 +203,13 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// The difficulty to mine at: `--difficulty`, or the relay's `min_pow_difficulty` (spec §4: a
-/// sender SHOULD read `/info` before mining), capped at [`MAX_RELAY_DIFFICULTY`].
-fn target_difficulty(difficulty: Option<u32>, relay: Option<&str>) -> Result<u32, Fail> {
-    match (difficulty, relay) {
+/// The difficulty to mine at: `--difficulty`, or the relays' `min_pow_difficulty` (spec §4: a
+/// sender SHOULD read `/info` before mining). With several relays the block is mined once, at the
+/// highest difficulty among them; a relay asking for more than [`MAX_RELAY_DIFFICULTY`] is left out
+/// (ADR 0029 rule 13: no mining for it), and a relay whose `/info` fails sets nothing. Refused when
+/// no relay gives a usable difficulty.
+fn target_difficulty(difficulty: Option<u32>, relays: Option<&[Relay]>) -> Result<u32, Fail> {
+    match (difficulty, relays) {
         (Some(_), Some(_)) => Err(Fail::usage(
             "give `--difficulty` or `--relay`, not both (`--relay` reads the difficulty from the \
              relay's /sbtp/v1/info)",
@@ -141,18 +219,40 @@ fn target_difficulty(difficulty: Option<u32>, relay: Option<&str>) -> Result<u32
             sbtp_core::MAX_DIFFICULTY
         ))),
         (Some(d), None) => Ok(d),
-        (None, Some(url)) => {
-            let relay = Relay::new(url)?;
-            let d = relay.info()?.min_pow_difficulty;
-            eprintln!("Relay {} requires difficulty {d}.", relay.base());
-            if d > MAX_RELAY_DIFFICULTY {
-                return Err(Fail::refused(format!(
-                    "relay {} requires difficulty {d}, above the {MAX_RELAY_DIFFICULTY} this CLI \
-                     accepts from a relay; pass `--difficulty {d}` explicitly to mine anyway",
-                    relay.base()
-                )));
+        (None, Some(relays)) => {
+            let several = relays.len() > 1;
+            let mut failures = Vec::new();
+            let mut chosen: Option<u32> = None;
+            for relay in relays {
+                let d = match relay.info() {
+                    Ok(info) => info.min_pow_difficulty,
+                    Err(f) => {
+                        failures.push(f);
+                        continue;
+                    }
+                };
+                eprintln!("Relay {} requires difficulty {d}.", relay.base());
+                if d > MAX_RELAY_DIFFICULTY {
+                    let f = Fail::refused(format!(
+                        "relay {} requires difficulty {d}, above the {MAX_RELAY_DIFFICULTY} this \
+                         CLI accepts from a relay; pass `--difficulty {d}` explicitly to mine anyway",
+                        relay.base()
+                    ));
+                    failures.push(f);
+                    continue;
+                }
+                chosen = Some(chosen.map_or(d, |c| c.max(d)));
             }
-            Ok(d)
+            match chosen {
+                Some(d) => {
+                    warn_all(&failures);
+                    if several {
+                        eprintln!("Mining once at difficulty {d}, the highest of these relays.");
+                    }
+                    Ok(d)
+                }
+                None => Err(all_failed("no usable difficulty", failures)),
+            }
         }
         (None, None) => Err(Fail::usage(
             "give the target difficulty with `--difficulty <D>`, or `--relay <URL>` to use the \
@@ -179,15 +279,13 @@ pub fn inspect(args: &[OsString]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `publish --relay <URL> <BLOCK_FILE>`.
+/// `publish --relay <URL>... <BLOCK_FILE>`: one `PUT` per relay, in parallel. The block is
+/// published when at least one relay answered `200` or `201`.
 pub fn publish(args: &[OsString]) -> Result<(), Fail> {
-    let p = parse_args(args, &[("relay", Kind::Value)])?;
+    let p = parse_args(args, &[("relay", Kind::Repeated)])?;
     let file = p.positionals(1, "<BLOCK_FILE>")?;
     let path = file.first().map_or(Path::new(""), Path::new);
-    let relay = Relay::new(
-        p.text("relay")?
-            .ok_or_else(|| Fail::usage("`--relay <URL>` is required"))?,
-    )?;
+    let relays = required_relays(&p)?;
     let bytes = read_bounded(path, MAX_BLOCK_LEN, "block")?;
     // Catch a broken file before the network; the relay applies its own difficulty (C1) and
     // timestamp policy (P1), so only format and signature are checked here.
@@ -200,23 +298,61 @@ pub fn publish(args: &[OsString]) -> Result<(), Fail> {
             ))
         })?
         .block_id();
-    match relay.put_block(&bytes)? {
-        Stored::Created => eprintln!("201 Created: relay {} stored the block.", relay.base()),
-        Stored::AlreadyStored => {
-            eprintln!("200 OK: relay {} already held this block.", relay.base());
+    let outcomes: Vec<Result<Stored, Fail>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = relays
+            .iter()
+            .map(|relay| scope.spawn(|| relay.put_block(&bytes)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(Fail::failed("internal error: a request thread panicked"))
+                })
+            })
+            .collect()
+    });
+    let mut failures = Vec::new();
+    let mut failed_on = Vec::new();
+    for (relay, outcome) in relays.iter().zip(outcomes) {
+        match outcome {
+            Ok(Stored::Created) => {
+                eprintln!("201 Created: relay {} stored the block.", relay.base());
+            }
+            Ok(Stored::AlreadyStored) => {
+                eprintln!("200 OK: relay {} already held this block.", relay.base());
+            }
+            Err(f) => {
+                failed_on.push(relay.base().to_owned());
+                failures.push(f);
+            }
         }
+    }
+    if failures.len() == relays.len() {
+        return Err(all_failed("the block was not stored", failures));
+    }
+    warn_all(&failures);
+    if !failed_on.is_empty() {
+        eprintln!(
+            "Published on {} of {} relays. To retry the others (PUT is idempotent): \
+             cli-demo publish --relay {} {}",
+            relays.len() - failed_on.len(),
+            relays.len(),
+            failed_on.join(","),
+            path.display()
+        );
     }
     println!("{id}");
     Ok(())
 }
 
-/// `get --relay <URL> <BLOCK_ID> [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
-/// [--force]`.
+/// `get --relay <URL>... <BLOCK_ID> [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
+/// [--force]`: asks the relays in order and keeps the first block that passes the receipt rule.
 pub fn get(args: &[OsString]) -> Result<(), Fail> {
     let p = parse_args(
         args,
         &[
-            ("relay", Kind::Value),
+            ("relay", Kind::Repeated),
             ("out", Kind::Value),
             ("payload-out", Kind::Value),
             ("difficulty", Kind::Value),
@@ -234,10 +370,7 @@ pub fn get(args: &[OsString]) -> Result<(), Fail> {
             untrusted(id_text, 80)
         ))
     })?;
-    let relay = Relay::new(
-        p.text("relay")?
-            .ok_or_else(|| Fail::usage("`--relay <URL>` is required"))?,
-    )?;
+    let relays = required_relays(&p)?;
     // ADR 0026 rules 1 to 3: a local floor, 0 by default, never taken from the relay's /info.
     let difficulty = p.number::<u32>("difficulty")?.unwrap_or(0);
     if difficulty > sbtp_core::MAX_DIFFICULTY {
@@ -246,18 +379,59 @@ pub fn get(args: &[OsString]) -> Result<(), Fail> {
             sbtp_core::MAX_DIFFICULTY
         )));
     }
-    let bytes = relay.get_block(&id)?;
-    // spec §3.4 "Receipt": recompute the block_id, compare with the requested one (R1), then
-    // full validation (F1 to F9, C1 with the recipient's own difficulty, C2, C3) before any
-    // storage or use.
-    let validated = validate_requested(&bytes, difficulty, &id)
-        .map_err(|e| receipt_fail(&relay, &id, &bytes, &e))?;
-    // Both outputs or neither (security review 2026-11-19, L-3).
+    let several = relays.len() > 1;
+    let mut failures = Vec::new();
+    // Failover: a 404, a failed request, a refusal or an invalid block moves on to the next relay.
+    // No relay is trusted: each answer goes through the receipt rule.
+    for relay in &relays {
+        let bytes = match relay.get_block(&id) {
+            Ok(bytes) => bytes,
+            Err(f) => {
+                failures.push(f);
+                continue;
+            }
+        };
+        // spec §3.4 "Receipt": recompute the block_id, compare with the requested one (R1), then
+        // full validation (F1 to F9, C1 with the recipient's own difficulty, C2, C3) before any
+        // storage or use.
+        match validate_requested(&bytes, difficulty, &id) {
+            Ok(validated) => {
+                warn_all(&failures);
+                if several {
+                    eprintln!("Served by relay {}.", relay.base());
+                }
+                return write_fetched(&p, &bytes, &validated, difficulty);
+            }
+            Err(e) => {
+                let (f, local_floor) = receipt_fail(relay, &id, &bytes, &e);
+                // The PoW of a block is a property of its block_id: every relay would fail the
+                // local floor the same way, so none is asked further.
+                if local_floor {
+                    return Err(f);
+                }
+                failures.push(f);
+            }
+        }
+    }
+    Err(all_failed(
+        &format!("no valid block {id} was served"),
+        failures,
+    ))
+}
+
+/// The outputs of `get` for a block that passed the receipt rule: both files or neither (security
+/// review 2026-11-19, L-3), then the summary.
+fn write_fetched(
+    p: &Parsed,
+    bytes: &[u8],
+    validated: &ValidatedBlock<'_, Requested>,
+    difficulty: u32,
+) -> Result<(), Fail> {
     let out = p.path("out");
     let payload_out = p.path("payload-out");
     let mut files: Vec<(&Path, &[u8])> = Vec::new();
     if let Some(path) = &out {
-        files.push((path, &bytes));
+        files.push((path, bytes));
     }
     if let Some(path) = &payload_out {
         files.push((path, validated.block().payload()));
@@ -276,23 +450,25 @@ pub fn get(args: &[OsString]) -> Result<(), Fail> {
 /// The failure of the receipt check of `get`. A block that fails only C1 at the local floor
 /// (`--difficulty` above 0) is refused by this client's policy; it does not show that the relay
 /// served an invalid block (ADR 0026 rule 4). `validate_requested` checks C1 before C2 and C3, so
-/// the block is checked again at `d = 0` to tell the two cases apart.
-fn receipt_fail(relay: &Relay, id: &BlockId, bytes: &[u8], e: &sbtp_core::Error) -> Fail {
+/// the block is checked again at `d = 0` to tell the two cases apart. The flag is true for the
+/// local floor.
+fn receipt_fail(relay: &Relay, id: &BlockId, bytes: &[u8], e: &sbtp_core::Error) -> (Fail, bool) {
     if let sbtp_core::Error::InsufficientPow { required, actual } = *e {
         match validate_requested(bytes, 0, id) {
             Ok(_) => {
-                return Fail::invalid(format!(
+                let f = Fail::invalid(format!(
                     "the block {id} from relay {} is valid, but below the local floor: its \
                      block_id has {actual} leading zero bits, `--difficulty {required}` asks for \
                      at least {required}. This is this client's policy, not a fault of the \
                      relay. Nothing written.",
                     relay.base()
                 ));
+                return (f, true);
             }
-            Err(other) => return invalid_from_relay(relay, id, &other),
+            Err(other) => return (invalid_from_relay(relay, id, &other), false),
         }
     }
-    invalid_from_relay(relay, id, e)
+    (invalid_from_relay(relay, id, e), false)
 }
 
 fn invalid_from_relay(relay: &Relay, id: &BlockId, e: &sbtp_core::Error) -> Fail {
@@ -308,28 +484,26 @@ const DEFAULT_FOLLOW_INTERVAL_S: u64 = 10;
 /// Longest polling interval of `query --follow`, in seconds.
 const MAX_FOLLOW_INTERVAL_S: u64 = 3600;
 
-/// `query --relay <URL> [--parent <ID>] [--since <MS>] [--limit <N>] [--cursor <C>]
-/// [--follow [--interval <S>]]`: walks `/query` with cursors (ADR 0012 rule 12) and prints each
-/// `block_id` once.
+/// `query --relay <URL>... [--parent <ID>] [--since <MS>] [--limit <N>] [--cursor <C>]...
+/// [--follow [--interval <S>]]`: walks `/query` with cursors (ADR 0012 rule 12) on each relay, one
+/// after the other, each with its own cursor, and prints each `block_id` once over all of them.
 pub fn query(args: &[OsString]) -> Result<(), Fail> {
     let p = parse_args(
         args,
         &[
-            ("relay", Kind::Value),
+            ("relay", Kind::Repeated),
             ("parent", Kind::Value),
             ("since", Kind::Value),
             ("limit", Kind::Value),
-            ("cursor", Kind::Value),
+            ("cursor", Kind::Repeated),
             ("follow", Kind::Switch),
             ("interval", Kind::Value),
         ],
     )?;
     p.positionals(0, "")?;
-    let relay = Relay::new(
-        p.text("relay")?
-            .ok_or_else(|| Fail::usage("`--relay <URL>` is required"))?,
-    )?;
-    let (filter, cursor) = query_filter(&p)?;
+    let relays = required_relays(&p)?;
+    let filter = query_filter(&p)?;
+    let cursors = query_cursors(&p, &relays)?;
     let follow = p.switch("follow");
     let interval = match p.number::<u64>("interval")? {
         Some(_) if !follow => return Err(Fail::usage("`--interval` needs `--follow`")),
@@ -342,41 +516,72 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
         None => DEFAULT_FOLLOW_INTERVAL_S,
     };
 
-    let mut walker = Walker::new(&relay, filter, cursor, Policy::default());
+    let several = relays.len() > 1;
+    // The deduplication bound is shared: what this process remembers does not grow with the number
+    // of relays. Each walker keeps its own set (its restarts and its no-progress check are its own);
+    // `printed` deduplicates across relays and is not needed for one.
+    let policy = Policy {
+        max_seen: (walk::MAX_SEEN / relays.len()).max(1),
+        ..Policy::default()
+    };
+    let mut walkers: Vec<Walker<&Relay>> = relays
+        .iter()
+        .zip(cursors)
+        .map(|(relay, cursor)| Walker::new(relay, filter.clone(), cursor, policy))
+        .collect();
+    let mut printed: Option<HashSet<BlockId>> = several.then(HashSet::new);
     let mut first = true;
     loop {
-        let mut closed = false;
-        let result = walker.walk(
-            &mut std::thread::sleep,
-            &mut walk::jitter_source,
-            &mut |event| on_walk_event(&relay, event, &mut closed),
-        );
-        if closed {
-            // The reader of standard output went away (`| head`): a normal end.
-            return Ok(());
-        }
-        let summary = result.map_err(|mut fail| {
-            if let Some(c) = walker.cursor() {
-                // The cursor is within the rule 5 alphabet: safe to show as is.
-                fail.message = format!("{}\nResume later with `--cursor {c}`.", fail.message);
-            }
-            fail
-        })?;
-        if first {
-            let restarts = match summary.restarts {
-                0 => String::new(),
-                n => format!(", {n} restart(s) after InvalidCursor"),
-            };
-            eprintln!(
-                "{} block_id(s) in {} page(s){restarts}.",
-                summary.new_ids, summary.pages
+        let mut failures = Vec::new();
+        for (relay, walker) in relays.iter().zip(walkers.iter_mut()) {
+            let mut closed = false;
+            let result = walker.walk(
+                &mut std::thread::sleep,
+                &mut walk::jitter_source,
+                &mut |event| on_walk_event(relay, event, printed.as_mut(), &mut closed),
             );
-            if let Some(c) = walker.cursor() {
-                eprintln!("cursor: {c}");
-                if !follow {
-                    eprintln!("Poll for blocks stored since with `--cursor {c}`.");
+            if closed {
+                // The reader of standard output went away (`| head`): a normal end.
+                return Ok(());
+            }
+            match result {
+                Ok(summary) if first => {
+                    let restarts = match summary.restarts {
+                        0 => String::new(),
+                        n => format!(", {n} restart(s) after InvalidCursor"),
+                    };
+                    let from = if several {
+                        format!("relay {}: ", relay.base())
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "{from}{} block_id(s) in {} page(s){restarts}.",
+                        summary.new_ids, summary.pages
+                    );
+                }
+                Ok(_) => {}
+                Err(mut fail) => {
+                    if let Some(c) = walker.cursor() {
+                        // The cursor is within the rule 5 alphabet: safe to show as is.
+                        let resume = if several {
+                            format!("{}={c}", relay.base())
+                        } else {
+                            c.to_owned()
+                        };
+                        fail.message =
+                            format!("{}\nResume later with `--cursor {resume}`.", fail.message);
+                    }
+                    failures.push(fail);
                 }
             }
+        }
+        if failures.len() == relays.len() {
+            return Err(all_failed("the listing failed", failures));
+        }
+        warn_all(&failures);
+        if first {
+            print_cursors(&relays, &walkers, follow);
             first = false;
         }
         if !follow {
@@ -386,8 +591,100 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
     }
 }
 
-/// The filters and starting cursor of `query`, checked.
-fn query_filter(p: &Parsed) -> Result<(Filter, Option<String>), Fail> {
+/// The cursors to resume from, on standard error. With several relays each is tied to its relay:
+/// `<RELAY_URL>=<CURSOR>`, so that a cursor is never sent to a relay that did not issue it.
+fn print_cursors(relays: &[Relay], walkers: &[Walker<&Relay>], follow: bool) {
+    if let [_] = relays {
+        if let Some(c) = walkers.first().and_then(Walker::cursor) {
+            eprintln!("cursor: {c}");
+            if !follow {
+                eprintln!("Poll for blocks stored since with `--cursor {c}`.");
+            }
+        }
+        return;
+    }
+    let mut resume = Vec::new();
+    for (relay, walker) in relays.iter().zip(walkers) {
+        if let Some(c) = walker.cursor() {
+            eprintln!("cursor: {}={c}", relay.base());
+            resume.push(format!("--cursor {}={c}", relay.base()));
+        }
+    }
+    if !follow && !resume.is_empty() {
+        eprintln!(
+            "Poll for blocks stored since with the same --relay list and {}.",
+            resume.join(" ")
+        );
+    }
+}
+
+/// The starting cursor of each relay, in the order of `relays`. With one relay `--cursor <C>` (at
+/// most once); with several, each `--cursor <RELAY_URL>=<CURSOR>` names its relay, since a cursor
+/// is only valid on the relay that issued it (ADR 0012, ADR 0024).
+fn query_cursors(p: &Parsed, relays: &[Relay]) -> Result<Vec<Option<String>>, Fail> {
+    let values = p.values("cursor");
+    let mut cursors: Vec<Option<String>> = vec![None; relays.len()];
+    if relays.len() == 1 {
+        if values.len() > 1 {
+            return Err(Fail::usage("`--cursor` given more than once"));
+        }
+        if let (Some(v), Some(slot)) = (values.first(), cursors.first_mut()) {
+            *slot = Some(checked_cursor(text(v)?)?.to_owned());
+        }
+        return Ok(cursors);
+    }
+    for v in values {
+        let v = text(v)?;
+        let Some((url, cursor)) = v.rsplit_once('=') else {
+            return Err(Fail::usage(format!(
+                "`--cursor {}`: with several relays, give `--cursor <RELAY_URL>=<CURSOR>`, as \
+                 printed by an earlier `query`",
+                untrusted(v, 60)
+            )));
+        };
+        let base = Relay::new(url)?;
+        let Some(i) = relays.iter().position(|r| r.base() == base.base()) else {
+            return Err(Fail::usage(format!(
+                "`--cursor`: relay {} is not in the --relay list",
+                untrusted(url, 100)
+            )));
+        };
+        let slot = cursors
+            .get_mut(i)
+            .ok_or_else(|| Fail::failed("internal error: relay index"))?;
+        if slot.is_some() {
+            return Err(Fail::usage(format!(
+                "`--cursor`: two cursors for relay {}",
+                base.base()
+            )));
+        }
+        *slot = Some(checked_cursor(cursor)?.to_owned());
+    }
+    Ok(cursors)
+}
+
+/// A `--cursor` value as text.
+fn text(v: &std::ffi::OsStr) -> Result<&str, Fail> {
+    v.to_str()
+        .ok_or_else(|| Fail::usage("`--cursor`: the value is not UTF-8"))
+}
+
+/// A `--cursor` value within the syntax of ADR 0012 rule 5: a value outside it would get
+/// `InvalidParameter` (K1).
+fn checked_cursor(c: &str) -> Result<&str, Fail> {
+    if walk::is_cursor_syntax(c) {
+        Ok(c)
+    } else {
+        Err(Fail::usage(format!(
+            "`--cursor {}`: a cursor is 1 to 128 characters of A-Z a-z 0-9 - _, copied from an \
+             earlier `query` of the same relay",
+            untrusted(c, 40)
+        )))
+    }
+}
+
+/// The filters of `query`, checked.
+fn query_filter(p: &Parsed) -> Result<Filter, Fail> {
     let parent = p
         .text("parent")?
         .map(|t| {
@@ -404,31 +701,29 @@ fn query_filter(p: &Parsed) -> Result<(Filter, Option<String>), Fail> {
     if limit == Some(0) {
         return Err(Fail::usage("`--limit` is at least 1"));
     }
-    let cursor = p.text("cursor")?;
-    if let Some(c) = cursor {
-        // ADR 0012 rule 5: a value outside this syntax would get InvalidParameter (K1).
-        if !walk::is_cursor_syntax(c) {
-            return Err(Fail::usage(format!(
-                "`--cursor {}`: a cursor is 1 to 128 characters of A-Z a-z 0-9 - _, copied \
-                 from an earlier `query` of the same relay",
-                untrusted(c, 40)
-            )));
-        }
-    }
-    Ok((
-        Filter {
-            parent,
-            since,
-            limit,
-        },
-        cursor.map(str::to_owned),
-    ))
+    Ok(Filter {
+        parent,
+        since,
+        limit,
+    })
 }
 
-/// Prints one walk event: identifiers to standard output, notices to standard error.
-fn on_walk_event(relay: &Relay, event: Event<'_>, closed: &mut bool) -> Result<(), Fail> {
+/// Prints one walk event: identifiers to standard output, notices to standard error. `printed`
+/// deduplicates across relays (`None` with one relay: the walker already does).
+fn on_walk_event(
+    relay: &Relay,
+    event: Event<'_>,
+    printed: Option<&mut HashSet<BlockId>>,
+    closed: &mut bool,
+) -> Result<(), Fail> {
     match event {
         Event::Id(id) => {
+            // spec §4 `/query`: a client MUST deduplicate by block_id, over every relay it reads.
+            if let Some(set) = printed
+                && !set.insert(*id)
+            {
+                return Ok(());
+            }
             let mut out = std::io::stdout().lock();
             writeln!(out, "{id}")
                 .and_then(|()| out.flush())
@@ -471,17 +766,31 @@ fn on_walk_event(relay: &Relay, event: Event<'_>, closed: &mut bool) -> Result<(
     }
 }
 
-/// `info --relay <URL>`.
+/// `info --relay <URL>...`.
 pub fn info(args: &[OsString]) -> Result<(), Fail> {
-    let p = parse_args(args, &[("relay", Kind::Value)])?;
+    let p = parse_args(args, &[("relay", Kind::Repeated)])?;
     p.positionals(0, "")?;
-    let relay = Relay::new(
-        p.text("relay")?
-            .ok_or_else(|| Fail::usage("`--relay <URL>` is required"))?,
-    )?;
-    let info = relay.info()?;
-    println!("min_pow_difficulty: {}", info.min_pow_difficulty);
-    println!("max_future_ms:      {}", info.max_future_ms);
+    let relays = required_relays(&p)?;
+    let several = relays.len() > 1;
+    let mut failures = Vec::new();
+    for relay in &relays {
+        match relay.info() {
+            Ok(info) => {
+                if several {
+                    println!("relay:              {}", relay.base());
+                }
+                println!("min_pow_difficulty: {}", info.min_pow_difficulty);
+                println!("max_future_ms:      {}", info.max_future_ms);
+            }
+            Err(f) => {
+                failures.push(f);
+            }
+        }
+    }
+    if failures.len() == relays.len() {
+        return Err(all_failed("/info failed", failures));
+    }
+    warn_all(&failures);
     Ok(())
 }
 
@@ -559,6 +868,23 @@ fn build_fail(e: BuildError) -> Fail {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// The exit status of a command that failed on every relay.
+    #[test]
+    fn all_failed_status() {
+        let one = all_failed("x", vec![Fail::refused("only")]);
+        assert_eq!(
+            (one.code, one.message.as_str()),
+            (fail::EXIT_REFUSED, "only")
+        );
+        let same = all_failed("x", vec![Fail::refused("a"), Fail::refused("b\nc")]);
+        assert_eq!(same.code, fail::EXIT_REFUSED);
+        assert_eq!(same.message, "x on any relay:\n- a\n- b\n  c");
+        let mixed = all_failed("x", vec![Fail::refused("a"), Fail::failed("b")]);
+        assert_eq!(mixed.code, fail::EXIT_FAILURE);
+        let invalid = all_failed("x", vec![Fail::failed("a"), Fail::invalid("b")]);
+        assert_eq!(invalid.code, fail::EXIT_INVALID);
+    }
 
     #[test]
     fn build_mine_sign_through_core() {

@@ -3,14 +3,16 @@
 import { LIMITS } from "./bounds.js";
 import { formatTimestamp } from "./format.js";
 import { fromHex, isIdHex, toHex } from "./hex.js";
-import { checkRelayUrl, deadline, RelayRequestError } from "./http.js";
+import { deadline } from "./http.js";
 import { openDb } from "./idb.js";
 import { createIdentity, deleteIdentity, loadIdentity, signBlock } from "./keys.js";
 import { mineInWorker } from "./miner.js";
-import { fetchBlocks, Relay, RelayStatus, resolveDifficulty } from "./relay.js";
+import {
+  fetchBlocksFrom, fetchOne, publishAll, publishDifficulty, RelaySet, retryPlan, walkAll,
+} from "./relays.js";
+import { loadRelays, saveRelays } from "./settings.js";
 import { BlockStore } from "./store.js";
 import { traverse } from "./traverse.js";
-import { walk } from "./walk.js";
 import { buildUnsignedBlock, loadSbtp, verifyFetched, verifySubmitted } from "./wasm.js";
 
 const $ = (id) => document.getElementById(id);
@@ -24,7 +26,27 @@ let brokenKey = null; // the error of a stored identity record that failed to lo
 let mining = null;
 let republishing = false;
 
-const relay = () => new Relay(checkRelayUrl($("relay").value));
+let relays = new RelaySet(loadRelays());
+
+/** Shows the relay list and the health of each relay (in memory: a reload starts them healthy). */
+function showRelays() {
+  say("relays-health", relays.describe().join("\n"));
+}
+
+function onSaveRelays() {
+  try {
+    relays = new RelaySet(saveRelays($("relays").value));
+    $("relays").value = relays.bases.join("\n");
+    showRelays();
+  } catch (e) {
+    fail("relays-health", e);
+  }
+}
+
+/** One line per relay of a publishAll result. */
+const NAMES = { created: "201 created", stored: "200 already stored", "backing-off": "not sent" };
+const perRelay = (results) => results.map((r) =>
+  `  ${r.base}: ${NAMES[r.outcome] ?? "failed"}${r.error ? ` (${r.error.name}: ${r.error.message})` : ""}`).join("\n");
 
 /**
  * Asks the browser not to evict this origin's storage once a key exists: the identity cannot be
@@ -120,10 +142,11 @@ async function receive(bytes, idHex) {
   return b;
 }
 
-async function publishOne(r, id, bytes, signal) {
-  const outcome = await r.put(bytes, { signal });
-  await store.ack(id);
-  return outcome;
+/** PUTs an own block to `targets` in parallel and records which relays acknowledged it. */
+async function publishTo(targets, id, bytes, signal) {
+  const res = await publishAll(relays, bytes, { targets, signal });
+  await store.recordPublish(id, res.acked, res.failed);
+  return res;
 }
 
 async function onPublish() {
@@ -133,15 +156,16 @@ async function onPublish() {
   $("cancel").disabled = false;
   $("publish").disabled = true;
   try {
-    const r = relay();
     const parentIds = $("parents").value.split(/\s+/).filter(Boolean);
     if (!parentIds.every(isIdHex)) throw new Error("a parent is not a 64-character lowercase hex id");
     const parents = fromHex(parentIds.join(""));
     const payload = new TextEncoder().encode($("payload").value);
     const typed = $("difficulty").value.trim();
     const explicit = typed === "" ? null : Number(typed);
-    // An explicit difficulty needs no /info (review finding 10).
-    const d = await resolveDifficulty(r, explicit, { signal: controller.signal });
+    // An explicit difficulty needs no /info (review finding 10). Otherwise one mining at the
+    // highest /info difficulty of the relays, each bounded by maxInfoDifficulty (ADR 0029 rule 13).
+    const plan = await publishDifficulty(relays, explicit, { signal: controller.signal });
+    const d = plan.difficulty;
     const unsigned = buildUnsignedBlock(identity.publicKey, BigInt(Date.now()), 0n, parents, payload);
     const t0 = performance.now();
     say("publish-out", `Mining at difficulty ${d} in a Web Worker…`);
@@ -154,9 +178,14 @@ async function onPublish() {
     const b = verifySubmitted(signed, d);
     await store.put(b.idHex, signed, { own: true }); // kept until a relay acknowledges it
     controller.signal.throwIfAborted();
-    const outcome = await publishOne(r, b.idHex, signed, controller.signal);
-    say("publish-out", `Published ${b.idHex} (${outcome === "created" ? "201 created" : "200 already stored"}); ` +
-      `mined in ${ms} ms.`, "ok");
+    const res = await publishTo(plan.targets, b.idHex, signed, controller.signal);
+    const skipped = plan.skipped.map((x) => `  ${x.base}: skipped, ${x.reason}`).join("\n");
+    const head = res.acked.length > 0
+      ? `Published ${b.idHex} on ${res.acked.length} of ${relays.bases.length} relay(s); mined in ${ms} ms at difficulty ${d}.`
+      : `${b.idHex} was mined in ${ms} ms but no relay acknowledged it: it is kept as pending.`;
+    const retry = res.failed.length > 0 ? "\n\"Publish pending blocks\" sends it again to the relays that failed." : "";
+    say("publish-out", `${head}\n${perRelay(res.results)}${skipped ? `\n${skipped}` : ""}${retry}`,
+      res.acked.length > 0 && res.failed.length === 0 ? "ok" : "bad");
   } catch (e) {
     if (controller.signal.aborted) {
       say("publish-out", "Cancelled. A block already signed is kept as pending: " +
@@ -168,37 +197,43 @@ async function onPublish() {
     mining = null;
     $("cancel").disabled = true;
     $("publish").disabled = false;
+    showRelays();
   }
 }
 
-/** A failure that concerns the relay, not one block: the run stops instead of trying the rest. */
-const relayWide = (e) => e instanceof RelayRequestError || (e instanceof RelayStatus && e.transient);
-
+/**
+ * Sends own blocks again: those no relay acknowledged, to every relay; those that failed on some
+ * relays, to those relays only (relays.js retryPlan, at most storeMaxPending blocks per run). Stops
+ * when every relay is backing off.
+ */
 async function onRepublish() {
   if (republishing) return;
   republishing = true;
   $("republish").disabled = true;
-  let acked = 0;
-  let failed = 0;
-  let pending = [];
+  let done = 0;
+  let incomplete = 0;
+  let plan = [];
   let stopped = null;
   let last = null;
   try {
-    const r = relay();
-    pending = (await store.list()).filter((m) => m.own && !m.acked);
-    for (const m of pending) {
+    plan = retryPlan(await store.list(), relays.bases);
+    for (const { id, targets } of plan) {
+      if (relays.available().length === 0) {
+        stopped = new Error("every relay is backing off");
+        break;
+      }
       try {
-        const bytes = await store.get(m.id);
+        const bytes = await store.get(id);
         verifySubmitted(bytes, 0);
-        await publishOne(r, m.id, bytes);
-        acked += 1;
-      } catch (e) {
-        failed += 1;
-        last = e;
-        if (relayWide(e)) {
-          stopped = e;
-          break;
+        const res = await publishTo(targets, id, bytes);
+        if (res.failed.length === 0) done += 1;
+        else {
+          incomplete += 1;
+          last = res.results.find((r) => r.error)?.error ?? last;
         }
+      } catch (e) {
+        incomplete += 1;
+        last = e;
       }
     }
   } catch (e) {
@@ -206,31 +241,35 @@ async function onRepublish() {
   } finally {
     republishing = false;
     $("republish").disabled = false;
+    showRelays();
   }
-  const left = pending.length - acked;
   const why = stopped ?? last;
-  say("publish-out", `${acked} pending block(s) acknowledged, ${failed} failed, ${left} still pending` +
-    `${stopped ? "; stopped" : ""}${why ? ` (${why.name}: ${why.message})` : ""}.`, why ? "bad" : "ok");
+  say("publish-out", `${plan.length} own block(s) to send: ${done} acknowledged by every relay asked, ` +
+    `${incomplete} still missing on some relay${stopped ? "; stopped" : ""}` +
+    `${why ? ` (${why.name}: ${why.message})` : ""}.`, why ? "bad" : "ok");
 }
 
 function onList() {
   return browse(async (signal) => {
-    const r = relay();
     const parent = $("parent-filter").value.trim();
     if (parent && !isIdHex(parent)) throw new Error("the filter is not a 64-character lowercase hex id");
-    say("list-out", "Walking /query…");
+    say("list-out", `Walking /query on ${relays.bases.length} relay(s)…`);
     // The view fetches at most fetchMaxBlocks blocks: walking further would be wasted (review L-2).
-    const w = await walk(r, parent ? { parent } : {}, {
-      signal, limits: { ...LIMITS, walkMaxIds: LIMITS.fetchMaxBlocks },
+    // Each relay is walked with its own cursor; the ids are merged and deduplicated.
+    const w = await walkAll(relays, parent ? { parent } : {}, {
+      signal, perRelayMaxIds: LIMITS.fetchMaxBlocks, maxTotalIds: LIMITS.fetchMaxBlocks,
     });
-    const got = await fetchBlocks(r, w.ids,
+    // Every block is validated (R1 and full validation) whatever relay serves it.
+    const got = await fetchBlocksFrom(relays, w.ids,
       (bytes, id) => ({ b: verifyFetched(bytes, LIMITS.receiptDifficulty, id), bytes }), { signal });
     for (const { b, bytes } of got.blocks) {
       await store.put(b.idHex, bytes).catch(() => {}); // a full store only means it is not cached
       renderBlock(b);
     }
-    const partial = w.stop !== "done" || got.partial;
-    say("list-out", `${w.ids.length} id(s) listed (walk: ${w.stop}${w.error ? `, ${w.error.message}` : ""}); ` +
+    const partial = w.partial || got.partial;
+    const walks = w.runs.map((x) => `${x.base}: ${x.ids.length} id(s), ${x.stop}${x.error ? ` (${x.error.message})` : ""}`)
+      .concat(w.backingOff.map((b) => `${b}: not asked, backing off`)).join("; ");
+    say("list-out", `${w.ids.length} distinct id(s) listed [${walks}]; ` +
       `${got.blocks.length} fetched and verified, ${got.notFound.length} not found, ${got.failed.length} failed` +
       `${partial ? ". Partial view: a bound or a failure stopped it." : "."}`, partial ? "bad" : "ok");
   });
@@ -238,16 +277,24 @@ function onList() {
 
 function onAncestors() {
   return browse(async (signal) => {
-    const r = relay();
     const start = $("parent-filter").value.trim();
     if (!isIdHex(start)) throw new Error("enter a block id in the field above");
     say("list-out", "Walking ancestors…");
+    const budget = { left: LIMITS.fetchMaxAttempts };
     const t = await traverse(start, async (id) => {
       let b;
       try {
-        const bytes = (await store.get(id)) ?? (await r.get(id, { signal }));
-        if (bytes === null) return null;
-        b = await receive(bytes, id);
+        const local = await store.get(id);
+        if (local !== null) {
+          b = await receive(local, id);
+        } else {
+          // Failover over the relays; each answer is validated (§3.4) before it is used or stored.
+          const r = await fetchOne(relays, id,
+            (bytes, i) => ({ b: verifyFetched(bytes, LIMITS.receiptDifficulty, i), bytes }), { budget, signal });
+          if (r.status !== "ok") return null;
+          b = r.block.b;
+          await store.put(id, r.block.bytes).catch(() => {}); // a full store only means it is not cached
+        }
       } catch {
         return null; // unreachable, or fails §3.4: discarded, never stored
       }
@@ -299,12 +346,25 @@ async function main() {
     fail("status", e);
   }
   showIdentity();
+  $("relays").value = relays.bases.join("\n");
+  showRelays();
+  $("relays-save").addEventListener("click", onSaveRelays);
   $("info").addEventListener("click", async () => {
-    try {
-      say("info-out", JSON.stringify(await relay().info(), null, 1));
-    } catch (e) {
-      fail("info-out", e);
-    }
+    const lines = await Promise.all(relays.entries.map(async (e) => {
+      // A relay backing off is not asked: a Retry-After must elapse first.
+      const wait = relays.waitMs(e);
+      if (wait > 0) return `${e.base}\nnot asked: backing off for ${Math.ceil(wait / 1000)} s`;
+      try {
+        const info = await e.relay.info();
+        relays.ok(e);
+        return `${e.base}\n${JSON.stringify(info, null, 1)}`;
+      } catch (err) {
+        relays.fail(e, err);
+        return `${e.base}\n${err.name}: ${err.message}`;
+      }
+    }));
+    say("info-out", lines.join("\n\n"));
+    showRelays();
   });
   $("key-new").addEventListener("click", async () => {
     try {

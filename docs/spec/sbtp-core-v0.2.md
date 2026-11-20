@@ -468,6 +468,25 @@ poll `/query` with a cursor. `[Q-23]`
   repeated (see "Redirects"). (ADR 0029, ADR 0030)
 - Peer-to-peer bounds are not specified in this version. `[Q-26]`
 
+### Several relays (non-normative)
+
+Nothing in this subsection is a new rule. It is guidance for a client that uses several relays, and
+follows from §3.3, §3.4 and the subsections above.
+
+- A block is the same block on every relay: it is identified by its `block_id` (§3.4). A client merges
+  `/query` results from several relays and deduplicates them by `block_id`, never by the full bytes.
+- Every block, from every relay, goes through the receipt rule (§3.4). A block that fails it is
+  discarded and the block MAY be requested from another relay. A block that fails only the client's own
+  difficulty floor fails it on every relay: its proof of work depends on its `block_id` alone (§3.3).
+- A cursor is only valid on the relay that issued it (`GET /sbtp/v1/query`). A client keeps one cursor
+  per relay and never sends a cursor to another relay.
+- A sender that mines once for several relays mines at the highest `min_pow_difficulty` among them,
+  each read within its maximum (see "Client bounds"); it does not mine for a relay above that maximum.
+  `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later.
+- The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
+  stays a function of the client's settings. `Retry-After` and the back-off apply to the relay that
+  sent them.
+
 ## 5. P2P synchronisation and gossip
 
 ```

@@ -62,6 +62,15 @@ KEY FILES:
     command refuses a key file readable by the group or others. A key is never read from the
     command line or the environment.
 
+SEVERAL RELAYS:
+    mine, publish, get, query and info take several relays: repeat --relay, or give a comma
+    list (--relay http://127.0.0.1:8080,http://127.0.0.1:8081), at most 8. publish sends to all
+    of them in parallel and succeeds when one stores the block; get asks them in order until one
+    serves a block that passes verification; query lists the blocks of all of them, each once,
+    with one cursor per relay. No relay is trusted: every block is verified, whatever relay
+    served it. A command fails only when it fails on every relay; the others are shown as
+    warnings.
+
 NETWORK:
     This build speaks plain HTTP only (no TLS): use a local relay or an SSH tunnel. Proxies from
     the environment are not used. Requests time out after 30 seconds.
@@ -94,7 +103,7 @@ const HELP_MINE: &str = "\
 cli-demo mine: build a block, mine its proof of work, sign it
 
 USAGE:
-    cli-demo mine --key <FILE> --out <FILE> (--difficulty <D> | --relay <URL>)
+    cli-demo mine --key <FILE> --out <FILE> (--difficulty <D> | --relay <URL>...)
                   [--payload <FILE>] [--parent <BLOCK_ID>]... [--timestamp <MS>] [--force]
 
 Builds the block (spec §2), increments its nonce from 0 until the block_id has at least D leading
@@ -107,7 +116,10 @@ OPTIONS:
     --difficulty <D>        Proof-of-work difficulty, 0 to 256 (16 is the relay default; each
                             extra bit doubles the expected time)
     --relay <URL>           Read the difficulty from this relay's /sbtp/v1/info instead; a relay
-                            asking for more than 24 is refused (use --difficulty to override)
+                            asking for more than 24 is refused (use --difficulty to override).
+                            Repeat, or give a comma list, to mine once at the highest
+                            difficulty of several relays; a relay above 24 or whose /info
+                            fails is then left out with a warning
     --payload <FILE>        Payload, at most 65,535 bytes (default: empty)
     --parent <BLOCK_ID>     A parent block_id, 64 hexadecimal characters; repeat for up to 8
                             parents, in order
@@ -133,30 +145,42 @@ const HELP_PUBLISH: &str = "\
 cli-demo publish: send a block to a relay
 
 USAGE:
-    cli-demo publish --relay <URL> <BLOCK_FILE>
+    cli-demo publish --relay <URL>... <BLOCK_FILE>
 
 Validates the block locally (format and signature), then sends PUT /sbtp/v1/block. 201 Created
 (newly stored) and 200 OK (already stored) are both success. On a refusal, prints the status and
 the relay's {error, message}; after 429, 502, 503 or 504, wait for the Retry-After shown, if
 any, before retrying (ADR 0012 K3). Prints the block_id.
 
+With several relays the block is sent to all of them in parallel. It is published when at least
+one relay answers 201 or 200; the relays that failed are listed with the command that retries
+them (PUT is idempotent). Exit status 0 then; otherwise the status of the failures.
+
 OPTIONS:
-    --relay <URL>   Relay base URL, such as http://127.0.0.1:8080 (required)
+    --relay <URL>   Relay base URL, such as http://127.0.0.1:8080 (required). Repeat, or give
+                    a comma list, for several relays (at most 8)
 ";
 
 const HELP_GET: &str = "\
 cli-demo get: fetch a block from a relay and verify it
 
 USAGE:
-    cli-demo get --relay <URL> [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
+    cli-demo get --relay <URL>... [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
                  [--force] <BLOCK_ID>
 
 Sends GET /sbtp/v1/block/<BLOCK_ID>, then, before writing or printing anything, recomputes the
 block_id and checks it equals <BLOCK_ID> (R1) and applies the full validation (spec §3.4). A 404
 means the relay does not hold the block; it may have evicted it.
 
+With several relays they are asked in order. A 404, a failed request, a refusal or a block that
+fails verification moves on to the next relay; the first valid block is used, and the relays
+that failed before it are shown as warnings. A block below --difficulty is refused at once: its
+proof of work depends on its block_id only, so no other relay could serve a different answer.
+If no relay serves a valid block, the exit status is 4 when one served an invalid block.
+
 OPTIONS:
-    --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required)
+    --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required). Repeat,
+                            or give a comma list, for several relays (at most 8), in order
     --out <FILE>            Write the raw block to this new file
     --payload-out <FILE>    Write the payload to this new file
     --difficulty <D>        Local proof-of-work floor, 0 to 256 (default: 0, any). It is this
@@ -171,8 +195,8 @@ const HELP_QUERY: &str = "\
 cli-demo query: list block_ids held by a relay
 
 USAGE:
-    cli-demo query --relay <URL> [--parent <BLOCK_ID>] [--since <MS>] [--limit <N>]
-                   [--cursor <CURSOR>] [--follow [--interval <S>]]
+    cli-demo query --relay <URL>... [--parent <BLOCK_ID>] [--since <MS>] [--limit <N>]
+                   [--cursor <CURSOR>]... [--follow [--interval <S>]]
 
 Walks GET /sbtp/v1/query page by page, following the returned cursor until the relay has no
 more, and prints each block_id once, one per line, in the relay's storage order. The order is
@@ -194,15 +218,24 @@ second (6 retries at most); a Retry-After over 300 seconds or not in seconds sto
 Any other refusal, InvalidParameter included, stops the walk, as does a relay that keeps
 sending pages with nothing new.
 
+With several relays, each is walked in turn with its own cursor (a cursor is only valid on the
+relay that issued it), and each block_id is printed once over all of them. The 1,000,000
+deduplication bound is shared among the relays. The cursors are printed as
+`cursor: <RELAY_URL>=<CURSOR>`, one per relay, and given back the same way with --cursor. A
+relay whose walk fails is shown as a warning with its resume cursor; the command fails only
+when every relay fails.
+
 OPTIONS:
-    --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required)
+    --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required). Repeat,
+                            or give a comma list, for several relays (at most 8)
     --parent <BLOCK_ID>     Only the children of this block (the relay need not hold it)
     --since <MS>            Only blocks the relay stored at or after this Unix time in
                             milliseconds, by the relay's clock (not the block Timestamp)
     --limit <N>             Page size, at least 1 (default: 100; the relay lowers a value
                             above its max_query_limit)
     --cursor <CURSOR>       Start after this cursor, printed by an earlier `query` of the
-                            same relay
+                            same relay. With several relays: <RELAY_URL>=<CURSOR>, once per
+                            relay at most
     --follow                After the walk, poll for new blocks until interrupted
     --interval <S>          Seconds between polls with --follow, 1 to 3600 (default: 10)
 ";
@@ -211,12 +244,14 @@ const HELP_INFO: &str = "\
 cli-demo info: print a relay's settings
 
 USAGE:
-    cli-demo info --relay <URL>
+    cli-demo info --relay <URL>...
 
-Prints min_pow_difficulty and max_future_ms from GET /sbtp/v1/info.
+Prints min_pow_difficulty and max_future_ms from GET /sbtp/v1/info; with several relays, a
+`relay:` line before each.
 
 OPTIONS:
-    --relay <URL>   Relay base URL, such as http://127.0.0.1:8080 (required)
+    --relay <URL>   Relay base URL, such as http://127.0.0.1:8080 (required). Repeat, or give
+                    a comma list, for several relays (at most 8)
 ";
 
 type Command = fn(&[OsString]) -> Result<(), Fail>;
