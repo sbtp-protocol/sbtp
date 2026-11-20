@@ -1,0 +1,193 @@
+# Relay container image: builds deploy/Dockerfile for linux/amd64, smoke-tests it, pushes it to
+# ghcr.io/sbtp-protocol/sbtp-relay and writes the pushed digest to the job summary. Deploy by that
+# digest, never by tag (deploy/README.md, "Pulling the CI image").
+#
+# Runs only on a `relay-v*` tag push or a manual dispatch from `main`; never on a pull request.
+# Hardening (docs/ci.md): actions pinned by full commit SHA; `packages: write` and the attestation
+# grants on this job only; no secret other than the run's own GITHUB_TOKEN; no untrusted value
+# interpolated into a `run:` script (refs reach the shell through `env`); no cache; the build uses
+# the runner's Docker daemon (BuildKit, `docker` driver), so no unpinned BuildKit image is pulled.
+
+name: Relay image
+
+on:
+  push:
+    tags: ["relay-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/sbtp-protocol/sbtp-relay
+
+jobs:
+  image:
+    name: Build, smoke-test and push the relay image (linux/amd64)
+    # A dispatch from another branch does nothing: images come from `main` or a release tag.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/relay-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # Sigstore certificate for the provenance attestation
+      attestations: write # store the provenance attestation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The image tags: `sha-<commit>` always, and `<version>` for a `relay-v<version>` tag.
+      # The ref name reaches the script through `env` and is checked against a strict pattern
+      # before it is used.
+      - name: Compute the image tags
+        id: tags
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:sha-${COMMIT}"
+          version=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [[ ! "$REF_NAME" =~ ^relay-v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)$ ]]; then
+              echo "::error::tag must be relay-v<major>.<minor>.<patch>[-<pre>]"
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+            tags="${tags},${IMAGE}:${version}"
+          fi
+          {
+            echo "tags=${tags}"
+            echo "version=${version:-sha-${COMMIT}}"
+          } >> "$GITHUB_OUTPUT"
+
+      # First build: loaded into the local daemon only, for the smoke test. The push below reuses
+      # its layers from the same daemon.
+      - name: Build (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: sbtp-relay:smoke
+
+      # The image starts read-only, without capabilities, as uid 65532, and answers
+      # `GET /sbtp/v1/info`. The port is published on loopback only.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect --format '{{.Config.User}}' sbtp-relay:smoke)"
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::image user is '$user', expected 65532:65532"
+            exit 1
+          fi
+          docker volume create sbtp-smoke-data >/dev/null
+          docker run -d --name sbtp-smoke \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -v sbtp-smoke-data:/data -p 127.0.0.1:8080:8080 sbtp-relay:smoke
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8080/sbtp/v1/info -o info.json; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          docker logs sbtp-smoke 2>&1 | tail -n 50
+          if [ "$ok" != 1 ]; then
+            echo "::error::the relay did not answer GET /sbtp/v1/info"
+            exit 1
+          fi
+          head -c 2000 info.json; echo
+          docker stop --time 10 sbtp-smoke >/dev/null
+          status="$(docker inspect --format '{{.State.ExitCode}}' sbtp-smoke)"
+          docker rm sbtp-smoke >/dev/null
+          docker volume rm sbtp-smoke-data >/dev/null
+          if [ "$status" != 0 ]; then
+            echo "::error::the relay exited with status $status on SIGTERM"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/sbtp-protocol/sbtp
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+            org.opencontainers.image.title=sbtp-relay
+
+      # GitHub artifact attestations are not available for private repositories on the Free
+      # plan; the repository is public, and the condition keeps a private fork or a future change
+      # of visibility from failing the run.
+      - name: Build provenance attestation
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+          COMMIT: ${{ github.sha }}
+          VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no image digest from the push step"
+            exit 1
+          fi
+          {
+            echo "## sbtp-relay image"
+            echo
+            echo "Deploy by digest:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "- Commit: \`${COMMIT}\`"
+            echo "- Platform: linux/amd64"
+            echo "- Tags: \`${TAGS//,/\`, \`}\`"
+            if [ "$VISIBILITY" = "public" ]; then
+              echo "- Provenance: \`gh attestation verify oci://${IMAGE}@${DIGEST} -R sbtp-protocol/sbtp\`"
+            else
+              echo "- Provenance: none (repository is ${VISIBILITY}; attestations need a public repository on this plan)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE}@${DIGEST}"

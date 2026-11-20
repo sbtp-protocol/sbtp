@@ -46,6 +46,9 @@ Initial public version. Pre-release software: no version is supported for produc
   `SEALED_SIG_PREFIX` and `ENC_KEY_DIRECTORY_CONTEXT` (spec §3.5).
 - `sbtp-wasm`: WebAssembly bindings; `examples/cli-demo`: keygen, mine, sign, publish, query; `web/`:
   minimal browser client.
+- CI (`.github/workflows/`, `docs/ci.md`): the `CONTRIBUTING.md` checks on every push and pull request
+  to `main`; a relay image built by CI and pushed to `ghcr.io/sbtp-protocol/sbtp-relay` on `relay-v*`
+  tags, deployed by digest. Actions pinned by commit SHA, read-only token outside the image job.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
 
