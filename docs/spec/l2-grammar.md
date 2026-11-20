@@ -376,6 +376,9 @@ the envelope through the tags it defines (§5.4).
   is not `0x00`. A sender SHOULD use the smallest bucket that fits.
 - The item is a map with exactly the keys `from` (the sender's Ed25519 identity key), `msg` (a byte
   string holding a payload of this grammar) and `sig` (64 bytes).
+- An application MAY define a tag whose sender has no identity yet; it then states what key `from` is
+  (for example a key used for one exchange only). `from` MUST still differ from the outer PubKey (§5.2).
+  `sig` then proves only possession of that key; the application MUST NOT treat it as an identity.
 - `sig` is a pure Ed25519 signature (RFC 8032 §5.1) by `from` over
   `SBTP-v1-sealed-sig ‖ outer_pubkey (32) ‖ recipient_id (32) ‖ recipient_x25519_pubkey (32) ‖ msg`.
   `recipient_id` is fixed by the application that defines the tag (§5.4), for example the recipient's
@@ -407,7 +410,8 @@ the envelope through the tags it defines (§5.4).
   state in its own specification, for each tag: its `derive_key` context, which MUST NOT start with a
   prefix reserved by core spec §3.5; the inputs of the derivation; the `msg` kinds the tag allows; the `recipient_id` of §5.3; the tag check of
   step (9) of §5.3; the length buckets allowed; the difficulty a recipient applies; and the largest
-  valid block for the bound above.
+  valid block for the bound above. For a tag whose recipient key is not an `sbtp.enc_key`, the
+  application that defines the tag states which private keys the recipient tries in step (4) of §5.3.
 
 ### 5.5 Encryption keys (`sbtp.enc_key`)
 - Signed by the identity key. Body `enc-key-body`: `x25519` (32 bytes, the HPKE recipient key) and

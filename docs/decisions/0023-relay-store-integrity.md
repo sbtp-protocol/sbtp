@@ -1,7 +1,7 @@
 # 0023: Relay store integrity: damaged files, signature check on read, cache policy
 
 - Status: accepted (by the project owner, 2026-11-21), with the recommended choice on rules 14 to 18
-- Amended by: 0024 (rule 14: `epoch_renewed`); 0025 (rules 5 and 14: costs in the quarantine and the walk, `dirs_created`)
+- Amended by: 0024 (rule 14: `epoch_renewed`); 0025 (rules 5 and 14: costs in the quarantine and the walk, `dirs_created`); 0046 (rule 13: `Cache-Control` of a block response when demand eviction is on)
 - Date: 2026-11-19
 - Questions: none
 - Review: `docs/security/2026-11-21-relay-m1b.md`, finding L-1, design questions (b) and (c); also L-3,

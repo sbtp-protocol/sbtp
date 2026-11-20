@@ -1,6 +1,6 @@
 # 0045: Network PoW difficulty: one value that replicating relays do not exceed
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21)
 - Date: 2026-11-20
 - Questions: Q-28 (partially: the default value; the phone measurement stays open)
 - Amends: ADR 0007 rule 1 (last sentence, "There is no network-wide difficulty") and its rejected
@@ -94,6 +94,8 @@ Phones are slower and were not measured.
 - **Compatibility.** Nothing is released. Relays at the default are already at 16.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 Core spec §3.3, the bullet "The minimum difficulty `d` is a setting of each relay…" replaced by:
 

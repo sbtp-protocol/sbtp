@@ -160,9 +160,12 @@ of the Version field MUST define new strings. (ADR 0002)
 - The sender increments `Nonce` until the difficulty is reached.
 - The relay checks it in O(1) on the `block_id` it computes anyway, with no shared state.
 - The minimum difficulty `d` is a setting of each relay (`min_pow_difficulty`, 0 to 256), published by
-  `GET /sbtp/v1/info` (§4). The default of `sbtp-relay` is 16. There is no network-wide difficulty. An
-  implementation of validation takes `d` as a parameter and MUST NOT read a clock or any ambient state.
-  (ADR 0007, ADR 0019)
+  `GET /sbtp/v1/info` (§4). An implementation of validation takes `d` as a parameter and MUST NOT read
+  a clock or any ambient state. (ADR 0007)
+- The network difficulty `D_NET` is 16. A relay SHOULD set `min_pow_difficulty = D_NET`. A relay that
+  takes part in replication MUST NOT set it above `D_NET`; it MAY set it below. A sender that wants its
+  block to be accepted by every such relay mines at `D_NET` or above. `D_NET` changes only by a
+  revision of this specification; a relay never re-checks C1 on a block it holds. (ADR 0045)
 - The recipient of a block requested by its identifier (§3.4) applies C1 with a difficulty `d` of its
   own, independent of any relay, and `d = 0` when it has none. It MUST NOT take `d` from the `/info` of
   the relay that served the block. A block that fails only a recipient's own `d > 0` is refused by that
@@ -282,13 +285,17 @@ path prefix. The routes of this section are under it. (ADR 0030)
   (`InvalidParameter`) when the identifier is malformed.
 - A relay MUST serve only bytes that pass full validation (§2.2) and R1 for the requested `block_id`. A
   stored file that fails gets `404` (`NotFound`). A `200` response SHOULD carry `Cache-Control: public,
-  max-age=31536000, immutable`. (ADR 0023)
+  max-age=31536000, immutable`. A relay that evicts by demand MUST instead bound shared caches to half
+  its demand epoch `S`, on every `200` and `304`: `Cache-Control: public, max-age=31536000,
+  s-maxage=<S>, immutable` and `CDN-Cache-Control: public, max-age=<S>, must-revalidate` (RFC 9213),
+  with the `ETag`, so that a shared cache revalidates each requested block at least once per `S`.
+  (ADR 0023, ADR 0046)
 - A `200` response MAY carry `ETag: "<block_id>"` (lowercase hexadecimal, a strong validator). A relay
   that sends it answers a request whose `If-None-Match` matches it (RFC 9110 §13.1.2) with `304 Not
   Modified`, the same `ETag` and `Cache-Control` and no body, and only for a block it would serve with
   `200`.
-- A relay MAY evict blocks (`block_ttl_ms`, `/info`). A `404` does not mean that the block does not
-  exist.
+- A relay MAY evict blocks, by age (`block_ttl_ms`) or by demand (`demand_eviction`), both published by
+  `/info`. A `404` does not mean that the block does not exist. (ADR 0013, ADR 0046)
 - The recipient MUST check that the received block carries the requested `block_id` and validate it
   (§3.4). The `min_pow_difficulty` of `/info` applies to `PUT` only (§3.3).
 
@@ -302,7 +309,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
     "max_future_ms": 300000,
     "block_versions": [1],
     "max_query_limit": 1000,
-    "block_ttl_ms": 2592000000
+    "block_ttl_ms": null,
+    "demand_eviction": true
   }
   ```
 
@@ -313,6 +321,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - `max_query_limit`: integer from 1 to 1,000, the largest page of `/query`.
 - `block_ttl_ms`: integer in milliseconds, or `null` when the relay does not evict by age. A relay never
   publishes `0`.
+- `demand_eviction`: boolean; `true` when the relay evicts the blocks requested least recently once
+  its store is near full (`architecture.md` §2, "Eviction"). A client MUST read an absent member as
+  `false`. (ADR 0046)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
@@ -480,8 +491,9 @@ follows from §3.3, §3.4 and the subsections above.
   difficulty floor fails it on every relay: its proof of work depends on its `block_id` alone (§3.3).
 - A cursor is only valid on the relay that issued it (`GET /sbtp/v1/query`). A client keeps one cursor
   per relay and never sends a cursor to another relay.
-- A sender that mines once for several relays mines at the highest `min_pow_difficulty` among them,
-  each read within its maximum (see "Client bounds"); it does not mine for a relay above that maximum.
+- A sender that mines once for several relays mines at `D_NET` or at the highest
+  `min_pow_difficulty` among them, whichever is higher, each read within its maximum (see "Client
+  bounds"); it does not mine for a relay above that maximum. (ADR 0045)
   `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later.
 - The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
   stays a function of the client's settings. `Retry-After` and the back-off apply to the relay that
