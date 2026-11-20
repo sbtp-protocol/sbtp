@@ -4,6 +4,8 @@
 - Date: 2026-11-20
 - Questions: touches Q-11 (synchronisation, not decided here) and Q-23 (push delivery, not decided
   here); opens Q-64 and Q-65
+- Clarification: 2026-11-20 (owner): the gateway is `GET`-only, so a preflight gets
+  `Access-Control-Allow-Methods: GET`, not the relay's `GET, PUT` (rule 9; `graph-access.md` §3.2)
 - Depends on: ADR 0040 (URI, view); core spec §3.4 (receipt), §4 (`/query`, errors, CORS, redirects,
   admission control, client bounds; ADRs 0012, 0018, 0029, 0030); `l2-grammar.md` §2.4, §5.4, §5.9
 - Impact: `docs/spec/graph-access.md` §3 and §4; new binary crate `sbtp-gateway`; `sbtp-graph`
