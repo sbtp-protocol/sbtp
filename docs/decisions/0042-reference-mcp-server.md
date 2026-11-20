@@ -1,6 +1,6 @@
 # 0042: Reference MCP server for read access to the graph
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: opens Q-66
 - Depends on: ADR 0040 (URI, view), ADR 0041 (gateway API, rules 20 to 24); core spec §3.4 and §4

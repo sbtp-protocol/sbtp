@@ -1,10 +1,11 @@
 # 0044: Client address from a single-value header set by a CDN (`client_ip_header`)
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: none open; found while deploying the first public relay behind a CDN and a proxy that
   replaces `X-Forwarded-For`
-- Amends, if accepted: ADR 0018 rule 20 (one more source of the client address) and ADR 0020 rule 6
+- Amends: ADR 0018 rule 20 (one more source of the client address) and rule 6 (key set: one more
+  relay setting, `client_ip_header`), and ADR 0020 rule 6
   ("every other header MUST NOT be read" gets one exception). Nothing else in ADR 0018 or ADR 0020
   changes
 - Depends on: ADR 0018 rules 20 to 22, ADR 0019 rule 42, ADR 0020 rules 6 to 17, ADR 0021 (privacy of

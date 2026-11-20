@@ -5,7 +5,8 @@
   entry; `unknown` ends the search; loopback trusted by default; prefix 0 refused, warning below /16 (IPv4)
   or /32 (IPv6); warning, not a strict bound, for L-6; preflights and unknown paths cost a token
 - Amended by: 0022 (rule 7: a non-ASCII byte invalidates the element, not the whole line); 0027
-  (clarification T1: the worst-case figures below are recomputed with a limiter entry of 192 bytes)
+  (clarification T1: the worst-case figures below are recomputed with a limiter entry of 192 bytes); 0044
+  (rule 6: `client_ip_header` is the one header read besides `X-Forwarded-For`, and replaces it when set)
 - Also amends: ADR 0019 rule 37 computed worst cases, now including the per-client tables (d2f54f6):
   small 13,022,676 bytes, standard 97,662,800 bytes, large 1,199,328,928 bytes
 - Clarifications: 2026-11-19, after relay milestone 1c-b (N1: overflow key and per-client `PUT` bound;

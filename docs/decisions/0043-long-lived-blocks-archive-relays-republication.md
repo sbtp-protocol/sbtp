@@ -1,9 +1,9 @@
 # 0043: Long-lived blocks: archive relays, re-publication, and a `PUT` of an expired block
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: Q-24
-- Amends, if accepted: ADR 0013 rules 13 and 15 (what "after eviction" means for a `PUT`, and what the
+- Amends: ADR 0013 rules 13 and 15 (what "after eviction" means for a `PUT`, and what the
   sweeper may delete); `l2-grammar.md` §5.5, re-submission of the current key block. Nothing else in
   ADR 0013 changes
 - Depends on: ADR 0008 (`200` / `201`), ADR 0013 (positions, expiry, sweeper), ADR 0019 (archive relay),

@@ -252,10 +252,11 @@ path prefix. The routes of this section are under it. (ADR 0030)
   5. storage addressed by the `block_id`, without replacing a block already present (§3.4), within the
      relay's storage quota.
 - Responses:
-  - `201 Created`: the block is valid and was not stored; the relay stored it. The relay SHOULD send
-    `Location: /sbtp/v1/block/{block_id}` (lowercase hexadecimal).
-  - `200 OK`: the block is valid and its `block_id` is already stored. The stored bytes are not replaced
-    (§3.4). A relay MUST NOT answer `409` in this case.
+  - `201 Created`: the block is valid and the relay did not hold it, or held it expired (see
+    `architecture.md` §2, "Eviction"); the relay stored it with a new reception time. The relay SHOULD
+    send `Location: /sbtp/v1/block/{block_id}` (lowercase hexadecimal).
+  - `200 OK`: the block is valid and the relay holds it, not expired. The stored bytes are not replaced
+    and its lifetime is not extended (§3.4). A relay MUST NOT answer `409` in this case.
   - `400 Bad Request`: F1 to F9, P1, C1. Every failure of the binary analysis gets `400`, F2 included if
     it is reached despite the body limit. Error names: the §2.2 error of the failed check; P1 is
     `TimestampTooFarInFuture`.
@@ -266,11 +267,13 @@ path prefix. The routes of this section are under it. (ADR 0030)
   - `422 Unprocessable Entity`: C2 (`InvalidPublicKey`), C3 (`InvalidSignature`).
   - `429 Too Many Requests`: this client is over its allowance, see "Admission control".
   - `507 Insufficient Storage`: the block is valid and new, and the relay has no room for it
-    (`StorageFull`). Nothing is stored. A valid block already stored still gets `200`.
+    (`StorageFull`). Nothing is stored. A valid block that the relay holds, not expired, still gets
+    `200`. An expired block whose file the relay still holds MUST NOT get `507` because of the quota.
   - `503 Service Unavailable`: the relay is starting, stopping or at one of its own limits
     (`Unavailable`), see "Admission control".
 - A client MUST treat `200` and `201` as the same success. When concurrent requests carry the same new
-  `block_id`, at most one gets `201`. (ADR 0004, ADR 0007, ADR 0008, ADR 0012, ADR 0013, ADR 0018)
+  `block_id`, at most one gets `201`. (ADR 0004, ADR 0007, ADR 0008, ADR 0012, ADR 0013, ADR 0018,
+  ADR 0043)
 
 ### `GET /sbtp/v1/block/{block_id}`
 
@@ -306,8 +309,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - `max_query_limit`: integer from 1 to 1,000, the largest page of `/query`.
 - `block_ttl_ms`: integer in milliseconds, or `null` when the relay does not evict by age. A relay never
   publishes `0`.
-- A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019) A client
-  MUST accept the absence of any member other than `min_pow_difficulty` and `max_future_ms`.
+- A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
+- A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
+  relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
+- A client MUST accept the absence of any member other than `min_pow_difficulty` and `max_future_ms`.
   (ADR 0007, ADR 0012)
 - A relay MAY add members; the body is at most 16,384 bytes. A client MUST ignore members it does not
   know. A relay MAY change its settings at any time. A sender SHOULD read `/info` before mining.

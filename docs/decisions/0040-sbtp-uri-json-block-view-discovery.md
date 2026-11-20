@@ -1,9 +1,11 @@
 # 0040: `sbtp:` URI scheme, JSON block view and discovery
 
-- Status: proposed
+- Status: accepted (2026-11-20, owner)
 - Date: 2026-11-20
 - Questions: none open before this ADR (owner request, machine and agent access to the graph); opens
   Q-62 and Q-63
+- Amends: ADR 0012 rule 20 (one more optional `/info` member, `graph_gateway`) and ADR 0018 rule 6 (key
+  set: one more relay setting, `info_graph_gateway`). Nothing else in ADR 0012 or ADR 0018 changes
 - Depends on: core spec §3.4 (block identity, receipt), §4 (relay URL, `/info`, client bounds, ADR
   0029, ADR 0030); `l2-grammar.md` §1 to §2.4 and §5.4 (grammar validation, `tagged` targets)
 - Impact: new normative document `docs/spec/graph-access.md` §1 to §3 and §5; core spec §4 `/info`
