@@ -478,8 +478,8 @@ impl Store {
 
     /// ADR 0023 rule 6, for the sweeper: deletes the quarantined files moved at least 7 days
     /// before `now_ms`, and the oldest files beyond 64. Returns the number deleted; each releases
-    /// its quota cost (rule 5).
-    // HOOK(1c-b): called by the sweeper at every run, even when `block_ttl_ms = 0` (rule 6).
+    /// its quota cost (rule 5). Called by the sweeper at every run, even when `block_ttl_ms = 0`
+    /// (rule 6).
     ///
     /// # Errors
     ///
@@ -623,6 +623,37 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Stored::AlreadyPresent),
             Err(e) => Err(NotLinked(e)),
         }
+    }
+
+    /// The sweeper's deletion of the file of `id` (ADR 0013 rule 15): `unlink` of the final name,
+    /// then its quota cost is released. Returns whether a file was there; a missing file is not an
+    /// error (the step is idempotent). A symbolic link or another non-regular entry under the
+    /// final name is unlinked without being followed and releases nothing: only regular files are
+    /// counted (`reconcile`). The shard directory is not `fsync`ed: a deletion lost in a crash
+    /// leaves the file, which the start-up walk re-indexes from its modification time and the next
+    /// sweep deletes again. The gauges are left to the caller ([`Store::publish_gauges`]).
+    ///
+    /// # Errors
+    ///
+    /// Operating-system errors; a shard directory that is missing or not a real directory (ADR
+    /// 0025 rule 6, [`is_shard_error`]).
+    pub fn evict(&self, id: &BlockId) -> io::Result<bool> {
+        check_shard(self.shard_dir(id))?;
+        let path = self.path(id);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if meta.is_file() {
+            self.release(cost(meta.len()));
+        }
+        Ok(true)
     }
 
     /// The stored bytes of `id`, or `None` if no file is held. At most `MAX_BLOCK_LEN + 1` bytes

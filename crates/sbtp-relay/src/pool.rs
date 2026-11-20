@@ -45,7 +45,7 @@ use crate::metrics;
 
 /// Exit status when a thread of the pool ends unexpectedly, or after [`FATAL_INDEX_FAILURES`]
 /// consecutive index failures (`EX_SOFTWARE`).
-const EXIT_THREAD_ENDED: i32 = 70;
+pub(crate) const EXIT_THREAD_ENDED: i32 = 70;
 
 /// ADR 0018 rule 37, last bullet: the fixed number of consecutive failed index calls of one
 /// family after which the relay exits with status 70 and a `fatal` line, for the service manager
@@ -1060,7 +1060,7 @@ mod tests {
             &self,
             before: crate::index::Position,
             max: usize,
-        ) -> Result<Vec<crate::index::Position>, IndexError> {
+        ) -> Result<Vec<(crate::index::Position, sbtp_core::BlockId)>, IndexError> {
             self.inner.expired(before, max)
         }
         fn remove(&self, positions: &[crate::index::Position]) -> Result<usize, IndexError> {

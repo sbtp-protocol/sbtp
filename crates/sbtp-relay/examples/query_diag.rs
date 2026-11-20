@@ -399,13 +399,17 @@ impl IndexBackend for MemIndex {
         })
     }
 
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, Infallible> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, Infallible> {
         Ok(self
             .read()
             .blocks
             .range(..before)
             .take(max.clamp(1, MAX_QUERY_LIMIT))
-            .map(|(p, _)| *p)
+            .map(|(p, (id, _))| (*p, *id))
             .collect())
     }
 

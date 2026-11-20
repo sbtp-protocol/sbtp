@@ -264,13 +264,18 @@ pub trait IndexBackend: Send + Sync + Sized {
         limit: usize,
     ) -> Result<Page, Self::Error>;
 
-    /// Up to `max` positions strictly before `before`, oldest first (rule 15). `max` is clamped to
-    /// `1..=MAX_QUERY_LIMIT`.
+    /// Up to `max` positions strictly before `before`, oldest first, each with the `block_id` it
+    /// holds (rule 15: the sweeper deletes the cache entry and the file of that block). `max` is
+    /// clamped to `1..=MAX_QUERY_LIMIT`.
     ///
     /// # Errors
     ///
     /// Backend errors.
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, Self::Error>;
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, Self::Error>;
 
     /// Removes the entries of the blocks at `positions`; idempotent. Returns the number removed
     /// (rule 15).
@@ -556,14 +561,23 @@ impl IndexBackend for RedbIndex {
     ///
     /// # Errors
     ///
-    /// redb errors.
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    /// redb errors, `CorruptRow`.
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         let txn = self.db.begin_read()?;
         let blocks = txn.open_table(BLOCKS)?;
         let max = max.clamp(1, MAX_QUERY_LIMIT);
         let mut out = Vec::with_capacity(max);
         for item in blocks.range(..before.key())?.take(max) {
-            out.push(Position::from_key(item?.0.value()));
+            let (k, v) = item?;
+            let id = v.value().get(..32).and_then(|b| Id::try_from(b).ok());
+            out.push((
+                Position::from_key(k.value()),
+                BlockId(id.ok_or(IndexError::CorruptRow)?),
+            ));
         }
         Ok(out)
     }
@@ -723,7 +737,8 @@ mod tests {
         let idx = RedbIndex::open(&tmp("resubmit"), DEFAULT_INDEX_CACHE_BYTES).unwrap();
         let old = put(&idx, 1, &[id(9)], 10).unwrap();
         let batch = idx.expired(Position::at(20), 10).unwrap();
-        assert_eq!(batch, vec![old]);
+        assert_eq!(batch, vec![(old, id(1))]);
+        let batch = [old];
         // The sweeper deletes the file here; the client re-submits.
         let new = put(&idx, 1, &[id(9)], 5_000).unwrap();
         assert!(new > old);
@@ -755,7 +770,7 @@ mod tests {
         assert!(new > old);
         // Expiry bound between the old and the new acceptance: only block 2 is expired.
         let expired = idx.expired(Position::at(4_000), 10).unwrap();
-        assert_eq!(expired, vec![Position::at(11)]);
+        assert_eq!(expired, vec![(Position::at(11), id(2))]);
         assert_eq!(idx.contains(&id(1)).unwrap(), Some(new));
         let page = idx.query(Some(&id(9)), Position::default(), 10).unwrap();
         assert_eq!(page.entries, vec![(new, id(1))]);
@@ -830,7 +845,12 @@ mod tests {
         for b in 1..=3u8 {
             put(&idx, b, &[id(100)], u64::from(b));
         }
-        let old = idx.expired(Position::at(3), 10).unwrap();
+        let old: Vec<Position> = idx
+            .expired(Position::at(3), 10)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         assert_eq!(old.len(), 2);
         assert_eq!(idx.remove(&old).unwrap(), 2);
         assert_eq!(idx.remove(&old).unwrap(), 0);

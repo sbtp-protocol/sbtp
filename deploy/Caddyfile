@@ -29,6 +29,11 @@
 	# No product name on the network (ADR 0019 rule 25 applies to the relay; same intent here).
 	header -Server
 
+	# No `log` directive: Caddy writes no access log, so it keeps no client addresses per request.
+	# If you add one, delete or mask `request>remote_ip`, `request>client_ip` and the forwarding
+	# headers, and set `roll_keep_for` (default 90 days): see "Logs and client addresses" in
+	# deploy/README.md.
+
 	# Only the relay interface is proxied. No `redir`, no `rewrite`, no trailing-slash
 	# redirect on /sbtp/v1/ (ADR 0030 rule 3). Caddy's own plain-HTTP-to-HTTPS redirect on
 	# port 80 stays: it is on another origin (ADR 0030 rule 5).

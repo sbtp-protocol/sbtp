@@ -105,6 +105,54 @@ fn new_known_and_served() {
     assert_eq!(r.header("cache-control"), Some("no-store"));
 }
 
+/// A `200` carries the strong validator `"<block_id>"`; a matching `If-None-Match` (exact, weak,
+/// in a list, `*`) gets `304` with the validator, the cache policy, CORS and no body, on a cache
+/// miss and on a hit; `HEAD` too. Another tag gets the block; an unknown block stays `404`.
+#[test]
+fn etag_and_not_modified() {
+    let relay = start(&[("MIN_POW_DIFFICULTY", "0")]);
+    let mut c = relay.connect();
+    let b = block(b"etag", 0);
+    let id = id_of(&b);
+    assert_eq!(put(&mut c, &b).status, 201);
+    let path = format!("/sbtp/v1/block/{id}");
+    let etag = format!("\"{id}\"");
+    // First request: a cache miss, conditional.
+    for cond in [
+        etag.clone(),
+        format!("W/{etag}"),
+        format!("\"other\", {etag}"),
+        "*".to_owned(),
+    ] {
+        let r = http_get(&mut c, &path, &format!("If-None-Match: {cond}\r\n"));
+        assert_eq!(r.status, 304, "{cond}");
+        assert_eq!(r.body, b"");
+        assert_eq!(r.header("etag"), Some(etag.as_str()));
+        assert_eq!(
+            r.header("cache-control"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(r.header("access-control-allow-origin"), Some("*"));
+    }
+    let r = http_get(&mut c, &path, "If-None-Match: \"other\"\r\n");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b);
+    assert_eq!(r.header("etag"), Some(etag.as_str()));
+    let r = common::exchange(
+        &mut c,
+        &format!("HEAD {path} HTTP/1.1\r\nHost: relay.test\r\nIf-None-Match: {etag}\r\n\r\n"),
+    );
+    assert_eq!(r.status, 304);
+    let missing = BlockId([0x22; 32]);
+    let r = http_get(
+        &mut c,
+        &format!("/sbtp/v1/block/{missing}"),
+        &format!("If-None-Match: \"{missing}\", *\r\n"),
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.header("etag"), None);
+}
+
 #[test]
 fn malformed_ids_and_traversal_never_reach_the_store() {
     let relay = start(&[]);
@@ -795,7 +843,11 @@ impl IndexBackend for SlowIndex {
     ) -> Result<Page, IndexError> {
         self.inner.query(parent, from, limit)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.inner.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {

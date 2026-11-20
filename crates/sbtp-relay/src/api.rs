@@ -36,7 +36,9 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
     let info = Bytes::from(info_body(settings));
     let queries = Router::new()
         .route("/sbtp/v1/query", get(query::<I>))
-        .with_state(Arc::new(QueryState::new(settings, relay.index().clone())));
+        .with_state(Arc::new(
+            QueryState::new(settings, relay.index().clone()).with_clock(relay.clock()),
+        ));
     let blocks = Router::new()
         .route("/sbtp/v1/block", put(put_block::<I>))
         .route("/sbtp/v1/block/{id}", get(get_block::<I>))
@@ -48,10 +50,17 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
                 let info = info.clone();
                 async move {
                     (
-                        [(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("application/json"),
-                        )],
+                        [
+                            (
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            ),
+                            // Not cached by a CDN or a browser: the settings it publishes may
+                            // change at any restart (spec §4, "A relay MAY change its settings
+                            // at any time"), and the body is a constant held in memory, so
+                            // serving it costs the relay nothing worth caching.
+                            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                        ],
                         info,
                     )
                 }

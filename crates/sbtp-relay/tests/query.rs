@@ -267,7 +267,11 @@ impl IndexBackend for SlowQueries {
         std::thread::sleep(Duration::from_millis(300));
         self.0.query(p, from, n)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.0.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {

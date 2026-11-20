@@ -283,6 +283,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - A relay MUST serve only bytes that pass full validation (§2.2) and R1 for the requested `block_id`. A
   stored file that fails gets `404` (`NotFound`). A `200` response SHOULD carry `Cache-Control: public,
   max-age=31536000, immutable`. (ADR 0023)
+- A `200` response MAY carry `ETag: "<block_id>"` (lowercase hexadecimal, a strong validator). A relay
+  that sends it answers a request whose `If-None-Match` matches it (RFC 9110 §13.1.2) with `304 Not
+  Modified`, the same `ETag` and `Cache-Control` and no body, and only for a block it would serve with
+  `200`.
 - A relay MAY evict blocks (`block_ttl_ms`, `/info`). A `404` does not mean that the block does not
   exist.
 - The recipient MUST check that the received block carries the requested `block_id` and validate it

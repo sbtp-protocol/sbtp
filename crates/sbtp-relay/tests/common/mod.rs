@@ -70,6 +70,9 @@ pub struct TestServer {
     thread: Option<JoinHandle<()>>,
     /// The index threads, stopped once the server thread has ended.
     pool: Option<Box<dyn Send + Sync>>,
+    /// One sweeper run (`sweep::sweep_once` with a batch of 1,000) over the server's relay; the
+    /// test server runs no sweeper task of its own.
+    sweeper: Box<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
 impl TestServer {
@@ -92,13 +95,40 @@ impl TestServer {
         data: &std::path::Path,
         index: std::sync::Arc<I>,
     ) -> Self {
+        Self::start_full(settings, extra, data, index, sbtp_relay::log::unix_ms)
+    }
+
+    /// On a fresh data directory, with `clock` as the relay clock (P1, `received_at`, expiry).
+    pub fn start_clocked(settings: &Settings, clock: fn() -> u64) -> Self {
+        let data = tmp_dir("server");
+        std::fs::create_dir_all(&data).unwrap();
+        let index = RedbIndex::open(&data.join("index.redb"), 1 << 20).unwrap();
+        Self::start_full(
+            settings,
+            Router::new(),
+            &data,
+            std::sync::Arc::new(index),
+            clock,
+        )
+    }
+
+    fn start_full<I: IndexBackend + 'static>(
+        settings: &Settings,
+        extra: Router,
+        data: &std::path::Path,
+        index: std::sync::Arc<I>,
+        clock: fn() -> u64,
+    ) -> Self {
         std::fs::create_dir_all(data).unwrap();
         let index_file = data.join("index.redb");
         let store = Store::open(data, index_file, settings.max_store_bytes).unwrap();
         reconcile(&store, &*index).unwrap();
         let pool = IndexPool::start(&index, settings).unwrap();
         drop(index); // Held by the index threads from here on.
-        let relay = std::sync::Arc::new(Relay::new(settings, store, pool.handle()));
+        let relay =
+            std::sync::Arc::new(Relay::new(settings, store, pool.handle()).with_clock(clock));
+        let swept = std::sync::Arc::clone(&relay);
+        let sweeper = Box::new(move || sbtp_relay::sweep::sweep_once(&swept, 1_000));
         let app = sbtp_relay::api::layered(
             sbtp_relay::api::routes(settings, relay).merge(extra),
             settings,
@@ -124,11 +154,17 @@ impl TestServer {
             stop: Some(stop),
             thread: Some(thread),
             pool: Some(Box::new(pool)),
+            sweeper,
         }
     }
 
     pub fn connect(&self) -> TcpStream {
         connect(self.addr)
+    }
+
+    /// One sweeper run; the number of index entries removed, `None` on a failure.
+    pub fn sweep(&self) -> Option<u64> {
+        (self.sweeper)()
     }
 }
 

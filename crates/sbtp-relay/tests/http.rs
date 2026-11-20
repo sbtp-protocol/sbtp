@@ -75,6 +75,8 @@ fn info_has_exactly_the_adr_members() {
     let r = http_get(&mut c, "/sbtp/v1/info", "");
     assert_eq!(r.status, 200);
     assert_eq!(r.header("content-type"), Some("application/json"));
+    // A CDN in front of the relay must not keep settings across a restart.
+    assert_eq!(r.header("cache-control"), Some("no-store"));
     assert_eq!(
         r.json(),
         serde_json::json!({

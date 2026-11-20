@@ -220,7 +220,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 10] = [
+const OTHER_KEYS: [&str; 11] = [
     "profile",
     "listen",
     "data_dir",
@@ -231,6 +231,7 @@ const OTHER_KEYS: [&str; 10] = [
     "log_level",
     "log_timestamp",
     "log_client_tag",
+    "client_ip_header",
 ];
 
 /// An address block in CIDR notation (`192.0.2.0/24`, `2001:db8::/32`). Host bits must be zero.
@@ -412,6 +413,9 @@ pub struct Settings {
     pub rate_limit_exempt: Vec<Cidr>,
     pub client_ipv6_prefix: u64,
     pub trusted_proxies: Vec<Cidr>,
+    /// ADR 0044: the single-value header that holds the client address on a connection from a
+    /// peer in `trusted_proxies`, lowercase; `None` (the default) reads `X-Forwarded-For`.
+    pub client_ip_header: Option<String>,
     pub block_cache_bytes: u64,
     // ADR 0021.
     pub log_format: Format,
@@ -651,6 +655,7 @@ impl Settings {
             &["127.0.0.1/32", "::1/128"],
             false,
         )?;
+        let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
         // Strings of one fixed set each (ADR 0021 rule 46), parsed by the `choice!` of `log`.
         macro_rules! choice {
             ($t:ident, $k:literal) => {
@@ -706,6 +711,7 @@ impl Settings {
             rate_limit_exempt,
             client_ipv6_prefix: v(ints.client_ipv6_prefix),
             trusted_proxies,
+            client_ip_header,
             block_cache_bytes: v(ints.block_cache_bytes),
             log_format: log_format.unwrap_or(Format::Text),
             log_level: log_level.unwrap_or(Level::Info),
@@ -745,6 +751,7 @@ impl Settings {
                     "log_level" => Some(self.log_level.name().to_owned()),
                     "log_timestamp" => Some(self.log_timestamp.name().to_owned()),
                     "log_client_tag" => Some(self.log_client_tag.name().to_owned()),
+                    "client_ip_header" => Some(self.client_ip_header.clone().unwrap_or_default()),
                     _ => None,
                 }
             };
@@ -932,6 +939,18 @@ impl Settings {
                  write X-Forwarded-For; a forwarder on this host that does not write it needs \
                  trusted_proxies = [] (ADR 0020 rules 16 and 17)"
                     .to_owned(),
+            });
+        }
+        // ADR 0044 rule 7: the trust the setting implies, once at start-up.
+        if let Some(h) = &self.client_ip_header {
+            n.push(Warning {
+                code: "client_ip_header",
+                setting: "client_ip_header",
+                msg: format!(
+                    "the client address is read from the {h} header on connections from \
+                     trusted_proxies, which are trusted to forward it unchanged from the CDN; \
+                     X-Forwarded-For is not read (ADR 0044)"
+                ),
             });
         }
         n
@@ -1198,6 +1217,32 @@ fn parse_listen(r: Option<Raw>) -> Result<SocketAddr, ConfigError> {
         })
 }
 
+/// ADR 0044 rule 1: an RFC 9110 §5.1 field name (a token) of 1 to 64 bytes, compared without
+/// regard to case (kept lowercase), never `X-Forwarded-For` or `Forwarded`. Absent: off.
+fn parse_client_ip_header(r: Option<Raw>) -> Result<Option<String>, ConfigError> {
+    let Some(r) = r else {
+        return Ok(None);
+    };
+    let s = r.string("client_ip_header")?.to_ascii_lowercase();
+    let invalid = |reason: &str| ConfigError::Invalid {
+        setting: "client_ip_header",
+        reason: reason.into(),
+    };
+    let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if s.is_empty() || s.len() > 64 || !s.bytes().all(tchar) {
+        return Err(invalid(
+            "expected an HTTP field name of 1 to 64 token characters",
+        ));
+    }
+    if s == "x-forwarded-for" || s == "forwarded" {
+        return Err(invalid(
+            "X-Forwarded-For and Forwarded are address chains, not a single-value header \
+             (ADR 0044 rule 1); leave client_ip_header unset to read X-Forwarded-For",
+        ));
+    }
+    Ok(Some(s))
+}
+
 fn parse_data_dir(r: Option<Raw>) -> Result<PathBuf, ConfigError> {
     let Some(r) = r else {
         return Ok(PathBuf::from("data"));
@@ -1320,8 +1365,56 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 40 integer settings plus the 10 others: ADRs 0007, 0012, 0013, 0018, 0019 and 0021.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 50);
+        // 40 integer settings plus the 11 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021 and
+        // 0044.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 51);
+    }
+
+    /// ADR 0044 rule 1: a field name of 1 to 64 token bytes, kept lowercase; the two address
+    /// chains are refused whatever their case; the note of rule 7 is written when it is set.
+    #[test]
+    fn client_ip_header_setting() {
+        let load = |v: &str| {
+            Settings::load(
+                Vec::<std::ffi::OsString>::new(),
+                vec![("SBTP_RELAY_CLIENT_IP_HEADER".into(), v.into())],
+            )
+        };
+        let s = load("CF-Connecting-IP").unwrap();
+        assert_eq!(s.client_ip_header.as_deref(), Some("cf-connecting-ip"));
+        assert!(
+            s.config_notes()
+                .iter()
+                .any(|n| n.code == "client_ip_header" && n.msg.contains("cf-connecting-ip"))
+        );
+        for bad in [
+            "X-Forwarded-For",
+            "x-forwarded-for",
+            "Forwarded",
+            "",
+            "two words",
+            "a:b",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                matches!(
+                    load(bad),
+                    Err(ConfigError::Invalid {
+                        setting: "client_ip_header",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        assert!(load(&"x".repeat(64)).is_ok());
+        let off = Settings::finish(BTreeMap::new()).unwrap();
+        assert_eq!(off.client_ip_header, None);
+        assert!(
+            off.config_notes()
+                .iter()
+                .all(|n| n.code != "client_ip_header")
+        );
     }
 
     /// Every setting has a source and a logged value, read from its typed field.
