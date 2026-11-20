@@ -1,7 +1,7 @@
 # 0013: Relay index, TTL eviction and storage quota
 
 - Status: accepted (by the project owner, 2026-11-18)
-- Amended by: 0014 (adversarial data set uses the format maximum of 8 parents); 0017 (benchmark protocol clarifications); 0021 (rule 19: disk-space watermark); 0023 (rules 9 and 18: reconciliation at every start with full validation of orphans; quota counts quarantined files; its clarifications of 2026-11-21 also cover rules 9 and 19); 0024 (rule 5: new epoch when the start-up walk indexes an orphan); 0025 (rule 18: tree and entry charges); 0043 (rule 13: an expired block is not held for `PUT` and is a new block, `201`, even before the sweep; rule 15: the sweeper deletes nothing of a block re-accepted after expiry)
+- Amended by: 0014 (adversarial data set uses the format maximum of 8 parents); 0017 (benchmark protocol clarifications); 0021 (rule 19: disk-space watermark); 0023 (rules 9 and 18: reconciliation at every start with full validation of orphans; quota counts quarantined files; its clarifications of 2026-11-21 also cover rules 9 and 19); 0024 (rule 5: new epoch when the start-up walk indexes an orphan); 0025 (rule 18: tree and entry charges); 0043 (rule 13: an expired block is not held for `PUT` and is a new block, `201`, even before the sweep; rule 15: the sweeper deletes nothing of a block re-accepted after expiry); 0046 (rule 12: default `block_ttl_ms`, eviction may depend on reads; rule 16: what an archive relay is; rule 21: the sweeper may evict unexpired blocks by demand, a `PUT` never does)
 - Date: 2026-11-18
 - Questions: Q-12 (resolved; chunk storage stays under Q-21)
 - Depends on: ADR 0012 (`/query` order, cursor, error names); ADR 0003 rule 9, ADR 0008 rule 6 and

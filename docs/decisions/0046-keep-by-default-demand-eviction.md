@@ -1,6 +1,6 @@
 # 0046: Relays keep by default; eviction under disk pressure by least recent demand
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21)
 - Date: 2026-11-20
 - Revised: 2026-11-20, owner review: demand hidden by shared caches is recovered, not accepted
   (rules 7, 12 to 17, 24 to 28)
@@ -345,6 +345,8 @@ headers of rule 15 (no shared lifetime above `S`, unchanged `immutable` for priv
 and metrics carry no `block_id` or client key.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 Core spec §4, `GET /sbtp/v1/block/{block_id}`, the `Cache-Control` sentence ("A `200` response SHOULD
 carry `Cache-Control: public, max-age=31536000, immutable`.") replaced by:

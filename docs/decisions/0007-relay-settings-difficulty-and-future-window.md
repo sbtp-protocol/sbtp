@@ -1,6 +1,7 @@
 # 0007: Relay settings: PoW difficulty and future timestamp window
 
 - Status: accepted (by the project owner, 2026-11-18)
+- Amended by: 0045 (rule 1, last sentence: a network difficulty `D_NET` is defined by the specification; rejected alternative "Network-wide difficulty")
 - Date: 2026-11-18
 - Decision: project owner, 2026-11-18
 - Questions: Q-06 (resolved), Q-07 (partially), Q-08 (partially: `GET /sbtp/v1/info`)

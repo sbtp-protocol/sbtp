@@ -91,26 +91,40 @@ On the first failure, the block is rejected without allocating any persistent re
   runs the relay binary itself, over loopback HTTP. (ADR 0013, protocol clarified by ADR 0017)
 
 ### Eviction
-- A block expires when `received_at + block_ttl_ms ≤ now`. `block_ttl_ms` is a relay setting (default:
-  30 days), published by `/info`. Eviction does not depend on reads. A `PUT` of a held, unexpired block
-  does not extend its lifetime. From its expiry a block is not held for `PUT`: a `PUT` of it is a new
-  block (`201`, new `received_at`), even before the sweeper has deleted it, and the sweeper then deletes
-  nothing of it. (ADR 0043)
-- `/query` never lists an expired block. A sweeper deletes expired blocks periodically, oldest first:
-  cache entry, block file, then index entries.
-- A relay MAY disable eviction (archive relay; `block_ttl_ms = 0` in the settings of `sbtp-relay`);
-  `/info` then publishes `"block_ttl_ms": null`. (ADR 0019)
+- A relay keeps what it receives. Eviction by age is a setting: a block expires when
+  `received_at + block_ttl_ms ≤ now`; `sbtp-relay` disables it by default (`block_ttl_ms = 0`, `/info`
+  `null`). A `PUT` of a held, unexpired block does not extend its lifetime. From its expiry a block is
+  not held for `PUT`: a `PUT` of it is a new block (`201`, new `received_at`), even before the sweeper
+  has deleted it, and the sweeper then deletes nothing of it. (ADRs 0013, 0043, 0046)
+- Eviction by demand: when the store is above a high-water mark of the quota, the sweeper evicts the
+  blocks requested least recently until it is at a low-water mark. Demand is its acceptance, a `GET`
+  answered `200` or `304`, a `PUT` answered `200`, and the acceptance of a child; at most one per block
+  per epoch `E`, whatever the client. A block whose last demand is less than `3 × E` old is not
+  evicted. A lost demand suspends eviction by demand for `2 × E`. A `PUT` never evicts. (ADR 0046)
+- A relay that evicts by demand bounds shared caches to `E / 2` with `s-maxage` and
+  `CDN-Cache-Control`, so that a block requested through a cache is revalidated, and counted, at least
+  once per `E / 2`. (ADR 0046)
+- `/query` never lists an expired block. Evicted blocks leave `/query` when the sweeper removes them:
+  cache entry, block file, then index entries. Edges of their children stay.
+- An archive relay disables both; it never deletes a block. (ADRs 0019, 0046)
 - Eviction is local to a relay and is not a deletion mechanism. (ADR 0013)
 - Long-lived blocks are kept available by archive relays and by clients that submit them again after
-  expiry; a `PUT` never renews a block before it expires. (ADR 0043)
+  a `404` or an expiry; a `PUT` never renews a block before it expires. (ADR 0043)
 
 ### Quota
 - `max_store_bytes` bounds the block files and quarantined files (each counted in 4,096-byte units
   plus 128 bytes for its directory entry), a fixed charge of 1,060,864 bytes for the directories, and
   the index. File system metadata and directory space left after removals are left to the free-space
   margin. (ADRs 0013, 0023 and 0025)
-- A new block that does not fit gets `507 Insufficient Storage`. The relay does not evict unexpired
-  blocks to make room, and keeps serving reads. (ADR 0013)
+- A new block that does not fit gets `507 Insufficient Storage`. A `PUT` never evicts to make room;
+  only the sweeper evicts, by age or by demand. A full relay keeps serving reads. (ADRs 0013, 0046)
+
+### Replication
+- A mirror copies a block by a `PUT` of the same bytes to another relay. It never re-mines, re-signs or
+  alters a block. A block below the target's `min_pow_difficulty` is skipped for that target and
+  counted; it is not an error of the source. (ADR 0045)
+- When `D_NET` is raised, clients mine at the new value from its announcement and relays raise their
+  floor at its effective date. Blocks mined earlier stay where they are held. (ADR 0045)
 
 ### Admission control
 - Every request has a cost bounded by constants and settings: time, memory and index work.
