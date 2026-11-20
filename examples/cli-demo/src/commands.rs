@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sbtp_core::layout::{MAX_BLOCK_LEN, MAX_PAYLOAD_LEN};
 use sbtp_core::{
-    BlockBuilder, BlockId, BlockRef, BuildError, DEFAULT_MAX_ATTEMPTS, mine, sign_block,
+    BlockBuilder, BlockId, BlockRef, BuildError, default_max_attempts, mine, sign_block,
     validate_requested, validate_submitted,
 };
 
@@ -98,7 +98,8 @@ pub fn mine_block(args: &[OsString]) -> Result<(), Fail> {
     let budget = if difficulty > 26 {
         u64::MAX
     } else {
-        DEFAULT_MAX_ATTEMPTS
+        // The default budget is in hashed bytes, so large blocks get fewer attempts (same time bound).
+        default_max_attempts(block.len())
     };
     let (nonce, id) = mine(&mut block, difficulty, budget).map_err(build_fail)?;
     let elapsed = started.elapsed();
@@ -564,7 +565,7 @@ mod tests {
             .payload(b"hello")
             .build_unsigned()
             .unwrap();
-        let (_, id) = mine(&mut block, 8, DEFAULT_MAX_ATTEMPTS).unwrap();
+        let (_, id) = mine(&mut block, 8, sbtp_core::DEFAULT_MAX_ATTEMPTS).unwrap();
         assert_eq!(sign_block(&mut block, &key).unwrap(), id);
         let parsed = sbtp_core::parse(&block).unwrap();
         assert_eq!(parsed.payload(), b"hello");
