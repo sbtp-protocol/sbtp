@@ -5,12 +5,13 @@
 //! bounds of ADR 0018, error mapping, `GET /sbtp/v1/info` and CORS; logger and counters of ADR 0021;
 //! block store (one shard level, ADR 0025), `PUT /sbtp/v1/block`, `GET /sbtp/v1/block/{block_id}`
 //! and `GET /sbtp/v1/query` with index epochs (ADR 0024); dedicated index threads (ADR 0018 rules
-//! 9 to 13) and the `query` token bucket (rule 21).
+//! 9 to 13) and the `query` token bucket (rule 21); the age-based sweeper ([`sweep`], ADR 0013
+//! rule 15) and the re-acceptance of expired blocks (ADR 0043).
 //!
 //! Nothing writes to standard output or standard error outside [`log`] (ADR 0021 rule 1); the two
 //! lints below keep `print!`-style macros out.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
-// TODO(1c): `block` and `put` token buckets, eviction, disk watermark, `/metrics`.
+// TODO(1c): disk watermark, `/metrics`.
 
 pub mod api;
 pub mod blocks;
@@ -26,6 +27,7 @@ pub mod pool;
 pub mod query;
 pub mod server;
 pub mod store;
+pub mod sweep;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -162,11 +164,9 @@ where
         });
     let served = match opened {
         Ok(store) => {
-            let app = api::app(
-                &settings,
-                Arc::new(Relay::new(&settings, store, pool.handle())),
-            );
-            serve(&settings, app, shutdown, on_listen)
+            let relay = Arc::new(Relay::new(&settings, store, pool.handle()));
+            let app = api::app(&settings, Arc::clone(&relay));
+            serve(&settings, app, relay, shutdown, on_listen)
         }
         Err(e) => Err(e),
     };
@@ -258,10 +258,14 @@ fn log_settings(settings: &Settings) -> Result<(), StartError> {
 }
 
 /// Builds the runtime (ADR 0018 rule 19: explicit `worker_threads` and `max_blocking_threads`),
-/// installs the shutdown signal, binds and serves.
+/// installs the shutdown signal, binds and serves. The sweeper ([`sweep::run`]) runs beside the
+/// accept loop; if it ends while the relay serves (a run panicked), the process exits like a
+/// supervised index thread (ADR 0018 rule 37). On shutdown it is stopped and its current run, if
+/// any, is waited for, before the index threads stop.
 fn serve<S, T>(
     settings: &Settings,
     app: axum::Router,
+    relay: Arc<Relay<RedbIndex>>,
     shutdown: S,
     on_listen: impl FnOnce(SocketAddr),
 ) -> Result<(), StartError>
@@ -296,9 +300,24 @@ where
         let addr = local.to_string();
         log::emit(Event::Listening, &[("addr", Value::Str(&addr))]);
         on_listen(local);
-        server::serve(listener, app, limits, shutdown)
-            .await
-            .map_err(|e| StartError::Io("serving", e))
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let mut sweeper = tokio::spawn(sweep::run(
+            relay,
+            std::time::Duration::from_millis(settings.sweep_interval_ms),
+            usize::try_from(settings.sweep_batch).unwrap_or(index::MAX_QUERY_LIMIT),
+            stopped,
+        ));
+        let served = tokio::select! {
+            r = server::serve(listener, app, limits, shutdown) => r,
+            _ = &mut sweeper => {
+                log::emit(Event::Fatal, &[("msg", Value::Str("the sweeper ended"))]);
+                log::flush();
+                std::process::exit(pool::EXIT_THREAD_ENDED);
+            }
+        };
+        let _ = stop.send(true);
+        let _ = sweeper.await;
+        served.map_err(|e| StartError::Io("serving", e))
     })
 }
 

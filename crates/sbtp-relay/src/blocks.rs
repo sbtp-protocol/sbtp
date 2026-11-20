@@ -2,7 +2,7 @@
 //! ADR 0007, ADR 0008, ADR 0013 rules 7 to 9 and 18 to 21, ADR 0018 rules 18, 28 to 32, ADR 0023).
 
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -20,10 +20,11 @@ use crate::cache::BlockCache;
 use crate::client::Counts;
 use crate::config::Settings;
 use crate::error::ApiError;
-use crate::index::{FileState, IndexBackend};
+use crate::index::{FileState, IndexBackend, Position};
 use crate::log::{self, Event, Level, Throttle, Value};
 use crate::metrics::{self, Accepted, Damage, Refused, StorageFull, StoreOp};
 use crate::pool::{IndexHandle, PoolError};
+use crate::query::expiry_floor;
 use crate::server::RequestClient;
 use crate::store::{self, Cause, Quarantine, Store, StoreError, Stored, full_validation};
 
@@ -79,7 +80,7 @@ impl Class {
 
 /// Stripes of the per-`block_id` lock of the `PUT` pipeline. More than the largest sensible
 /// `put_max_in_flight`, so that two different blocks rarely share one.
-const ID_STRIPES: usize = 64;
+pub(crate) const ID_STRIPES: usize = 64;
 
 /// The shared state of the block routes. `I` is the index backend (ADR 0013, "Index trait").
 pub struct Relay<I> {
@@ -92,6 +93,21 @@ pub struct Relay<I> {
     /// a repair (ADR 0013 rule 9) never indexes a block whose creator is about to index it with
     /// [`FileState::Created`], which would move its position (rule 6).
     ids: [Mutex<()>; ID_STRIPES],
+    /// Per stripe, incremented under the stripe's lock each time a block of the stripe gets a new
+    /// acceptance: a new file (`201`, or a damaged file replaced) or a re-acceptance of an expired
+    /// block (ADR 0043 rule 3). The sweeper compares it with the value it read before listing a
+    /// batch, and looks the block up again before deleting anything when it moved (ADR 0043 rule
+    /// 4; see [`crate::sweep`]).
+    accepted: [AtomicU64; ID_STRIPES],
+    /// Per stripe, incremented by the sweeper after it deletes a block file. A `GET` miss that
+    /// read the file before the deletion drops the cache entry it inserted when this moved during
+    /// its read, so that a swept block is not kept in the cache ([`Relay::cache_loaded`]).
+    evicted: [AtomicU64; ID_STRIPES],
+    /// ADR 0013 rule 12, ADR 0019 rule 6: `None` when eviction by age is disabled.
+    block_ttl_ms: Option<u64>,
+    /// The relay clock in Unix milliseconds ([`log::unix_ms`]; a test clock in tests): P1,
+    /// `received_at`, the expiry of a stored block, the sweeper and `/query`.
+    clock: fn() -> u64,
     put: Class,
     put_per_client: Arc<Counts>,
     read: Class,
@@ -111,6 +127,10 @@ impl<I: IndexBackend + 'static> Relay<I> {
             index,
             cache: BlockCache::new(usize::try_from(s.block_cache_bytes).unwrap_or(usize::MAX)),
             ids: [const { Mutex::new(()) }; ID_STRIPES],
+            accepted: [const { AtomicU64::new(0) }; ID_STRIPES],
+            evicted: [const { AtomicU64::new(0) }; ID_STRIPES],
+            block_ttl_ms: s.block_ttl_ms,
+            clock: log::unix_ms,
             put: Class::new(
                 s.put_max_in_flight,
                 s.put_max_queue,
@@ -133,15 +153,97 @@ impl<I: IndexBackend + 'static> Relay<I> {
         }
     }
 
+    /// Replaces the relay clock (tests: a controllable clock instead of [`log::unix_ms`]). The
+    /// `/query` route built by [`crate::api::routes`] uses the same clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The relay clock.
+    #[must_use]
+    pub fn clock(&self) -> fn() -> u64 {
+        self.clock
+    }
+
     /// The index handle, for the `/query` route.
     #[must_use]
     pub fn index(&self) -> &IndexHandle<I> {
         &self.index
     }
 
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub(crate) fn block_ttl_ms(&self) -> Option<u64> {
+        self.block_ttl_ms
+    }
+
+    /// The acceptance generation of every stripe, for the sweeper (see `accepted`).
+    pub(crate) fn accepted_generations(&self) -> [u64; ID_STRIPES] {
+        let mut out = [0; ID_STRIPES];
+        for (o, a) in out.iter_mut().zip(&self.accepted) {
+            *o = a.load(Ordering::SeqCst);
+        }
+        out
+    }
+
+    /// The acceptance generation of `id`'s stripe.
+    pub(crate) fn accepted_generation(&self, id: &BlockId) -> u64 {
+        self.accepted
+            .get(stripe(id))
+            .map_or(0, |a| a.load(Ordering::SeqCst))
+    }
+
+    /// Records a new acceptance of `id`. Called under the lock of `id`.
+    fn bump_accepted(&self, id: &BlockId) {
+        if let Some(a) = self.accepted.get(stripe(id)) {
+            a.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn evicted_generation(&self, id: &BlockId) -> u64 {
+        self.evicted
+            .get(stripe(id))
+            .map_or(0, |a| a.load(Ordering::SeqCst))
+    }
+
+    /// The sweeper's deletion of one block, under the lock of `id` (ADR 0013 rule 15, first two
+    /// steps): the cache entry, the file, then the cache entry again, so that a `GET` miss that
+    /// read the file before the `unlink` cannot leave it cached ([`Relay::cache_loaded`]).
+    /// Returns whether a file was there.
+    pub(crate) fn evict_locked(&self, id: &BlockId) -> io::Result<bool> {
+        self.cache.remove(id);
+        let deleted = self.store.evict(id)?;
+        if let Some(a) = self.evicted.get(stripe(id)) {
+            a.fetch_add(1, Ordering::SeqCst);
+        }
+        self.cache.remove(id);
+        Ok(deleted)
+    }
+
+    /// Caches the bytes of `id` that a `GET` miss loaded, unless the sweeper deleted a file of the
+    /// stripe since `before` ([`Relay::evicted_generation`] read before the load): then the entry
+    /// is dropped again. Either the sweeper's second cache removal comes after this insert, or its
+    /// increment is visible here.
+    fn cache_loaded(&self, id: &BlockId, bytes: Bytes, before: u64) {
+        self.cache.insert(id, bytes);
+        if self.evicted_generation(id) != before {
+            self.cache.remove(id);
+        }
+    }
+
+    /// Whether position `at` is expired at the relay clock (ADR 0013 rule 12: `received_at +
+    /// block_ttl_ms ≤ now`, the bound of `/query`, [`expiry_floor`]).
+    pub(crate) fn is_expired(&self, at: Position) -> bool {
+        self.block_ttl_ms.is_some() && at < expiry_floor(self.block_ttl_ms, (self.clock)())
+    }
+
     /// The lock of `id`'s stripe. A panic under it leaves no state to repair: poisoning is
     /// ignored.
-    fn lock_id(&self, id: &BlockId) -> MutexGuard<'_, ()> {
+    pub(crate) fn lock_id(&self, id: &BlockId) -> MutexGuard<'_, ()> {
         // The stripe is taken modulo the array length: the fallback is never used.
         let [first, ..] = &self.ids;
         self.ids
@@ -175,7 +277,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
         // spec §2.2 F1 to F9.
         let block = sbtp_core::parse(bytes).map_err(Rejection::Block)?;
         // P1 (ADR 0007 rules 3 and 8): after F9, before C1; the sum saturates.
-        if block.timestamp() > log::unix_ms().saturating_add(self.max_future_ms) {
+        if block.timestamp() > (self.clock)().saturating_add(self.max_future_ms) {
             return Err(Rejection::Future);
         }
         // spec §2.2 C1; computes the `block_id`.
@@ -188,6 +290,12 @@ impl<I: IndexBackend + 'static> Relay<I> {
         let mut verified = None;
         let replaced = match self.settle(&id, &block, checked, &mut verified)? {
             Settled::Known => return Ok(Accepted::Known),
+            // ADR 0043 rule 3: an expired block is not held; the file is kept, the block gets a
+            // new position. No quota check: nothing is written to the store.
+            Settled::Reaccept => {
+                self.bump_accepted(&id);
+                return self.index_new(&id, &block);
+            }
             Settled::Create { replaced } => replaced,
         };
         // C2, C3 (ADR 0023 rule 8.6: the normal create path).
@@ -197,43 +305,21 @@ impl<I: IndexBackend + 'static> Relay<I> {
         };
         match self.store.write_new(&valid) {
             Ok(Stored::Created) if replaced => {
+                self.bump_accepted(&id);
                 // ADR 0023 rule 8.7: the `block_id` was already accepted by this relay; an
-                // existing index entry is kept, a missing one is added as an orphan. `200`.
+                // existing index entry is kept, a missing one is added as an orphan. `200`. An
+                // expired entry is not a holding (ADR 0043 rule 3): the block is new, `201`.
                 metrics::store_replaced();
-                if self.unindexed(&id) {
-                    self.index_orphan(&id, &block);
-                } else {
-                    self.store.publish_gauges();
+                match self.held(&id) {
+                    Held::Unindexed => self.index_orphan(&id, &block),
+                    Held::Expired => return self.index_new(&id, &block),
+                    Held::Live | Held::Unknown => self.store.publish_gauges(),
                 }
                 Ok(Accepted::Known)
             }
             Ok(Stored::Created) => {
-                let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-                let inserted = self.insert(&id, len, block.parents(), FileState::Created);
-                self.store.publish_gauges();
-                // ADR 0018 rule 13: the writer queue is bounded by the `PUT` permits; a refusal
-                // leaves an orphan, repaired by the next `PUT` of the block or at start-up.
-                let inserted = inserted.map_err(Rejection::Shed)?;
-                if let Err(e) = inserted {
-                    // An orphan: repaired by the next `PUT` of the block or at start-up (rule 9).
-                    index_write_failed::<I>(&e, None);
-                    // Security review I-3 and L-1: no room for the index entry is a full store.
-                    if let Some(r) = I::io_error(&e).and_then(store::no_space) {
-                        return Err(Rejection::Full(r));
-                    }
-                    return Err(Rejection::Internal);
-                }
-                if log::global().enabled(Level::Debug) {
-                    let hex = store::hex(&id);
-                    log::emit(
-                        Event::BlockStored,
-                        &[
-                            ("block", Value::Str(suffix(&hex))),
-                            ("bytes", Value::Int(u64::from(len))),
-                        ],
-                    );
-                }
-                Ok(Accepted::New)
+                self.bump_accepted(&id);
+                self.index_new(&id, &block)
             }
             // A file appeared under the final name since the lookup (ADR 0008 rule 6). It is
             // indexed only if it holds the bytes just verified (ADR 0023 rule 15).
@@ -259,6 +345,38 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 Err(Rejection::Internal)
             }
         }
+    }
+
+    /// The index entries of a block that is new for the relay (`201`): a new file, or an expired
+    /// block whose file is kept (ADR 0043 rule 3). [`FileState::Created`] replaces any older entry
+    /// of `id` (ADR 0013 rule 13). Under the lock of `id`.
+    fn index_new(&self, id: &BlockId, block: &BlockRef<'_>) -> Result<Accepted, Rejection> {
+        let len = u32::try_from(block.as_bytes().len()).unwrap_or(u32::MAX);
+        let inserted = self.insert(id, len, block.parents(), FileState::Created);
+        self.store.publish_gauges();
+        // ADR 0018 rule 13: the writer queue is bounded by the `PUT` permits; a refusal leaves an
+        // orphan, repaired by the next `PUT` of the block or at start-up.
+        let inserted = inserted.map_err(Rejection::Shed)?;
+        if let Err(e) = inserted {
+            // An orphan: repaired by the next `PUT` of the block or at start-up (rule 9).
+            index_write_failed::<I>(&e, None);
+            // Security review I-3 and L-1: no room for the index entry is a full store.
+            if let Some(r) = I::io_error(&e).and_then(store::no_space) {
+                return Err(Rejection::Full(r));
+            }
+            return Err(Rejection::Internal);
+        }
+        if log::global().enabled(Level::Debug) {
+            let hex = store::hex(id);
+            log::emit(
+                Event::BlockStored,
+                &[
+                    ("block", Value::Str(suffix(&hex))),
+                    ("bytes", Value::Int(u64::from(len))),
+                ],
+            );
+        }
+        Ok(Accepted::New)
     }
 
     /// ADR 0023 rule 8, steps 1 to 5, under the lock of `id`: decides from the stored file
@@ -294,26 +412,35 @@ impl<I: IndexBackend + 'static> Relay<I> {
             // Rule 8.2, ADR 0003 rule 10: the signature check MAY be skipped only for identical
             // bytes. An orphan is indexed only after full validation (ADR 0023 rule 15).
             if stored == block.as_bytes() {
-                if self.unindexed(id) {
+                let held = self.held(id);
+                if matches!(held, Held::Unindexed | Held::Expired) {
                     // C2, C3 of the submitted bytes, which are the stored bytes; R1 holds since
-                    // C1 computed `id` from them.
+                    // C1 computed `id` from them. A re-acceptance (ADR 0043 rule 3) is a `201`:
+                    // its bytes are verified as for a new block.
                     if let Err(rejected) = verify_once(checked, verified) {
                         // Owner decision (security review I-6): the stored file fails C2 or C3;
                         // it is moved to quarantine and the `PUT` gets the signature failure.
                         self.quarantine_identical(id, &stored);
                         return Err(rejected);
                     }
-                    self.index_orphan(id, block);
+                }
+                match held {
+                    Held::Unindexed => self.index_orphan(id, block),
+                    Held::Expired => return Ok(Settled::Reaccept),
+                    Held::Live | Held::Unknown => {}
                 }
                 return Ok(Settled::Known);
             }
             // Rule 8.3: the submitted bytes first, so that only a key holder reaches a second
             // verification.
             verify_once(checked, verified)?;
-            // Rule 8.4: a stored file that passes full validation is kept (first write wins).
+            // Rule 8.4: a stored file that passes full validation is kept (first write wins),
+            // also when it is expired: ADR 0043 rule 3 lets the relay keep the file it holds.
             let Err(damage) = full_validation(&stored, id) else {
-                if self.unindexed(id) {
-                    self.index_orphan(id, block);
+                match self.held(id) {
+                    Held::Unindexed => self.index_orphan(id, block),
+                    Held::Expired => return Ok(Settled::Reaccept),
+                    Held::Live | Held::Unknown => {}
                 }
                 return Ok(Settled::Known);
             };
@@ -371,20 +498,30 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// lookup is `index_write_failed` with `op=insert`, `step=lookup`, not `index_read_failed`
     /// (ADR 0021 clarification X2).
     fn unindexed(&self, id: &BlockId) -> bool {
+        matches!(self.held(id), Held::Unindexed)
+    }
+
+    /// The index entry of `id`, judged at the relay clock (see [`Relay::unindexed`] for the
+    /// failure cases, which are [`Held::Unknown`] and leave the `PUT` at `200` as before). An
+    /// entry whose position is expired is [`Held::Expired`]: the block is not held for `PUT`,
+    /// whether or not the sweeper has deleted it yet (ADR 0043 rule 3).
+    fn held(&self, id: &BlockId) -> Held {
         let id = *id;
         let found = self.index.read_blocking(move |i| i.contains(&id));
         if let Ok(r) = &found {
             self.index.record_read(r); // ADR 0018 rule 37
         }
         match found {
-            Ok(Ok(found)) => found.is_none(),
+            Ok(Ok(None)) => Held::Unindexed,
+            Ok(Ok(Some(at))) if self.is_expired(at) => Held::Expired,
+            Ok(Ok(Some(_))) => Held::Live,
             Ok(Err(e)) => {
                 index_write_failed::<I>(&e, Some("lookup"));
-                false
+                Held::Unknown
             }
             Err(_) => {
                 metrics::index_repair_deferred();
-                false
+                Held::Unknown
             }
         }
     }
@@ -401,10 +538,10 @@ impl<I: IndexBackend + 'static> Relay<I> {
         parents: &[BlockId],
         state: FileState,
     ) -> Result<Result<Option<crate::index::Position>, I::Error>, Refused> {
-        let (id, parents) = (*id, parents.to_vec());
+        let (id, parents, clock) = (*id, parents.to_vec(), self.clock);
         let inserted = self
             .index
-            .write_blocking(move |i| i.insert(&id, len, &parents, log::unix_ms(), state))
+            .write_blocking(move |i| i.insert(&id, len, &parents, clock(), state))
             .map_err(|_: PoolError| Refused::IndexQueue);
         if let Ok(r) = &inserted {
             self.index.record_write(r); // ADR 0018 rule 37
@@ -466,10 +603,25 @@ impl<I: IndexBackend + 'static> Relay<I> {
     }
 }
 
+/// The index entry of a stored block, at the relay clock.
+enum Held {
+    /// No entry: an orphan (ADR 0013 rule 9).
+    Unindexed,
+    /// An entry that has not expired.
+    Live,
+    /// An entry whose position is expired (ADR 0043 rule 3).
+    Expired,
+    /// The lookup failed or was refused; handled as [`Held::Live`].
+    Unknown,
+}
+
 /// What the stored file of a `PUT` decided (ADR 0023 rule 8).
 enum Settled {
     /// `200`, nothing more to write.
     Known,
+    /// The stored file is valid but its entry is expired: `201`, a new position, the file kept
+    /// (ADR 0043 rule 3).
+    Reaccept,
     /// The create path; `replaced` when a damaged file was moved out of the final name.
     Create { replaced: bool },
 }
@@ -511,7 +663,7 @@ fn index_write_failed<I: IndexBackend>(e: &I::Error, step: Option<&'static str>)
 /// The stripe of `id`'s lock: its last byte, the shard byte (ADR 0009), which PoW does not touch.
 /// The leading bytes are forced to zero by C1 (spec §3.3) and would put every block on one stripe
 /// (security review M-1).
-fn stripe(id: &BlockId) -> usize {
+pub(crate) fn stripe(id: &BlockId) -> usize {
     let [.., last] = *id.as_bytes();
     usize::from(last) % ID_STRIPES
 }
@@ -670,6 +822,8 @@ pub async fn get_block<I: IndexBackend + 'static>(
         Ok(p) => p,
         Err(r) => return relay.shed(r, None),
     };
+    // Read before the file is: see `Relay::cache_loaded`.
+    let evicted = relay.evicted_generation(&id);
     let worker = Arc::clone(&relay);
     let loaded = tokio::task::spawn_blocking(move || {
         let _owned = permit;
@@ -678,7 +832,7 @@ pub async fn get_block<I: IndexBackend + 'static>(
     .await;
     match loaded {
         Ok(Ok(Some(bytes))) => {
-            relay.cache.insert(&id, bytes.clone());
+            relay.cache_loaded(&id, bytes.clone(), evicted);
             block_response(bytes, &id, &headers)
         }
         Ok(Ok(None)) => ApiError::not_found().into_response(),

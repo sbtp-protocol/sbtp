@@ -153,7 +153,7 @@ impl AcceptClass {
 pub enum IndexOp {
     /// An insert (the `PUT` handler and the reconciliation).
     Insert,
-    /// A removal (HOOK(1c-b): the sweeper).
+    /// A removal (the sweeper).
     Remove,
     /// A durable commit.
     Flush,
@@ -264,9 +264,18 @@ static STORE_REPLACED: AtomicU64 = AtomicU64::new(0);
 static INDEX_REPAIRS_DEFERRED: AtomicU64 = AtomicU64::new(0);
 /// `quarantine_files` gauge (ADR 0023 rule 14), set by the store.
 static QUARANTINE_FILES: AtomicU64 = AtomicU64::new(0);
-// HOOK(1c-b): `storage_full_total` reasons `disk`, `inodes`, `read_only`; `sweeps_total`, `sweep_removed_blocks_total`,
-// `sweep_duration_ms_total`, `sweep_last_duration_ms`, `index_bytes`, `store_bytes`,
-// `store_max_bytes`, `disk_free_bytes`, `disk_state`, `build_info`; `log_lines_total{level}` and
+/// `sweeps_total`, `sweep_removed_blocks_total`, `sweep_duration_ms_total` (ADR 0021 rule 41).
+static SWEEPS: AtomicU64 = AtomicU64::new(0);
+static SWEEP_REMOVED: AtomicU64 = AtomicU64::new(0);
+static SWEEP_DURATION_MS: AtomicU64 = AtomicU64::new(0);
+/// `sweep_last_duration_ms` gauge.
+static SWEEP_LAST_DURATION_MS: AtomicU64 = AtomicU64::new(0);
+/// `sweep_failures_total`: runs that stopped on an error (`sweep_failed`, or `index_write_failed`
+/// with `op=remove`). Not in the table of rule 41, added so that a failing sweeper shows in the
+/// counters, not only in throttled lines.
+static SWEEP_FAILURES: AtomicU64 = AtomicU64::new(0);
+// HOOK(1c-b): `storage_full_total` reasons `disk`, `inodes`, `read_only`; `store_max_bytes`,
+// `disk_free_bytes`, `disk_state`, `build_info`; `log_lines_total{level}` and
 // `log_lines_dropped_total{event, cause}` (kept by the logger, `log::Logger::dropped`).
 
 /// The `error` label values of `blocks_rejected_total`: the block rejection names of ADR 0012
@@ -512,6 +521,29 @@ pub fn store_errors_total(op: StoreOp) -> u64 {
     STORE_ERRORS.get(op as usize).map_or(0, |n| n.load(Relaxed))
 }
 
+/// Counts one sweeper run that removed `removed` index entries in `duration_ms`.
+pub fn sweep_done(removed: u64, duration_ms: u64) {
+    SWEEPS.fetch_add(1, Relaxed);
+    SWEEP_REMOVED.fetch_add(removed, Relaxed);
+    SWEEP_DURATION_MS.fetch_add(duration_ms, Relaxed);
+    SWEEP_LAST_DURATION_MS.store(duration_ms, Relaxed);
+}
+
+/// Counts a sweeper run that stopped on an error.
+pub fn sweep_failed() {
+    SWEEP_FAILURES.fetch_add(1, Relaxed);
+}
+
+/// `(sweeps_total, sweep_removed_blocks_total, sweep_failures_total)` since start-up.
+#[must_use]
+pub fn sweep_totals() -> (u64, u64, u64) {
+    (
+        SWEEPS.load(Relaxed),
+        SWEEP_REMOVED.load(Relaxed),
+        SWEEP_FAILURES.load(Relaxed),
+    )
+}
+
 /// Counts a panic: once, by the `500` path for a caught request panic, by the panic hook for
 /// any other.
 pub fn panicked() {
@@ -599,6 +631,9 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("store_quarantined", sum(&STORE_QUARANTINED)),
         ("store_replaced", STORE_REPLACED.load(Relaxed)),
         ("quarantine_files", QUARANTINE_FILES.load(Relaxed)),
+        ("sweeps", SWEEPS.load(Relaxed)),
+        ("sweep_removed", SWEEP_REMOVED.load(Relaxed)),
+        ("sweep_failures", SWEEP_FAILURES.load(Relaxed)),
         // HOOK(1c-b): `disk_free_bytes`, `disk_state`.
         ("accept_errors", sum(&ACCEPT_ERRORS)),
         ("index_write_errors", sum(&INDEX_WRITE_ERRORS)),

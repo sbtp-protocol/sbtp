@@ -223,9 +223,11 @@ pub fn decode_cursor(s: &str, epoch: u64) -> Result<Position, QueryError> {
 
 /// ADR 0013 rules 12 and 14: the first position that is not expired at `now_ms`. A block expires
 /// when `received_at + block_ttl_ms ≤ now`, so the first live position has
-/// `received_at = now − block_ttl_ms + 1`. Without eviction by age nothing expires.
-// HOOK(1c-b): the sweeper uses the same bound, and the benchmark-only expiry bound `B` of ADR 0017
-// rule 4 replaces `now − block_ttl_ms` here (first live position `B + 1`).
+/// `received_at = now − block_ttl_ms + 1`. Without eviction by age nothing expires. The sweeper
+/// (`sweep::list`) and the `PUT` path (`blocks::Relay::is_expired`, ADR 0043 rule 3) use the same
+/// bound.
+// HOOK(1c-b): the benchmark-only expiry bound `B` of ADR 0017 rule 4 replaces `now − block_ttl_ms`
+// here (first live position `B + 1`). Not implemented.
 #[must_use]
 pub fn expiry_floor(block_ttl_ms: Option<u64>, now_ms: u64) -> Position {
     match block_ttl_ms.and_then(|ttl| now_ms.checked_sub(ttl)) {
@@ -270,6 +272,13 @@ impl<I: IndexBackend + 'static> QueryState<I> {
             retry_after_s: s.shed_retry_after_s,
             clock: log::unix_ms,
         }
+    }
+
+    /// Replaces the clock of the expiry bound (the relay clock, `blocks::Relay::clock`).
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
     }
 }
 

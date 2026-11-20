@@ -220,7 +220,8 @@ fn phase_main(phase: &str, ds: &Path, work: &Path) -> R<()> {
                 if batch.is_empty() {
                     break;
                 }
-                removed += idx.remove(&batch)? as u64;
+                let positions: Vec<Position> = batch.iter().map(|(p, _)| *p).collect();
+                removed += idx.remove(&positions)? as u64;
             }
             let left = idx.len()?;
             let errors =

@@ -725,7 +725,11 @@ impl IndexBackend for Recording {
     fn query(&self, p: Option<&BlockId>, from: Position, n: usize) -> Result<Page, IndexError> {
         self.inner.query(p, from, n)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.inner.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {
@@ -835,7 +839,11 @@ impl IndexBackend for FullIndex {
     ) -> Result<Page, IndexError> {
         self.inner.query(parent, from, limit)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.inner.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {

@@ -93,8 +93,9 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "TimestampTooFarInFuture")
     }
 
-    /// `507 StorageFull` (ADR 0013 rule 19). No `Retry-After` in milestone 1b.
-    // HOOK(1c-b): `Retry-After` when `block_ttl_ms` is set (rule 19 MAY), with the sweeper.
+    /// `507 StorageFull` (ADR 0013 rule 19). No `Retry-After`, also with eviction by age: ADR
+    /// 0023 rule 18 (accepted) keeps the `MAY` of rule 19 for other implementations, not this one,
+    /// since the relay cannot predict when room frees.
     #[must_use]
     pub fn storage_full() -> Self {
         Self::new(StatusCode::INSUFFICIENT_STORAGE, "StorageFull")

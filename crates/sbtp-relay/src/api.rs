@@ -36,7 +36,9 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
     let info = Bytes::from(info_body(settings));
     let queries = Router::new()
         .route("/sbtp/v1/query", get(query::<I>))
-        .with_state(Arc::new(QueryState::new(settings, relay.index().clone())));
+        .with_state(Arc::new(
+            QueryState::new(settings, relay.index().clone()).with_clock(relay.clock()),
+        ));
     let blocks = Router::new()
         .route("/sbtp/v1/block", put(put_block::<I>))
         .route("/sbtp/v1/block/{id}", get(get_block::<I>))

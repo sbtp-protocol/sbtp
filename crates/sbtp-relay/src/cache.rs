@@ -101,6 +101,15 @@ impl BlockCache {
         lru.entries.insert(*id.as_bytes(), (bytes, tick));
     }
 
+    /// Drops the entry of `id`, if any (the sweeper, ADR 0013 rule 15).
+    pub fn remove(&self, id: &BlockId) {
+        let mut lru = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((old, used)) = lru.entries.remove(id.as_bytes()) {
+            lru.order.remove(&used);
+            lru.bytes -= charge(old.len());
+        }
+    }
+
     /// Heap bytes charged (block lengths plus [`ENTRY_OVERHEAD`] per entry).
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -137,6 +146,10 @@ mod tests {
         assert!(c.get(&id(5)).is_none(), "larger than the cache");
         c.insert(&id(1), Bytes::from(vec![1; 100])); // replace, not duplicate
         assert_eq!(c.bytes(), 250 + 2 * o);
+        c.remove(&id(1));
+        c.remove(&id(1));
+        assert!(c.get(&id(1)).is_none());
+        assert_eq!(c.bytes(), 150 + o, "a removal returns its charge, once");
     }
 
     /// Security review L-2: many small blocks cannot hold more heap than the bound says.

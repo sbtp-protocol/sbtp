@@ -57,7 +57,11 @@ impl IndexBackend for CorruptQueries {
     fn query(&self, _: Option<&BlockId>, _: Position, _: usize) -> Result<Page, IndexError> {
         Err(IndexError::CorruptRow)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.0.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {

@@ -843,7 +843,11 @@ impl IndexBackend for SlowIndex {
     ) -> Result<Page, IndexError> {
         self.inner.query(parent, from, limit)
     }
-    fn expired(&self, before: Position, max: usize) -> Result<Vec<Position>, IndexError> {
+    fn expired(
+        &self,
+        before: Position,
+        max: usize,
+    ) -> Result<Vec<(Position, BlockId)>, IndexError> {
         self.inner.expired(before, max)
     }
     fn remove(&self, positions: &[Position]) -> Result<usize, IndexError> {
