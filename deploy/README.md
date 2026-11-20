@@ -164,8 +164,9 @@ SBTP_RELAY_DOMAIN=relay.example.org caddy run --config deploy/Caddyfile
   trusts Caddy on loopback.
 - The DNS record of the domain points at the VM and ports 80 and 443 are open: Caddy obtains the
   certificate itself (automatic HTTPS).
-- Only `/sbtp/v1/*` is proxied; any other path gets `404` from Caddy. No access log is configured,
-  so Caddy keeps no client addresses.
+- Only `/sbtp/v1/*` is proxied; any other path gets `404` from Caddy. No access log is configured
+  (Caddy writes none unless a `log` directive asks for one); see "Logs and client addresses" for
+  what Caddy's runtime log can still hold and how to log safely if you need access logs.
 - Limits, against the relay's defaults:
 
   | Caddy | Value | Relay |
@@ -237,6 +238,70 @@ documentation and source read through Context7 on 2026-11-20):
   - No challenge, Bot Fight Mode or "Under Attack" rule on `/sbtp/v1/*` (add a WAF skip rule for
     that path): their HTML challenge pages can exceed the 16,384-byte error-body ceiling.
   - Cache rule "bypass" on `/sbtp/v1/*`, explicitly.
+
+## Logs and client addresses
+
+The relay and the proxy in front of it keep different things. An IP address is personal data in
+most jurisdictions; the reverse proxy is the one place where addresses are logged at all (ADR 0021
+"Client identity"), so its retention is the operator's decision.
+
+What the relay logs (ADR 0021 rules 10 to 15), on standard error only:
+
+- Never, at any level or setting: a client IP address or a prefix of one, a value of
+  `X-Forwarded-For` or of any other request header, a request path as received or a query string,
+  a cursor, any byte of a block, a public key or a signature. Call sites pass only values the relay
+  produced from fixed sets (counts, sizes, durations, statuses, error names, route templates,
+  `errno`).
+- At start-up: the settings (including `trusted_proxies`, which are proxy addresses the operator
+  chose), the data directory and the relay's own listen address. No client is involved.
+- No per-request line at the default level `info` (rule 40). At `debug` (a start-up warning says
+  so) one `request` line per request with the route template, method, status and duration, and the
+  last 8 hexadecimal characters of a `block_id` on `block_stored` and `block_rejected`: still no
+  address.
+- `log_client_tag = "keyed"` (off by default, with a start-up warning) adds a `client` field: 8
+  hexadecimal characters of a BLAKE3 keyed hash of the client key, with a key drawn at start and
+  kept in memory only. Lines of one run can be linked; nothing can be turned back into an address
+  or linked across restarts.
+
+The relay's own lines therefore hold no client address. Their retention is the log sink's
+(journald, Docker's log driver, the cluster's log collector): it SHOULD NOT exceed `block_ttl_ms`
+(30 days by default, rule 15), so that logs do not outlive the blocks they mention.
+
+What a reverse proxy logs, and what to do about it:
+
+- **Caddy.** No access log unless a site has a `log` directive; the shipped `Caddyfile` has none.
+  Caddy's runtime log (standard error) still holds error entries, and an entry about a failed
+  request (for example the relay being down) can carry the request with `remote_ip`, `client_ip`
+  and its headers. Keep that sink's retention short. If you need access logs, drop the addresses or
+  mask them, and bound the retention:
+
+  ```caddyfile
+  log {
+  	output file /var/log/caddy/sbtp-relay.log {
+  		# 7 days; Caddy's default is 2160h (90 days).
+  		roll_keep_for 168h
+  	}
+  	format filter {
+  		request>remote_ip delete
+  		request>client_ip delete
+  		request>headers>X-Forwarded-For delete
+  		request>headers>Cf-Connecting-Ip delete
+  	}
+  }
+  ```
+
+  To keep coarse ranges for abuse handling instead, replace `delete` on the two address fields with
+  `ip_mask 16 32` (16 bits of IPv4, 32 bits of IPv6). A /24 or a /48 still often designates one
+  person or household: prefer `delete` unless you act on ranges.
+- **Traefik.** Access logs are off by default (`accessLog` disabled). If you enable them, set
+  `accesslog.fields.names.ClientAddr=drop`, `accesslog.fields.names.ClientHost=drop` and
+  `accesslog.fields.names.ClientPort=drop`; header fields are dropped by default
+  (`accesslog.fields.headers.defaultmode=drop`), keep it so. Bound the retention in the log
+  collector.
+- **Cloudflare** or another CDN keeps its own request logs under its own retention; that is a term of
+  the CDN account, outside this configuration.
+
+Recommended retention for any log that holds client addresses: none, or at most 7 days.
 
 ## Data directory
 

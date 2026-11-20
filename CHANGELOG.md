@@ -59,6 +59,9 @@ Initial public version. Pre-release software: no version is supported for produc
 - `sbtp-relay`: `GET /sbtp/v1/block/{block_id}` sends `ETag: "<block_id>"` and answers a matching
   `If-None-Match` (a list, a weak tag or `*`) with `304 Not Modified`, for a block it holds. Spec §4
   gains the corresponding `MAY`.
+- `deploy/`: what the relay and its reverse proxy log about clients, recommended retention (none, or
+  at most 7 days, for any log that holds addresses), and how to drop or mask addresses in Caddy and
+  Traefik access logs.
 
 ### Security
 
