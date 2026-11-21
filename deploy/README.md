@@ -392,7 +392,7 @@ deny_file = "/etc/sbtp-relay/deny.txt"
   - A CDN keeps `200` responses up to a year: purge `/sbtp/v1/block/<block_id>` from it after each
     new block entry. For a key entry, purge each held block of that key. A command that lists
     them is not part of this version yet, and once a key entry is loaded the relay hides its
-    blocks from `/query` and answers `451`, so the list MUST be collected **before** the key takes
+    blocks from `/query` and answers `451`, so the list must be collected **before** the key takes
     effect:
     1. Load the key with `hide` first if you intend `purge` (a `purge` entry deletes the local
        bytes, so nothing would be left to inspect). Or collect the list before loading the entry
