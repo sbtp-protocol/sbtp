@@ -374,7 +374,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   per-parent cursor to a relay without `read_api` ≥ 2. The bounds of these routes (256 identifiers,
   1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051)
 - `deny_list`: boolean; `true` when the relay applies a deny list of its operator, whatever its
-  entries. A client MUST read an absent member as `false`. (ADR 0052)
+  entries. A relay without a deny list omits the member. A client MUST read an absent member as
+  `false`. (ADR 0052, clarification L2)
 - `subscribe`: object `{ "versions": [1], "max_subscriptions": n, "tick_ms": t }`, present when the
   relay serves `GET /sbtp/v1/subscribe`. `max_subscriptions` from 1 to 64, `tick_ms` from 5,000 to
   120,000. A client MUST read an absent or malformed member as "no subscriptions" and MUST NOT open the
@@ -434,7 +435,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   - `head`: always present, a cursor for the gap after the newest position held when the response was
     built. `asc` from `head` returns exactly the matching blocks stored since. (ADR 0051)
   - An empty `desc` page returns as `cursor` the gap it started from: the cursor sent, or `head` when
-    the request had no cursor for that listing. (ADR 0051, clarification B4)
+    the request had no cursor for that listing, unless the page is empty only because its entries
+    were denied (see below). (ADR 0051, clarification B4)
 - With two or more `parent`, the body is `{ "parents": [ {"parent", "block_ids", "cursor", "more"} … ],
   "head" }`, one entry per requested parent in request order, each with the meaning of a single-parent
   response. A grouped request is one index read. (ADR 0051)
@@ -449,7 +451,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
   NOT answer `404`.
 - A relay MUST NOT list a block it denies by `block_id`. A block denied by its public key MAY be
   listed until the relay has marked it, and gets `451` on a fetch. A page MAY hold fewer than `limit`
-  identifiers, and `more` MAY be `true` when only denied blocks remain. (ADR 0052)
+  identifiers, and `more` MAY be `true` when only denied blocks remain. A page whose entries were all
+  denied returns the cursor of the entries it read (with `desc`, the gap before the oldest), not the
+  gap it started from, so that a walk always advances. (ADR 0052, clarification L1)
 - To read all children of a block, a client repeats the request with the returned `cursor` until `more`
   is `false`. Repeating it later returns the children stored since. A client MUST deduplicate by
   `block_id` and MUST fetch and validate each block (§3.4); the fetch can return `404`.

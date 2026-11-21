@@ -5,7 +5,8 @@
   `fields=parents` refused with `parent` for now; gateway newest first by ingestion order. A
   non-normative section "Fast first catch-up" is added at acceptance; it adds no rule
 - Amended by: 0052 (rule 2: a denied block is a `length = 0` record; such a record alone never triggers
-  a re-submission)
+  a re-submission); 0052 clarification L1, accepted 2026-11-21 (clarification B4: a page whose entries were all denied
+  returns the cursor of the entries it read, not the gap it started from)
 - Date: 2026-11-21
 - Questions: Q-23 (requirements recorded, rule 30; not decided); Q-64 (partially resolved: omission,
   rules 36 to 38); opens Q-74, Q-75, Q-76 and Q-77
@@ -523,7 +524,9 @@ rule from review findings M-1 and L-2. B9 is a deployment rule. They are applied
 - **B4. Empty `desc` page (rule 16).** A `desc` page with no entry returns as its `cursor` the gap it
   started from: the cursor sent (per-parent or shared), or `head` when the request had no cursor for
   that listing. The cursor of an empty page is never absent and never moves the walk: an `asc`
-  request from it lists the matching blocks after that gap (rule 16).
+  request from it lists the matching blocks after that gap (rule 16). A page that read entries and
+  had all of them removed by a deny list is not an empty page in this sense: it returns the cursor of
+  the entries it read (ADR 0052 clarification L1, accepted 2026-11-21).
 - **B5. Failed records (rules 2, 3 and 5).** The first record decides the status: when it cannot be
   read, the relay answers as `GET /block` would (`503` when its block readers are busy, `500` on an
   I/O error), with no batch body. A later record that cannot be read (I/O error, read refused under

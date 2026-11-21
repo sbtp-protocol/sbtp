@@ -19,6 +19,9 @@
   the subscription term, 415,744 bytes on `small`, is added when `ws_enabled` is `true`; the `small`
   bound with every function on is 19,425,202 bytes, 574,798 bytes under 20,000,000; the default bound
   is unchanged, 14,910,996 bytes)
+- Clarification: 2026-11-21, editorial: the body of rule 3, item 2 now states the current total
+  (19,425,202 bytes with every function on) and the history of the figure, as recorded by ADR 0050
+  U3, ADR 0052 rule 21 and ADR 0054 rule 35. No figure changes
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)
@@ -103,10 +106,14 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
       to the bound of ADR 0018 rule 35 only when the function is on. With the default settings every
       function of this ADR and of ADR 0050 is off, and the 15 MB target of ADR 0019 rule 39 applies:
       14,910,996 bytes computed with ADR 0049. With every function on, the computed `small` bound is
-      18,681,778 bytes: the default bound, plus server TLS (ADR 0028 rule 36, 2,228,224), replication
-      (rule 16, 723,077) and ADR 0050 rule 27 (819,481, the root store counted once). The 1,318,222 bytes
-      under 20,000,000 are what later functions have (updated by ADR 0050 U3; was 18,188,451 bytes,
-      326,154 for ADR 0050 and 1,811,549 bytes of margin); each later ADR states its terms and the new total.
+      19,425,202 bytes: the default bound, plus server TLS (ADR 0028 rule 36, 2,228,224), replication
+      (rule 16, 723,077, the root store included), ADR 0050 rule 27 (819,481: the archive copy's
+      651,284 and the read-through's 168,197; the root store counted once, in replication), the deny
+      list of ADR 0052 rule 21 (327,680) and the subscriptions of ADR 0054 rule 35 (415,744). The
+      574,798 bytes under 20,000,000 are what later functions have; each later ADR states its terms and
+      the new total. History of this figure: 18,188,451 bytes (1,811,549 of margin) with this ADR and
+      ADR 0050 as accepted; 18,681,778 (1,318,222) after ADR 0050 U3; 19,009,458 (990,542) after
+      ADR 0052; 19,425,202 (574,798) after ADR 0054.
       The 60-second `VmHWM` runs replace the estimates. The packaged unit keeps `MemoryMax=128M` for
       `small` (ADR 0019 rule 37).
 
