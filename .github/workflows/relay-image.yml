@@ -124,6 +124,11 @@ jobs:
             exit 1
           fi
 
+      # ADR 0048 budget: the published image stays under 5,000,000 bytes compressed, checked from
+      # its layers before anything is pushed.
+      - name: Image size budget
+        run: sh deploy/image-size.sh sbtp-relay:smoke 5000000
+
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:

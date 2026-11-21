@@ -189,6 +189,10 @@ events! {
     // Security review 2026-11-21, I-4 (owner decision, ADR 0046 clarification): the progress of
     // the start-up migration of the demand tables, before the relay listens.
     DemandMigration => "demand_migration", Info, Startup;
+    // ADR 0049 rule 16 (adds two rows to rule 7; the ADR names them without a table, the levels
+    // are this implementation's).
+    IngestCapped => "ingest_capped", Warn, Bounded;
+    IngestCapEnded => "ingest_cap_ended", Info, Bounded;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1152,6 +1156,14 @@ mod tests {
         // Security review 2026-11-21, I-4: named by the ADR 0046 clarification written alongside
         // this change; checked against the ADR text once it is merged.
         table.push(("demand_migration", "info"));
+        // ADR 0049 rule 16 names two events without a level table: each must appear there.
+        let adr0049 =
+            include_str!("../../../docs/decisions/0049-ingest-bounds-against-disk-filling.md");
+        let ingest = [("ingest_capped", "warn"), ("ingest_cap_ended", "info")];
+        for (name, _) in ingest {
+            assert!(adr0049.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&ingest);
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))

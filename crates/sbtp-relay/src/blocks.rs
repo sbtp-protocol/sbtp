@@ -24,6 +24,7 @@ use crate::config::Settings;
 use crate::demand::{Demand, epoch_start};
 use crate::error::ApiError;
 use crate::index::{FileState, IndexBackend, Position};
+use crate::ingest::{Ingest, Ticket};
 use crate::log::{self, Event, Level, Throttle, Value};
 use crate::metrics::{self, Accepted, Damage, Refused, StorageFull, StoreOp};
 use crate::pool::{IndexHandle, PoolError};
@@ -132,9 +133,14 @@ pub struct Relay<I> {
     /// ADR 0046 rule 8: `Retry-After` of a `507` above the high-water mark, `sweep_interval_ms`
     /// in seconds rounded up.
     sweep_retry_after_s: u64,
+    /// ADR 0049: the byte budgets per network group and the global cap under disk pressure.
+    ingest: Ingest,
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Tests: run by [`Relay::evict_locked`] right after each file deletion, under the lock.
+    #[cfg(test)]
+    after_evict: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl<I: IndexBackend + 'static> Relay<I> {
@@ -142,7 +148,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
     ///
     /// # Errors
     ///
-    /// The demand set of ADR 0046 rule 25 could not be allocated.
+    /// The demand set of ADR 0046 rule 25 or the group table of ADR 0049 rule 5 could not be
+    /// allocated.
     pub fn new(s: &Settings, store: Store, index: IndexHandle<I>) -> Result<Self, TryReserveError> {
         let queue = Duration::from_millis(s.queue_timeout_ms);
         let demand = Demand::new(s)?;
@@ -181,8 +188,11 @@ impl<I: IndexBackend + 'static> Relay<I> {
             high_water_pct: s.demand_high_water_pct,
             low_water_pct: s.demand_low_water_pct,
             sweep_retry_after_s: s.sweep_interval_ms.div_ceil(1_000),
+            ingest: Ingest::from_settings(s)?,
             #[cfg(test)]
             before_insert: Mutex::new(None),
+            #[cfg(test)]
+            after_evict: Mutex::new(None),
         })
     }
 
@@ -231,12 +241,34 @@ impl<I: IndexBackend + 'static> Relay<I> {
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
+    /// Tests: `f` runs inside every later [`Relay::evict_locked`], right after the file deletion.
+    #[cfg(test)]
+    pub(crate) fn set_after_evict(&self, f: impl FnMut() + Send + 'static) {
+        *self
+            .after_evict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
+    }
+
     /// Replaces the relay clock (tests: a controllable clock instead of [`log::unix_ms`]). The
     /// `/query` route built by [`crate::api::routes`] uses the same clock.
     #[must_use]
     pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Replaces the monotonic clock of the ingest buckets of ADR 0049 (tests).
+    #[must_use]
+    pub fn with_ingest_clock(mut self, clock: fn() -> u64) -> Self {
+        self.ingest = self.ingest.with_clock(clock);
+        self
+    }
+
+    /// The ingest bounds (ADR 0049).
+    #[must_use]
+    pub fn ingest(&self) -> &Ingest {
+        &self.ingest
     }
 
     /// The relay clock.
@@ -292,10 +324,19 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// The sweeper's deletion of one block, under the lock of `id` (ADR 0013 rule 15, first two
     /// steps): the cache entry, the file, then the cache entry again, so that a `GET` miss that
     /// read the file before the `unlink` cannot leave it cached ([`Relay::cache_loaded`]).
-    /// Returns whether a file was there.
-    pub(crate) fn evict_locked(&self, id: &BlockId) -> io::Result<bool> {
+    /// Returns the quota bytes released, or `None` when no file was there ([`Store::evict`]).
+    pub(crate) fn evict_locked(&self, id: &BlockId) -> io::Result<Option<u64>> {
         self.cache.remove(id);
         let deleted = self.store.evict(id)?;
+        #[cfg(test)]
+        if let Some(f) = self
+            .after_evict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            f();
+        }
         if let Some(a) = self.evicted.get(stripe(id)) {
             a.fetch_add(1, Ordering::SeqCst);
         }
@@ -351,8 +392,14 @@ impl<I: IndexBackend + 'static> Relay<I> {
     }
 
     /// Steps 1 to 5 of the `PUT` pipeline (spec §4), on a blocking thread. `seen` receives the
-    /// `block_id` once C1 has computed it.
-    fn process(&self, bytes: &[u8], seen: &mut Option<BlockId>) -> Result<Accepted, Rejection> {
+    /// `block_id` once C1 has computed it. `ticket` is what the block is charged to once stored
+    /// as new (ADR 0049 rules 3 and 6).
+    fn process(
+        &self,
+        bytes: &[u8],
+        seen: &mut Option<BlockId>,
+        ticket: &Ticket,
+    ) -> Result<Accepted, Rejection> {
         // spec §2.2 F1 to F9.
         let block = sbtp_core::parse(bytes).map_err(Rejection::Block)?;
         // P1 (ADR 0007 rules 3 and 8): after F9, before C1; the sum saturates.
@@ -365,7 +412,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
         *seen = Some(id);
         // Held until the index insert: one `PUT` of a given block at a time.
         let _id = self.lock_id(&id);
-        let result = self.decide(bytes, id, &block, checked);
+        let result = self.decide(bytes, id, &block, checked, ticket);
+        // ADR 0049 rules 3 and 6: a block stored as new is charged once, under the lock of `id`,
+        // the bytes it adds to the stored total (its quota cost, ADR 0025).
+        if matches!(result, Ok(Accepted::New)) {
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.ingest.charge(ticket, store::cost(len));
+        }
         // ADR 0046 rules 10 and 14: a `PUT` answered `200` is a demand of the block. A `201`
         // records its demand in its index insert.
         if matches!(result, Ok(Accepted::Known)) {
@@ -381,16 +434,28 @@ impl<I: IndexBackend + 'static> Relay<I> {
         id: BlockId,
         block: &BlockRef<'a>,
         checked: PowChecked<'a, Submitted>,
+        ticket: &Ticket,
     ) -> Result<Accepted, Rejection> {
         // C2 and C3 of the submitted bytes, run at most once.
         let mut verified = None;
         let replaced = match self.settle(&id, block, checked, &mut verified)? {
             Settled::Known => return Ok(Accepted::Known),
             // ADR 0043 rule 3: an expired block is not held; the file is kept, the block gets a
-            // new position. No quota check: nothing is written to the store.
-            Settled::Reaccept => return self.index_new(&id, block),
+            // new position. No quota check: nothing is written to the store. ADR 0049 rule 8: it
+            // is a new block for the global cap.
+            Settled::Reaccept => {
+                self.check_cap(ticket)?;
+                return self.index_new(&id, block);
+            }
             Settled::Create { replaced } => replaced,
         };
+        // ADR 0049 rule 6: a block that would be stored as new, after validation (C1 here, C2
+        // and C3 just below, before anything is written) and after the held check. A damaged
+        // file being replaced (ADR 0023 rule 8.7) belongs to a block this relay accepted before:
+        // it is not refused by the cap, and is charged only if it ends as a `201`.
+        if !replaced {
+            self.check_cap(ticket)?;
+        }
         // C2, C3 (ADR 0023 rule 8.6: the normal create path).
         verify_once(checked, &mut verified)?;
         let Some(valid) = verified else {
@@ -437,6 +502,18 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 Err(Rejection::Internal)
             }
         }
+    }
+
+    /// ADR 0049 rule 6: the global cap, checked against the stored total and the low-water mark
+    /// (the same total and mark as demand eviction, ADR 0046 rule 5).
+    fn check_cap(&self, ticket: &Ticket) -> Result<(), Rejection> {
+        if !self.ingest.enabled() {
+            return Ok(());
+        }
+        let (_, low) = self.watermarks();
+        self.ingest
+            .check_cap(ticket, self.store.admission_total(), low)
+            .map_err(Rejection::Capped)
     }
 
     /// The index entries of a block that is new for the relay (`201`): a new file, or an expired
@@ -784,6 +861,8 @@ enum Rejection {
     Full(StorageFull),
     /// `503`: an index queue refused the job (ADR 0018 rules 13 and 30).
     Shed(Refused),
+    /// `503`: the global cap of ADR 0049 rule 6, with its `Retry-After` in seconds.
+    Capped(u64),
     Internal,
 }
 
@@ -823,6 +902,10 @@ impl<I: IndexBackend + 'static> Relay<I> {
             Rejection::Internal => return ApiError::internal().into_response(),
             // ADR 0018 rule 30 and clarification M4: counted, logged, `shed_retry_after_s`.
             Rejection::Shed(r) => return self.shed(r, key),
+            // ADR 0049 rule 6: counted and logged by `Ingest::check_cap`.
+            Rejection::Capped(retry_after_s) => {
+                return ApiError::unavailable(retry_after_s).into_response();
+            }
         };
         if e.status() != StatusCode::INTERNAL_SERVER_ERROR {
             metrics::rejected(e.name());
@@ -865,6 +948,25 @@ pub async fn put_block<I: IndexBackend + 'static>(
             return ApiError::rate_limited(1).into_response();
         }
     }
+    // ADR 0049 rules 1 to 5: the byte budgets of the request's network groups, before the body
+    // is read and before a `PUT` permit is taken. Only the requests of that group are refused.
+    let ticket = match relay.ingest.check_groups(key) {
+        Ok(t) => t,
+        Err(limited) => {
+            static GROUP_LOG: Throttle = Throttle::new();
+            // No client and no network in the line (rule 16).
+            log::throttled(
+                &GROUP_LOG,
+                Event::RateLimited,
+                &[
+                    ("class", Value::Str("ingest_group")),
+                    ("level", Value::Str(limited.level.name())),
+                ],
+                None,
+            );
+            return ApiError::rate_limited(limited.retry_after_s).into_response();
+        }
+    };
     let permit = match relay.put.acquire().await {
         Ok(p) => p,
         Err(r) => return relay.shed(r, key.as_ref()),
@@ -877,7 +979,7 @@ pub async fn put_block<I: IndexBackend + 'static>(
     let done = tokio::task::spawn_blocking(move || {
         let _owned = (permit, slot);
         let mut id = None;
-        let result = worker.process(&bytes, &mut id);
+        let result = worker.process(&bytes, &mut id, &ticket);
         (result, id.as_ref().map(store::hex))
     })
     .await;
