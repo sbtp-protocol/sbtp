@@ -40,6 +40,10 @@ Initial public version. Pre-release software: no version is supported for produc
   resource limits and admission control, structured logs and metrics, store integrity checks;
   distroless container image and reverse-proxy guidance in `deploy/`.
 - `sbtp-l2`: validation of the layer 2 grammar.
+- `sbtp-seal`: sealed envelope of the layer 2 grammar (`l2-grammar.md` §5): HPKE base mode seal and open
+  (single-shot, X25519/HKDF-SHA256/ChaCha20Poly1305), padding to the fixed buckets, strict inner
+  signature, directory and application tags; `no_std` + `alloc`, `wasm32`. Security review:
+  `docs/security/2026-11-21-sbtp-seal.md` (mergeable; L-2 fixed, other low and info findings tracked).
 - `sbtp-relay`, ADR 0051 stage 1 (read API for large graphs): `POST /sbtp/v1/blocks`, a batch read
   of 1 to 256 raw identifiers (body of at most 8,192 bytes with `Content-Length`; chunked or
   unannounced bodies get `400` and the connection closed), answered `no-store` with one
