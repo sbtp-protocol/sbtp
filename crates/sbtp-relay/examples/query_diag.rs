@@ -413,6 +413,7 @@ impl IndexBackend for MemIndex {
         Ok(QueryAnswer {
             pages,
             head: Position::default(),
+            denied: (0, 0),
         })
     }
 

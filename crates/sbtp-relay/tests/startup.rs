@@ -825,7 +825,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 86, "one line per setting");
+    assert_eq!(lines.len(), 89, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1365,6 +1365,13 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
         &[("MIRROR_ENDPOINT", "")],
         4 * 155_909 + 4 * 64 * 96 + 64 * 48,
     ),
+    // ADR 0052 rule 21: `2 × deny_max_entries × 80`, only when `deny_file` is set.
+    (
+        "deny list",
+        &[("DENY_FILE", "/etc/sbtp-relay/deny.txt")],
+        &[("DENY_FILE", "")],
+        2 * 2_048 * 80,
+    ),
 ];
 
 /// ADR 0048 budget: `small` with every function of [`FUNCTIONS`] on stays under 20,000,000 bytes,
@@ -1384,6 +1391,15 @@ fn small_profile_with_every_function_is_under_20_mb() {
         .collect();
     let all = load(&[], &on).unwrap().memory_bound_bytes();
     assert!(all < 20_000_000, "{all}");
+    // ADR 0052 rule 21: the figure of the ADR, 19,009,458 bytes, with every function compiled
+    // in. It also counts two terms of functions this relay does not have yet: server TLS (ADR
+    // 0028 rule 36) and the read-through of ADR 0050 rules 15 to 19 (its share of rule 27 when
+    // replication is on).
+    if cfg!(feature = "object-store") {
+        const SERVER_TLS: u64 = 2_228_224;
+        const READ_THROUGH: u64 = 168_197;
+        assert_eq!(all + SERVER_TLS + READ_THROUGH, 19_009_458);
+    }
     for (name, _, off, share) in functions {
         let mut without = on.clone();
         without.extend_from_slice(off);

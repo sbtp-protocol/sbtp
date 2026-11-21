@@ -547,6 +547,11 @@ impl<I: IndexBackend<Error = IndexError> + CursorStore + 'static> Shared<I> {
             Replicated::New => metrics::stored(peer),
             Replicated::Known => metrics::skipped(peer, Skip::Held),
             Replicated::Future => metrics::skipped(peer, Skip::Future),
+            // ADR 0052 rule 17: discarded after validation, never stored.
+            Replicated::Denied(m) => {
+                crate::metrics::denied(crate::metrics::DenyRoute::Replication, m.is_key(), 1);
+                metrics::skipped(peer, Skip::Denied);
+            }
             Replicated::Invalid => {
                 metrics::skipped(peer, Skip::Invalid);
                 return Fetched::Invalid;

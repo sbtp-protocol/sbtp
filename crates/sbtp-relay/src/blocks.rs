@@ -22,11 +22,12 @@ use crate::cache::BlockCache;
 use crate::client::Counts;
 use crate::config::Settings;
 use crate::demand::{Demand, epoch_start};
+use crate::deny::{Deny, Match, pubkey_of};
 use crate::error::ApiError;
 use crate::index::{FileState, IndexBackend, Position};
 use crate::ingest::{Ingest, Ticket};
 use crate::log::{self, Event, Level, Throttle, Value};
-use crate::metrics::{self, Accepted, Damage, Refused, StorageFull, StoreOp};
+use crate::metrics::{self, Accepted, Damage, DenyRoute, Refused, StorageFull, StoreOp};
 use crate::pool::{IndexHandle, PoolError};
 use crate::query::expiry_floor;
 use crate::server::RequestClient;
@@ -135,6 +136,8 @@ pub struct Relay<I> {
     sweep_retry_after_s: u64,
     /// ADR 0049: the byte budgets per network group and the global cap under disk pressure.
     ingest: Ingest,
+    /// ADR 0052: the operator deny list, off unless [`Relay::with_deny`] sets one.
+    deny: Arc<Deny>,
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -189,6 +192,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
             low_water_pct: s.demand_low_water_pct,
             sweep_retry_after_s: s.sweep_interval_ms.div_ceil(1_000),
             ingest: Ingest::from_settings(s)?,
+            deny: Arc::new(Deny::off()),
             #[cfg(test)]
             before_insert: Mutex::new(None),
             #[cfg(test)]
@@ -269,6 +273,25 @@ impl<I: IndexBackend + 'static> Relay<I> {
     #[must_use]
     pub fn ingest(&self) -> &Ingest {
         &self.ingest
+    }
+
+    /// Applies the operator deny list `deny` (ADR 0052), loaded by [`Deny::open`].
+    #[must_use]
+    pub fn with_deny(mut self, deny: Arc<Deny>) -> Self {
+        self.deny = deny;
+        self
+    }
+
+    /// The operator deny list (ADR 0052).
+    #[must_use]
+    pub fn deny(&self) -> &Deny {
+        &self.deny
+    }
+
+    /// The operator deny list, shared (ADR 0052).
+    #[must_use]
+    pub fn deny_arc(&self) -> &Arc<Deny> {
+        &self.deny
     }
 
     /// The relay clock.
@@ -422,6 +445,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
             }));
         }
         *seen = Some(id);
+        // spec §4 `PUT` step 5, ADR 0052 rule 7: after C3, before storage, whether or not the
+        // block is held. C2 and C3 run first, so that only a holder of a validly signed block
+        // learns of the denial; a block that fails them gets their answer.
+        if let Some(m) = self.deny.check(&id, Some(block.pubkey())) {
+            checked.verify_signature().map_err(Rejection::Block)?;
+            return Err(Rejection::Denied(m));
+        }
         // Held until the index insert: one `PUT` of a given block at a time.
         let _id = self.lock_id(&id);
         let result = self.decide(bytes, id, &block, checked, ticket);
@@ -465,6 +495,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
             Ok(Err(Rejection::Block(_))) => Replicated::Invalid,
             Ok(Err(Rejection::Future)) => Replicated::Future,
             Ok(Err(Rejection::Full(_))) => Replicated::Full,
+            Ok(Err(Rejection::Denied(m))) => Replicated::Denied(m),
             // `Capped` never comes with `Ticket::Replicated` (ADR 0049 rule 9).
             Ok(Err(Rejection::Shed(_) | Rejection::Capped(_))) => Replicated::Busy,
             Ok(Err(Rejection::Internal)) | Err(_) => Replicated::Internal,
@@ -924,6 +955,8 @@ pub(crate) enum Replicated {
     Future,
     /// No room (`507` for a `PUT`).
     Full,
+    /// The operator denies the block (`451` for a `PUT`, ADR 0052 rule 17).
+    Denied(Match),
     /// No `PUT` permit within `queue_timeout_ms`, or the index writer refused the job.
     Busy,
     /// A local storage or index failure.
@@ -938,6 +971,8 @@ enum Rejection {
     Shed(Refused),
     /// `503`: the global cap of ADR 0049 rule 6, with its `Retry-After` in seconds.
     Capped(u64),
+    /// `451`: the operator denies the block (spec §4 `PUT` step 5, ADR 0052 rule 7).
+    Denied(Match),
     Internal,
 }
 
@@ -980,6 +1015,16 @@ impl<I: IndexBackend + 'static> Relay<I> {
             // ADR 0049 rule 6: counted and logged by `Ingest::check_cap`.
             Rejection::Capped(retry_after_s) => {
                 return ApiError::unavailable(retry_after_s).into_response();
+            }
+            // ADR 0052 rules 7 and 20: `DeniedKey` only when the key is listed and the
+            // `block_id` is not; counted, never logged.
+            Rejection::Denied(m) => {
+                metrics::denied(DenyRoute::Put, m.is_key(), 1);
+                let e = match m {
+                    Match::Block => ApiError::denied(),
+                    Match::Key => ApiError::denied_key(),
+                };
+                return e.into_response();
             }
         };
         if e.status() != StatusCode::INTERNAL_SERVER_ERROR {
@@ -1113,6 +1158,13 @@ pub async fn get_block<I: IndexBackend + 'static>(
     match Arc::clone(&relay).fetch(id).await {
         Fetched::Served(bytes) => relay.block_response(bytes, &id, &headers),
         Fetched::Missing => ApiError::not_found().into_response(),
+        // ADR 0052 rules 6 and 20: before any `304`, whatever `If-None-Match` or
+        // `Sbtp-Replication`; the same answer for a match by block or by key; counted, not
+        // logged, not demand (rule 15).
+        Fetched::Denied(m) => {
+            metrics::denied(DenyRoute::Get, m.is_key(), 1);
+            ApiError::denied().into_response()
+        }
         Fetched::Busy(r) => relay.shed(r, None),
         Fetched::Failed => ApiError::internal().into_response(),
     }
@@ -1131,6 +1183,8 @@ pub(crate) enum Fetched {
     Busy(Refused),
     /// An I/O error while reading, or a failed blocking task: `500`.
     Failed,
+    /// The operator denies the block (ADR 0052 rule 6): `451`, `length = 0` in a batch.
+    Denied(Match),
 }
 
 /// The outcome of [`Relay::read_for_copy`].
@@ -1151,8 +1205,25 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// The read path of `GET /block` without its response (ADR 0023 rules 10 and 11): a cache hit
     /// takes no permit and verifies nothing; a miss takes a block-read permit, in which the file
     /// is read and fully validated as one job of the blocking threads, and is cached.
+    ///
+    /// ADR 0052 rule 6: a block whose `block_id` is listed is denied before any read, held or
+    /// not, cached or not; a block whose key is listed is denied once its bytes are read, and a
+    /// miss is then not cached.
     pub(crate) async fn fetch(self: Arc<Self>, id: BlockId) -> Fetched {
+        let deny = self.deny.list();
+        if deny.as_ref().is_some_and(|l| l.denies_id(&id)) {
+            return Fetched::Denied(Match::Block);
+        }
+        let by_key = |bytes: &Bytes| {
+            deny.as_ref()
+                .filter(|l| l.has_keys())
+                .and_then(|l| pubkey_of(bytes).filter(|k| l.denies_key(k)))
+                .is_some()
+        };
         if let Some(bytes) = self.cache.get(&id) {
+            if by_key(&bytes) {
+                return Fetched::Denied(Match::Key);
+            }
             return Fetched::Served(bytes);
         }
         let permit = match self.read.acquire().await {
@@ -1168,6 +1239,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
         })
         .await;
         match loaded {
+            Ok(Ok(Loaded::Bytes(bytes))) if by_key(&bytes) => Fetched::Denied(Match::Key),
             Ok(Ok(Loaded::Bytes(bytes))) => {
                 self.cache_loaded(&id, bytes.clone(), evicted);
                 Fetched::Served(bytes)

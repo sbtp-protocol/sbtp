@@ -7,7 +7,9 @@
 //! - `edges`: (parent, position) → child `block_id`;
 //! - `demand`: position → `last_demand` (ADR 0046 rule 26), the start of the demand epoch in which
 //!   the block was last demanded;
-//! - `demand_order`: (`last_demand`, position) → `()`, the order of demand eviction (rule 6).
+//! - `demand_order`: (`last_demand`, position) → `()`, the order of demand eviction (rule 6);
+//! - `denied`: `block_id` → public key, the marks of the deny list's marking pass (ADR 0052
+//!   rule 9), removed with the block's `ids` entry.
 //!
 //! The two demand tables are written in the transaction that writes the other entries of a block
 //! and removed with them. An index written before ADR 0046 gets them at the first start
@@ -64,6 +66,7 @@ const EDGES: TableDefinition<(&Id, u64, u32), &Id> = TableDefinition::new("edges
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const DEMAND: TableDefinition<(u64, u32), u64> = TableDefinition::new("demand");
 const DEMAND_ORDER: TableDefinition<(u64, u64, u32), ()> = TableDefinition::new("demand_order");
+const DENIED: TableDefinition<&Id, &Id> = TableDefinition::new("denied");
 const EPOCH_KEY: &str = "epoch";
 /// `1` once every block has its demand entries (ADR 0046 implementation plan, step 2).
 const DEMAND_KEY: &str = "demand";
@@ -236,6 +239,10 @@ pub struct QueryPlan {
     /// `fields=parents`: fill [`Page::fields`] for the listing of every block (ADR 0051 rule
     /// 14: never with a parent).
     pub fields: bool,
+    /// ADR 0052 rule 9: the deny list in force. A listed `block_id`, or a block marked with a
+    /// listed key, is left out of its page after the walk, so that the page's cursor and `more`
+    /// are those of the walk and the work stays `O(log n + limit)`.
+    pub deny: Option<std::sync::Arc<crate::deny::List>>,
 }
 
 /// The answer to a [`QueryPlan`]: one page per listing, in order, and `head`.
@@ -246,6 +253,9 @@ pub struct QueryAnswer {
     /// ADR 0051 rule 18: the gap after the newest position the index held in this read
     /// transaction (any parent); `Position::default()` when it held none.
     pub head: Position,
+    /// ADR 0052 rule 20: the identifiers left out by [`QueryPlan::deny`], by `block_id` and by
+    /// key.
+    pub denied: (u64, u64),
 }
 
 /// Index errors: redb errors, plus a stored row that does not decode (corrupt index).
@@ -395,6 +405,7 @@ pub trait IndexBackend: Send + Sync + Sized {
             lower: from,
             limit,
             fields: false,
+            deny: None,
         };
         Ok(self.read_query(&plan)?.pages.pop().unwrap_or_default())
     }
@@ -435,6 +446,17 @@ pub trait IndexBackend: Send + Sync + Sized {
     ///
     /// Backend errors.
     fn len(&self) -> Result<u64, Self::Error>;
+
+    /// ADR 0052 rule 9: marks each indexed block of `marks` as signed by its denied key, in one
+    /// transaction; a block that is not indexed is skipped. Returns the number marked. None by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn mark_denied(&self, _marks: &[(BlockId, [u8; 32])]) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
 
     /// ADR 0046, at start-up before the index is shared: sets the demand epoch `epoch_ms` used to
     /// quantise `last_demand` on insert, and gives demand entries to every block that has none
@@ -567,6 +589,7 @@ impl IndexBackend for RedbIndex {
             txn.open_table(EDGES)?;
             txn.open_table(DEMAND)?;
             txn.open_table(DEMAND_ORDER)?;
+            txn.open_table(DENIED)?;
             let blocks = txn.open_table(BLOCKS)?;
             let last = blocks.last()?.map(|(k, _)| Position::from_key(k.value()));
             // A new index has nothing to migrate.
@@ -750,6 +773,16 @@ impl IndexBackend for RedbIndex {
             Position::from_key(k.value()).next()
         });
         let mut edges = None;
+        // ADR 0052 rule 9: the marks are read only when a key is listed and a mark exists.
+        let deny = plan.deny.as_deref().filter(|l| !l.is_empty());
+        let marks = match deny {
+            Some(l) if l.has_keys() => {
+                let t = txn.open_table(DENIED)?;
+                if t.is_empty()? { None } else { Some(t) }
+            }
+            _ => None,
+        };
+        let mut denied = (0u64, 0u64);
         let mut pages = Vec::with_capacity(plan.listings.len());
         for listing in &plan.listings {
             // ADR 0051 rules 16 and 17: `asc` reads forward from the later of the lower bound
@@ -808,6 +841,9 @@ impl IndexBackend for RedbIndex {
                 (true, Some((p, _))) => *p,
                 (true, None) => upper,
             };
+            if let Some(list) = deny {
+                drop_denied(list, marks.as_ref(), &mut entries, &mut fields, &mut denied)?;
+            }
             pages.push(Page {
                 entries,
                 next,
@@ -815,7 +851,11 @@ impl IndexBackend for RedbIndex {
                 fields,
             });
         }
-        Ok(QueryAnswer { pages, head })
+        Ok(QueryAnswer {
+            pages,
+            head,
+            denied,
+        })
     }
 
     /// Up to `max` positions strictly before `before`, oldest first (sweeper, rule 15).
@@ -874,6 +914,32 @@ impl IndexBackend for RedbIndex {
     fn len(&self) -> Result<u64, IndexError> {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(BLOCKS)?.len()?)
+    }
+
+    /// ADR 0052 rule 9, in one transaction with the writer's durability.
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    fn mark_denied(&self, marks: &[(BlockId, [u8; 32])]) -> Result<u64, IndexError> {
+        let _w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = self.db.begin_write()?;
+        let mut marked = 0;
+        {
+            let ids = txn.open_table(IDS)?;
+            let mut denied = txn.open_table(DENIED)?;
+            for (id, key) in marks {
+                if ids.get(id.as_bytes())?.is_some() {
+                    denied.insert(id.as_bytes(), key)?;
+                    marked += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(marked)
     }
 
     /// Sets `E`, then, unless `meta` says it is done, gives demand entries to every block that has
@@ -1200,6 +1266,7 @@ struct Tables<'t> {
     edges: Table<'t, (&'static Id, u64, u32), &'static Id>,
     demand: Table<'t, (u64, u32), u64>,
     order: Table<'t, (u64, u64, u32), ()>,
+    denied: Table<'t, &'static Id, &'static Id>,
 }
 
 impl<'t> Tables<'t> {
@@ -1210,6 +1277,7 @@ impl<'t> Tables<'t> {
             edges: txn.open_table(EDGES)?,
             demand: txn.open_table(DEMAND)?,
             order: txn.open_table(DEMAND_ORDER)?,
+            denied: txn.open_table(DENIED)?,
         })
     }
 
@@ -1265,9 +1333,43 @@ impl<'t> Tables<'t> {
         }
         if self.ids.get(&id)?.map(|g| g.value()) == Some(pos.key()) {
             self.ids.remove(&id)?;
+            // ADR 0052 rule 9: a mark goes with the block.
+            self.denied.remove(&id)?;
         }
         Ok(true)
     }
+}
+
+/// ADR 0052 rule 9: removes from a walked page the entries `list` denies, by `block_id` or by
+/// the key of their mark, and the aligned `fields`; counts them in `denied` (by id, by key).
+fn drop_denied(
+    list: &crate::deny::List,
+    marks: Option<&redb::ReadOnlyTable<&'static Id, &'static Id>>,
+    entries: &mut Vec<(Position, BlockId)>,
+    fields: &mut Vec<EntryFields>,
+    denied: &mut (u64, u64),
+) -> Result<(), IndexError> {
+    let mut keep = Vec::with_capacity(entries.len());
+    for (_, id) in entries.iter() {
+        let key = match marks {
+            Some(t) => t.get(id.as_bytes())?.map(|g| *g.value()),
+            None => None,
+        };
+        let m = list.check(id, key.as_ref());
+        match m {
+            Some(crate::deny::Match::Block) => denied.0 += 1,
+            Some(crate::deny::Match::Key) => denied.1 += 1,
+            None => {}
+        }
+        keep.push(m.is_none());
+    }
+    let mut k = keep.iter();
+    entries.retain(|_| k.next().copied().unwrap_or(true));
+    if !fields.is_empty() {
+        let mut k = keep.iter();
+        fields.retain(|_| k.next().copied().unwrap_or(true));
+    }
+    Ok(())
 }
 
 /// One `demand_migration` line (security review 2026-11-21, I-4): `phase`, then `fields`.
@@ -1483,6 +1585,7 @@ mod tests {
             lower,
             limit,
             fields: false,
+            deny: None,
         };
         let read = |p: &QueryPlan| idx.read_query(p).unwrap();
         let a = read(&plan(None, Order::Desc, None, Position::default(), 3));

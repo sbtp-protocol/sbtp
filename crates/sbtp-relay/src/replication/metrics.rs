@@ -20,16 +20,19 @@ pub enum Skip {
     NotFound,
     /// Failed P1 (rule 7).
     Future,
+    /// On this relay's own deny list, or `451` from the peer (ADR 0052 rule 17).
+    Denied,
 }
 
 impl Skip {
     /// Every reason, in label order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Held,
         Self::Pow,
         Self::Invalid,
         Self::NotFound,
         Self::Future,
+        Self::Denied,
     ];
 
     /// The label value.
@@ -41,6 +44,7 @@ impl Skip {
             Self::Invalid => "invalid",
             Self::NotFound => "not_found",
             Self::Future => "future",
+            Self::Denied => "denied",
         }
     }
 }

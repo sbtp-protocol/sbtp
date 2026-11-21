@@ -85,6 +85,9 @@ const EST_CLIENT_COUNT_ENTRY: u64 = 64;
 /// of identifiers; the window lets the lanes pass a block in back-off.
 const EST_MIRROR_PER_REQUEST: u64 = 65_909 + 90_000;
 const EST_MIRROR_WINDOW: u64 = 4 * 64 * 96 + 64 * 48;
+/// ADR 0052 rule 21: per deny list entry, a 32-byte value and its kind in a table at most half
+/// full; two lists are held during a reload.
+pub(crate) const EST_DENY_ENTRY: u64 = 80;
 /// ADR 0021 rule 21: the log queue, 256 lines of at most 1,024 bytes.
 const LOG_QUEUE_BYTES: u64 = (crate::log::QUEUE_LINES * crate::log::MAX_LINE) as u64;
 
@@ -195,12 +198,15 @@ int_settings! {
     mirror_max_in_flight: 1, 64, Some(4);
     mirror_request_timeout_ms: 1_000, 300_000, Some(30_000);
     mirror_max_backoff_s: 1, 86_400, Some(3_600);
+    // ADR 0052 rule 21: a profile row, then a policy setting.
+    deny_max_entries: 1, 16_777_216, Some(2_048);
+    deny_reload_ms: 1_000, 3_600_000, Some(10_000);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 27] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 28] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -233,6 +239,8 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 27] = [
     ("ingest_group_max", [16_384, 131_072]),
     // ADR 0050 rule 28 (amends rule 37).
     ("mirror_max_in_flight", [4, 8]),
+    // ADR 0052 rule 21 (amends rule 37).
+    ("deny_max_entries", [65_536, 1_048_576]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -300,7 +308,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 27] = [
+const OTHER_KEYS: [&str; 28] = [
     "profile",
     "listen",
     "data_dir",
@@ -330,6 +338,8 @@ const OTHER_KEYS: [&str; 27] = [
     "mirror_info",
     "mirror_public_url",
     "mirror_allow_private",
+    // ADR 0052 rule 21.
+    "deny_file",
 ];
 
 /// `mirror_url_style` (ADR 0050 rule 28).
@@ -610,6 +620,11 @@ pub struct Settings {
     pub mirror_request_timeout_ms: u64,
     pub mirror_max_backoff_s: u64,
     pub mirror_allow_private: bool,
+    // ADR 0052 rule 21.
+    /// The operator deny list; `None` (the default) turns it off.
+    pub deny_file: Option<PathBuf>,
+    pub deny_max_entries: u64,
+    pub deny_reload_ms: u64,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -885,6 +900,12 @@ impl Settings {
             other("replication_allow_private"),
             "replication_allow_private",
         )?;
+        // ADR 0052 rule 21: empty is off, as the default.
+        let deny_file = other("deny_file")
+            .map(|r| r.string("deny_file"))
+            .transpose()?
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         let peer_ca_file = other("peer_ca_file")
             .map(|r| parse_path(&r, "peer_ca_file"))
             .transpose()?;
@@ -993,6 +1014,9 @@ impl Settings {
             mirror_request_timeout_ms: v(ints.mirror_request_timeout_ms),
             mirror_max_backoff_s: v(ints.mirror_max_backoff_s),
             mirror_allow_private: mirror_allow_private.unwrap_or(false),
+            deny_file,
+            deny_max_entries: v(ints.deny_max_entries),
+            deny_reload_ms: v(ints.deny_reload_ms),
             sources,
         };
         s.check_constraints()?;
@@ -1061,6 +1085,13 @@ impl Settings {
                             .unwrap_or_default(),
                     ),
                     "mirror_allow_private" => Some(self.mirror_allow_private.to_string()),
+                    // ADR 0052 rule 20: the path, never the content of the file.
+                    "deny_file" => Some(
+                        self.deny_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    ),
                     _ => None,
                 }
             };
@@ -1108,6 +1139,8 @@ impl Settings {
             demand_high_water_pct,
             demand_low_water_pct,
             demand_epoch_ms,
+            deny_max_entries,
+            deny_reload_ms,
             demand_touch_max,
             replication_max_peers,
             replication_max_in_flight,
@@ -1610,6 +1643,12 @@ impl Settings {
                     .saturating_mul(EST_GROUP_ENTRY)
                     .saturating_add(EST_INGEST_FIXED)
             },
+            // ADR 0052 rule 21: only when `deny_file` is set.
+            if self.deny_file.is_some() {
+                self.deny_max_entries.saturating_mul(2 * EST_DENY_ENTRY)
+            } else {
+                0
+            },
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -2069,9 +2108,9 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 59 integer settings plus the 27 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
-        // 0046, 0048, 0049 and 0050.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 86);
+        // 61 integer settings plus the 28 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
+        // 0046, 0048, 0049, 0050 and 0052.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 89);
     }
 
     /// ADR 0050 rule 28: without `object-store`, a `mirror_*` setting given at its default is

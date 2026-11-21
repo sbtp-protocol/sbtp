@@ -240,6 +240,11 @@ impl<I: IndexBackend + 'static> BatchBody<I> {
         let (len, block) = match fetched {
             Fetched::Served(bytes) => (bytes.len(), Some(bytes)),
             Fetched::Missing => (0, None),
+            // ADR 0052 rules 8 and 15: a `length = 0` record, counted, not demand.
+            Fetched::Denied(m) => {
+                metrics::denied(metrics::DenyRoute::Batch, m.is_key(), 1);
+                (0, None)
+            }
             Fetched::Busy(_) => return self.end(BatchEnd::Busy),
             Fetched::Failed => return self.end(BatchEnd::Failed),
         };
