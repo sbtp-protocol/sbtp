@@ -57,7 +57,7 @@ fn defaults_are_the_small_vps_column() {
             s.demand_epoch_ms,
             s.demand_touch_max
         ),
-        (90, 80, 86_400_000, 16_384)
+        (90, 80, 28_800_000, 16_384)
     );
     assert_eq!(s.profile, Profile::Small);
     assert_eq!(
@@ -1133,7 +1133,7 @@ fn demand_settings_and_network_difficulty() {
                 s.demand_epoch_ms,
                 s.demand_eviction
             ),
-            (90, 86_400_000, true)
+            (90, 28_800_000, true)
         );
     }
     // Off: the demand set is not allocated, so not in the memory bound.

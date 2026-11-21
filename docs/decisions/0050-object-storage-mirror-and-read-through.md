@@ -104,7 +104,7 @@ documentation):
      (`mirror_missed_total`).
 10. **Bucket down.** The uploader keeps retrying with back-off; client `PUT`s are not affected. With
     demand eviction, a block is protected for `3 × E` after its acceptance (ADR 0046 rule 7), so a block
-    is lost to the bucket only after an outage of at least `3 × E` (3 days by default); with
+    is lost to the bucket only after an outage of at least `3 × E` (24 hours by default, ADR 0046 D10); with
     `block_ttl_ms` set, after an outage of that duration. An archive relay evicts nothing and loses
     nothing. Operators alert on `mirror_lag_ms` (rule 20).
 11. **Never deletes.** The relay MUST NOT send `DELETE` or any request other than `PUT` (and the `GET` of

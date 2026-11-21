@@ -4,7 +4,9 @@
 - Amended by: 0048 (rules 10 and 15: a request carrying `Sbtp-Replication: 1` is not demand and is
   answered `no-store`)
 - Clarified: 2026-11-21, by the project owner after the security review
-  `docs/security/2026-11-21-demand-eviction.md` (clarifications D1 to D8 below: rules 8, 13, 22 and 25)
+  `docs/security/2026-11-21-demand-eviction.md` (clarifications D1 to D8 below: rules 8, 13, 22 and 25);
+  2026-11-21, by the project owner: default `demand_epoch_ms` 8 hours (clarification D10: rules 24, 27
+  and 28)
 - Date: 2026-11-20
 - Revised: 2026-11-20, owner review: demand hidden by shared caches is recovered, not accepted
   (rules 7, 12 to 17, 24 to 28)
@@ -232,7 +234,7 @@ origin answers a revalidation with `429` or `503` (rule 26).
     | `demand_eviction` | `true` | `true`, `false` | Rule 2. Off on an archive relay. |
     | `demand_high_water_pct` | 90 | 50 to 99 | Leaves room for the `PUT`s that arrive between two sweeper runs. |
     | `demand_low_water_pct` | 80 | 10 to `demand_high_water_pct − 1` | A gap avoids a run on every new block. Equal or higher stops the start-up. |
-    | `demand_epoch_ms` (`E`) | 86,400,000 (1 day) | 14,400,000 (4 hours) to 2,592,000,000 (30 days) | One index update per block per epoch at most. The lower bound keeps `S = E/2` at 2 hours or more, the shortest edge lifetime documented for the cheapest CDN plan checked. Minimum stay of a block: `3 × E`. |
+    | `demand_epoch_ms` (`E`) | 28,800,000 (8 hours; was 86,400,000, D10) | 14,400,000 (4 hours) to 2,592,000,000 (30 days) | One index update per block per epoch at most. The lower bound keeps `S = E/2` at 2 hours or more, the shortest edge lifetime documented for the cheapest CDN plan checked. Minimum stay of a block: `3 × E`. |
     | `demand_touch_max` | profile: 16,384 / 131,072 / 1,048,576 | 1,024 to 16,777,216 | Set by the profile (`small` / `standard` / `large`). |
 
     `demand_eviction`, the two watermarks and `demand_epoch_ms` are policy settings and are not set by a
@@ -247,31 +249,31 @@ origin answers a revalidation with `429` or `503` (rule 26).
     per block, not measured.
 27. **Origin load of rule 15.** `N` is the number of blocks requested at least once per `S`, `U` the
     number of cache locations that contact the relay. A block causes at most `E / S = 2` origin requests
-    per cache location per epoch; with the default `E` of one day, at most `2 × N × U` per day. A `304`
-    carries no body: about 300 bytes of response headers, plus a request of the same order. Estimates,
-    not measured:
+    per cache location per epoch; with the default `E` of 8 hours (`S` of 4 hours, D10), at most
+    `6 × N × U` per day. A `304` carries no body: about 300 bytes of response headers, plus a request of
+    the same order. Estimates, not measured:
 
     | `N` | `U = 1` (one upper tier) | `U = 20` (no tiered cache, 20 edges per block) |
     |---|---|---|
-    | 10,000 | 20,000 / day, 0.23 / s, 12 MB / day | 400,000 / day, 4.6 / s, 240 MB / day |
-    | 100,000 | 200,000 / day, 2.3 / s, 120 MB / day | 4,000,000 / day, 46 / s, 2.4 GB / day |
-    | 1,000,000 | 2,000,000 / day, 23 / s, 1.2 GB / day | 40,000,000 / day, 463 / s, 24 GB / day |
+    | 10,000 | 60,000 / day, 0.69 / s, 36 MB / day | 1,200,000 / day, 13.9 / s, 720 MB / day |
+    | 100,000 | 600,000 / day, 6.9 / s, 360 MB / day | 12,000,000 / day, 139 / s, 7.2 GB / day |
+    | 1,000,000 | 6,000,000 / day, 69 / s, 3.6 GB / day | 120,000,000 / day, 1,389 / s, 72 GB / day |
 
     Bytes count request and response at 600 bytes per exchange. Cost per `304`: on a block-cache hit, a
     header comparison; on a miss, one block-read permit, one file read of at most 65,909 bytes and full
     validation (one BLAKE3 hash and one Ed25519 verification, of the order of 0.1 ms of CPU, not
-    measured): about 0.2% of one core at 23 / s and 5% at 463 / s. No index access on the request path.
-    Index writes from flushes: at most `N_epoch` per epoch (`N_epoch` the blocks requested in the
-    epoch), 11.6 / s at one million. A deployment behind a CDN SHOULD enable a single upper tier
+    measured): about 0.7% of one core at 69 / s and 14% at 1,389 / s. No index access on the request
+    path. Index writes from flushes: at most `N_epoch` per epoch (`N_epoch` the blocks requested in the
+    epoch), 34.7 / s at one million per 8-hour epoch. A deployment behind a CDN SHOULD enable a single upper tier
     (tiered cache) to stay in the `U = 1` column.
 28. **Rate limiter.** Revalidations are `block` requests of the client key the relay derives
     (ADR 0018 rule 20, ADR 0044). Each one stands for a visitor request that found an expired entry, so
     it adds no request that the visitor would not have sent without the cache. When the key is the
     visitor's address (`client_ip_header` or a correct `X-Forwarded-For`), the limiter sees what it sees
     without a CDN. When every request of one cache location arrives under one key (the header is not
-    set, or a tier does not forward the visitor's address), that key carries `2 × N` requests per day:
-    the `small` `block` allowance (3,000 per minute) covers up to 2.16 million blocks at `U = 1`,
-    `standard` 4.32 million and `large` 8.64 million. A revalidation refused with `429` or `503` is
+    set, or a tier does not forward the visitor's address), that key carries `6 × N` requests per day
+    with the default `E` (D10): the `small` `block` allowance (3,000 per minute) covers up to 720,000
+    blocks at `U = 1`, `standard` 1.44 million and `large` 2.88 million. A revalidation refused with `429` or `503` is
     not demand (rule 10); the cache retries on the next visitor request, which is counted then. An
     operator behind a CDN sets `client_ip_header` (ADR 0044) and SHOULD NOT exempt CDN ranges from
     the limiter: they carry every customer of the CDN.
@@ -297,7 +299,8 @@ origin answers a revalidation with `429` or `503` (rule 26).
   drops are those nobody fetched over the network, directly or through a cache, for at least `E`, and
   that the origin has not seen for at least `2 × E`. Archive relays remain the guarantee.
 - **CDN offload.** Browsers keep the one-year lifetime. Shared caches keep serving bodies; they ask the
-  origin at most twice a day per block per cache location, and get `304` without a body.
+  origin at most once per `S` per block per cache location (six times a day with the default `E`,
+  D10), and get `304` without a body.
 - **Privacy.** The index now records, per block, the epoch in which it was last requested. No client
   identity is stored with it (rule 11). Someone with the disk learns which blocks were read in which
   epoch, not by whom. An operator who does not want this turns demand eviction off.
@@ -355,7 +358,8 @@ Decided by the project owner after the security review of the implementation
 (`docs/security/2026-11-21-demand-eviction.md`). D1 to D6 close gaps in rules 8, 13 and 22 where
 rule 13 ("MUST NOT evict by demand while a lost demand could be the one that protects a block") was
 not quite kept; they are normative. D7 replaces stale figures. D8 is a reference. D9 records the
-event vocabulary of the implementation (added 2026-11-21).
+event vocabulary of the implementation (added 2026-11-21). D10 changes the default epoch (owner
+decision, added 2026-11-21).
 
 - **D1. Demand never recorded is a lost demand (review M-1).** Rule 13 gains a third case. At a start
   with `demand_eviction = true`, when the index metadata does not record that the previous start ran
@@ -444,6 +448,25 @@ event vocabulary of the implementation (added 2026-11-21).
     the demand order that the candidate listing skipped because they have no block row (corruption
     only). One listing skips at most 10,000 of them and then ends with what it found, so that such
     entries cannot fill a batch or keep a read transaction open.
+
+- **D10. Owner decision 2026-11-21: default `demand_epoch_ms` is 8 h.** The default of rule 24 changes
+  from 86,400,000 (1 day) to 28,800,000 (8 hours). The range stays 14,400,000 (4 hours) to
+  2,592,000,000 (30 days). No rule changes; the figures that follow from the rules with the default
+  become:
+  - shared-cache lifetime `S = E / 2` = 4 hours: `s-maxage=14400` and
+    `CDN-Cache-Control: public, max-age=14400, must-revalidate` (rule 15). This is above the 2-hour
+    shortest edge lifetime of the cheapest CDN plan checked ("Shared cache behaviour checked");
+  - minimum protection `3 × E` = 24 hours (rule 7): a block requested at least once in the last
+    8 hours, directly or through at most two shared caches in series, is not evicted by demand, and a
+    new block stays at least 24 hours;
+  - suspension `2 × E` = 16 hours (rule 13, D1, D2, D4);
+  - at most 3 index updates per block per day (one per epoch, rules 11 and 12);
+  - revalidations: at most one per `S` per block per cache location, 6 per day instead of 2 (three
+    times the former load); about 6.9 / s with one upper tier at 100,000 active blocks. Rules 27 and 28
+    are rescaled in place accordingly.
+
+  A shorter epoch drops cold blocks sooner on a small disk, at three times the revalidation load of the
+  former default. An operator who wants the former figures sets `demand_epoch_ms = 86400000`.
 
 Tests added to the implementation plan, step 7: a first start on an index written before this ADR
 suspends for `2 × E`; an off-to-on transition suspends, an on-to-on restart does not; an empty new

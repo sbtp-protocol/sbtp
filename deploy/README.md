@@ -103,9 +103,9 @@ docker run -d --name sbtp-relay \
 By default the relay keeps what it receives (ADR 0046): `block_ttl_ms = 0` (no eviction by age)
 and `demand_eviction = true`. When the store passes `demand_high_water_pct` (90 %) of
 `max_store_bytes`, the sweeper deletes the blocks requested least recently, down to
-`demand_low_water_pct` (80 %); a block requested in the last `demand_epoch_ms` (one day), directly
+`demand_low_water_pct` (80 %); a block requested in the last `demand_epoch_ms` (8 hours), directly
 or through at most two shared caches in series, is never deleted, and a new block stays at least
-three epochs. A `PUT` never deletes anything: a new block that does not fit gets `507`, with a
+three epochs (24 hours). A `PUT` never deletes anything: a new block that does not fit gets `507`, with a
 `Retry-After` of one sweeper interval only while the store is above the high-water mark and the
 sweeper can make room (demand eviction neither suspended nor stuck, ADR 0046 clarification D5);
 otherwise without `Retry-After`, so that clients try another relay.
@@ -120,7 +120,7 @@ otherwise without `Retry-After`, so that clients try another relay.
 - **Privacy.** With demand eviction on, the index records, per block, the epoch in which it was
   last requested (never by whom). An operator who does not want this turns demand eviction off.
 - **Restarts and suspensions.** Demand eviction is suspended for two epochs (`2 ×
-  demand_epoch_ms`, two days by default) whenever a demand may have gone unrecorded (ADR 0046
+  demand_epoch_ms`, 16 hours by default) whenever a demand may have gone unrecorded (ADR 0046
   rule 13 and clarifications D1 to D4); reads and writes are unaffected and a full store answers
   `507` meanwhile. The start-up line `demand_suspended` gives the `cause`:
   - `unclean_start`: the last stop was not clean: `SIGKILL`, a crash, a power loss, or a drain
@@ -141,9 +141,9 @@ otherwise without `Retry-After`, so that clients try another relay.
   a hang.
 - **Response headers.** With demand eviction on, a block response carries
   `Cache-Control: public, max-age=31536000, s-maxage=<E/2>, immutable` and
-  `CDN-Cache-Control: public, max-age=<E/2>, must-revalidate` (`E/2` in seconds, 43,200 by
-  default), so that a shared cache revalidates each requested block at least twice per epoch and
-  the relay sees that demand. Browsers keep the one-year lifetime. The relay computes these
+  `CDN-Cache-Control: public, max-age=<E/2>, must-revalidate` (`E/2` in seconds, 14,400, that is
+  4 hours, by default), so that a shared cache revalidates each requested block at least once per
+  `E/2` and the relay sees that demand. Browsers keep the one-year lifetime. The relay computes these
   values; nothing is configured for them. With demand eviction off, the one-year
   `Cache-Control` alone, as before.
 
@@ -260,13 +260,13 @@ served); until then, read them from the periodic `stats` log line (field in pare
 |---|---|---|
 | `storage_full_total` (`refused_507`) | increases for more than one hour | New blocks are refused with `507`: the store is full and eviction is not making room fast enough, or cannot (see `demand_stuck`). |
 | `demand_evicted_blocks_total` (`demand_evicted`) | grows by more than 10 % of the held blocks in a day | Blocks are pushed out faster than usual: a write flood (security review 2026-11-21, M-2) or a store sized too small. Consider a larger `max_store_bytes` or a `block_ttl_ms` as an outer bound. |
-| `demand_suspended` (`demand_suspended`) | is `1` for longer than `2 × demand_epoch_ms` | A suspension should end after two epochs; one that keeps renewing means demands keep being lost (see `demand_lost_total`) or the relay keeps stopping uncleanly. |
-| `demand_stuck_total` (`demand_stuck` events) | increases on two sweeper runs in a row | Above the high-water mark with nothing to evict: every block is protected (requested or accepted within three epochs), or `cause=index`, the index file alone reaches the low-water mark. Grow `max_store_bytes`. |
+| `demand_suspended` (`demand_suspended`) | is `1` for longer than `2 × demand_epoch_ms` (16 hours by default) | A suspension should end after two epochs; one that keeps renewing means demands keep being lost (see `demand_lost_total`) or the relay keeps stopping uncleanly. |
+| `demand_stuck_total` (`demand_stuck` events) | increases on two sweeper runs in a row | Above the high-water mark with nothing to evict: every block is protected (requested or accepted within three epochs, 24 hours by default), or `cause=index`, the index file alone reaches the low-water mark. Grow `max_store_bytes`. |
 | `ingest_capped_total` (`ingest_capped`; `ingest_capped` and `ingest_cap_ended` events) | increases for 15 minutes | Ingest capped: the store is above the low-water mark and writers use the whole hourly budget, a flood or real growth. Check `ingest_group_limited_total` and the disk. |
 | `ingest_group_limited_total` (`ingest_group_limited`) | increases by more than 100 in 15 minutes | Group limited: one network takes more than its share. Usually a flood; with a carrier NAT, raise `ingest_group_share_pct`. |
 | `ingest_group_unchecked_total` (`ingest_group_unchecked`) | increases | Group table full: many networks write at once and new groups pass unchecked (ADR 0049 rule 5), possibly a many-network flood (Q-71). |
 | `demand_evicted_blocks_total` while `demand_coldest_ms` is less than 7 days old | increases | Eviction of recent blocks: blocks requested within the week are evicted; the store is too small for its traffic, or a flood. |
-| `demand_lost_total` (`demand_lost`) | increases at all | A demand could not be recorded (set full, or an index write failed); each loss suspends demand eviction for two epochs. Repeated losses point at index write errors (`index_write_errors_total`) or at `demand_touch_max` too small for the read rate. |
+| `demand_lost_total` (`demand_lost`) | increases at all | A demand could not be recorded (set full, or an index write failed); each loss suspends demand eviction for two epochs (16 hours by default). Repeated losses point at index write errors (`index_write_errors_total`) or at `demand_touch_max` too small for the read rate. |
 
 ## Pulling the CI image
 
@@ -503,6 +503,10 @@ documentation and source read through Context7 on 2026-11-20):
       this TTL", and no Cache Response Rule that sets `Cache-Control` on this path: either one
       overrides the lifetime that the relay sets for demand eviction (ADR 0046 rule 15);
     - Tiered Cache with Smart Topology on, so that one upper tier contacts the relay.
+    - The relay's default shared lifetime is 4 hours (`s-maxage=14400`, `CDN-Cache-Control:
+      max-age=14400`), above the 2-hour minimum Edge Cache TTL of the Free plan (ADR 0046, "Shared
+      cache behaviour checked"). With one upper tier, expect up to six revalidations (`304`, no body)
+      per requested block per day, about 6.9 per second at 100,000 active blocks (ADR 0046 rule 27).
     - `client_ip_header = "CF-Connecting-IP"` on the relay (ADR 0044).
 
     No more than two caches in series may sit in front of a relay with demand eviction on (an edge
@@ -514,8 +518,8 @@ documentation and source read through Context7 on 2026-11-20):
     relay, so their demand never reaches it. Restart the relay with `demand_eviction = true` first,
     then purge `/sbtp/v1/block/*` from the CDN cache (a purge by prefix where the plan offers it,
     otherwise a purge of everything cached for the relay's host), within
-    `2 × demand_epoch_ms` of the restart. A purge before the restart is not enough. With the cache
-    bypassed on `/sbtp/v1/*`, no purge is needed.
+    `2 × demand_epoch_ms` (16 hours by default) of the restart. A purge before the restart is not
+    enough. With the cache bypassed on `/sbtp/v1/*`, no purge is needed.
 
     Why: the relay suspends demand eviction for `2 × demand_epoch_ms` after this restart
     (`demand_suspended cause=enabled`), which covers the reads it did not record while it was off,

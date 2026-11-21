@@ -143,7 +143,7 @@ int_settings! {
     // ADR 0046 rule 24. The low-water bound below the high-water mark is a constraint.
     demand_high_water_pct: 50, 99, Some(90);
     demand_low_water_pct: 10, 98, Some(80);
-    demand_epoch_ms: 14_400_000, 2_592_000_000, Some(86_400_000);
+    demand_epoch_ms: 14_400_000, 2_592_000_000, Some(28_800_000);
     demand_touch_max: 1_024, 16_777_216, Some(16_384);
     // ADR 0048 rule 15: profile rows, then policy settings.
     replication_max_peers: 1, 256, Some(4);

@@ -215,7 +215,7 @@ fn put_replaces_a_damaged_file() {
         assert_eq!(r.body, good);
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, s-maxage=43200, immutable")
+            Some("public, max-age=31536000, s-maxage=14400, immutable")
         );
         // Rule 8.3: invalid submitted bytes change nothing.
         let mut bad = good.clone();
@@ -649,7 +649,7 @@ fn head_follows_get() {
         assert_eq!(status, 200);
         assert_eq!(
             header(&h, "cache-control"),
-            Some("public, max-age=31536000, s-maxage=43200, immutable")
+            Some("public, max-age=31536000, s-maxage=14400, immutable")
         );
         assert_eq!(header(&h, "content-type"), Some("application/octet-stream"));
     }
