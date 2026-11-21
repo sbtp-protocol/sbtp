@@ -391,8 +391,17 @@ deny_file = "/etc/sbtp-relay/deny.txt"
 - **Copies the relay cannot reach.**
   - A CDN keeps `200` responses up to a year: purge `/sbtp/v1/block/<block_id>` from it after each
     new block entry. For a key entry, purge each held block of that key. A command that lists
-    them is not part of this version yet: until then, list the blocks with `/query` and keep those
-    whose header carries the key (bytes 19 to 50 of each block).
+    them is not part of this version yet, and once a key entry is loaded the relay hides its
+    blocks from `/query` and answers `451`, so the list MUST be collected **before** the key takes
+    effect:
+    1. Load the key with `hide` first if you intend `purge` (a `purge` entry deletes the local
+       bytes, so nothing would be left to inspect). Or collect the list before loading the entry
+       at all.
+    2. Collect the list: with no key entry loaded yet, walk `/query` and keep the blocks whose
+       header carries the key (bytes 19 to 50 of each block); with a `hide` entry already loaded,
+       read the block files in the data directory directly, since `/query` no longer lists them.
+    3. Purge each `/sbtp/v1/block/<block_id>` of that list from the CDN.
+    4. Only then switch the entry to `purge`, if wanted, and reload.
   - The archive copy never uploads a denied block, but never deletes from the bucket either.
     Removing an object already uploaded is an operator task, with credentials the relay does not
     hold (the relay's own allow `PutObject` only): delete
