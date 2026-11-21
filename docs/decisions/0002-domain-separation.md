@@ -1,7 +1,8 @@
 # 0002: Domain separation of the `block_id` and the signature
 
 - Status: accepted (by the project owner, 2026-11-18)
-- Amended by: 0010 (rule 10, layer-1 chunk_id); 0016 (rule 12, registry rows for layer 2 strings)
+- Amended by: 0010 (rule 10, layer-1 chunk_id); 0016 (rule 12, registry rows for layer 2 strings); 0055,
+  proposed 2026-11-21 (rule 8 extended to every signature prefix of the registry)
 - Date: 2026-11-18
 - Questions: Q-04
 - Impact: spec §2 (Signature row), §3.1, §3.2, new §3.5; `sbtp-core` (`block_id` computation, signing,

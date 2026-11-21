@@ -12,6 +12,12 @@
   publishes `subscribe` with a version the SDK implements and the transport allows WebSocket, polls
   otherwise and after a refused upgrade, holds at most one subscription connection per relay, and
   reports completeness the same way, ADR 0054 rule 44)
+- Clarifications: S1 to S15, proposed (2026-11-21), raised by the first TypeScript implementation:
+  `/info` re-read triggers, absent `block_versions`, `read_api` 1 fallback for `fields`, relays not
+  sent to (ADR 0047 D3), duplicates in a page, own time limit, other `5xx` (ADR 0047 D2), re-submission
+  schedule base, cut batch record, `follow` without `head`, bad `relays` member, `451` on a
+  `read_only` URL, malformed flags, absent `block_ttl_ms`, a page that does not advance (ADR 0051
+  B10)
 - Date: 2026-11-21
 - Questions: none resolved; opens Q-78 and Q-79. Refers to Q-23 (subscriptions, `follow`), Q-26
   (peer-to-peer serving) and Q-77 (snapshot format)
@@ -523,3 +529,173 @@ Applied on acceptance (2026-11-21).
   and has no expiry; provenance cannot be produced.
 - **A two-person release rule now.** With the current maintainers it would block every release. It
   is reconsidered when maintainers are added (rule 32).
+
+## Clarifications S1 to S15 (2026-11-21, proposed)
+
+Raised by the first TypeScript implementation of this ADR. Each clarification is proposed on its own,
+for the project owner to accept one by one. None changes the wire format of a block, the relay
+interface beyond the sentences quoted, or a frozen vector set. Three of them amend the rules of
+another ADR and are written there: S4 is ADR 0047 amendment D3, S7 is ADR 0047 amendment D2, S15 is
+ADR 0051 clarification B10. Spec changes are listed under "Spec change on acceptance of S1 to S15"
+and applied only for the clarifications accepted.
+
+- **S1. When `/info` is read again (rule 5).** A failure "that may follow a settings change" is:
+  - a `PUT` answered `400` with `InsufficientPow`, `UnsupportedVersion` or
+    `TimestampTooFarInFuture`;
+  - a `404`, `405` or `501`, or a `400` `InvalidParameter`, to a form that needs `read_api` ≥ 2
+    (`POST /blocks`; `/query` with `order`, `fields`, a repeated `parent` or a per-parent cursor);
+  - a `404`, `405` or `501` to `PUT` or `/query` (the URL may now be `read_only`).
+
+  After one of these the SDK reads that relay's `/info` again before it sends that form to that relay
+  again, at most once per relay per back-off delay (rule 9). If the new `/info` still announces the
+  form, the refusal is a failed request (core §4 "Client bounds"): the SDK backs off and does not
+  re-read `/info` in a loop. Otherwise rules 6 and 11 apply with the new values. A refused
+  subscription upgrade is handled by ADR 0054 rule 44 and needs no re-read.
+  *Reason:* without a re-read, a relay that was downgraded, replaced or turned into a bucket mirror
+  keeps receiving a form it cannot serve. A re-read costs one request of at most 16,384 bytes.
+  *Implementation:* re-reads after `InsufficientPow` only; MUST add the other triggers.
+- **S2. `/info` without `block_versions` (rule 11, core §4).** A client reads an absent
+  `block_versions` as `[1]`, and a malformed one as absent (ADR 0029 rule 13). A relay that publishes
+  a list without the block's Version gets no `PUT` of that block (ADR 0047 amendment D3).
+  *Reason:* check F4 makes `0x01` the only Version of this specification, so every conforming relay
+  accepts it. Publishing nothing loses delivery to a minimal relay for no gain; a wrong assumption
+  costs one `400` `UnsupportedVersion`, which is a final refusal (ADR 0047 rule 3) and triggers a
+  re-read (S1). *Implementation:* publishes nothing to such a relay; MUST change.
+- **S3. `fields=parents` on a relay with `read_api` 1 (rules 6 and 10, ADR 0051 clarification
+  B8).** `fields` adds hints; it does not change which identifiers a listing holds. On a relay without
+  `read_api` ≥ 2 the SDK asks the same listing in the form that relay supports: no `fields`, `asc`,
+  at most one `parent` per request. That relay then counts as asked, and its completeness is that of
+  the walk (complete, or incomplete at a bound). Its identifiers carry no hints; the SDK fetches the
+  blocks to learn their parents (§3.4). A relay counts as "not asked" only when the caller turned
+  this fallback off. *Reason:* B8 already counts a relay as asked when "asked with the single-parent
+  form instead"; the form without `fields` is the same fallback, and rule 6 requires it.
+  *Implementation:* counts the relay as not asked; MUST fall back as above.
+- **S4. Relays the client does not send to.** See ADR 0047 amendment D3: a `read_only` URL is not a
+  publication target; a relay whose `min_pow_difficulty` the block does not meet, or whose
+  `block_versions` lacks the block's Version, is `refused` without a request. *Implementation:* keeps
+  them `pending` until `publish_max_wait`; MUST change.
+- **S5. A duplicate identifier in a `/query` page (rule 7, core §4).** Not a failed request. The SDK
+  deduplicates the page, as ADR 0029 rule 8 already states. The check "no more identifiers than the
+  `limit` sent" counts every entry, duplicates included. *Reason:* "each at most once" is an
+  obligation of the relay; ADR 0029 rule 8 sets the client's reaction, and deduplication by
+  `block_id` is required anyway across pages and relays. *Implementation:* fails the request; MUST
+  change.
+- **S6. The client's own time limit (rule 9).** Its expiry is not a "closed connection". It is a
+  failed request (ADR 0029 rules 7 and 15), followed by back-off with no immediate retry. A closed
+  connection is one closed by the relay or the network before the response was complete, for example
+  an idle keep-alive connection the relay closed as the request was sent. *Reason:* the immediate
+  retry covers that race; a request that ran out of time shows a slow relay, and an immediate repeat
+  doubles its load. *Implementation:* backs off; conforms.
+- **S7. A `5xx` not named in ADR 0047 rule 3 or in rule 7 (`501`, `505`, `506`, `508`, `511` and any
+  other).** Transient, handled as a `503` (rule 9): see ADR 0047 amendment D2. A walk keeps its
+  cursor. A `501` to a form of `read_api` ≥ 2 or to `PUT` also triggers S1. *Implementation:*
+  transient; conforms (S1 adds the re-read).
+- **S8. Re-submission schedule on a relay with `block_ttl_ms` (rule 13, ADR 0043 rule 5).** Two
+  triggers, separate:
+  - a `404` to a single `GET` or `HEAD`: always a trigger, with no time condition (never after a
+    `451`, rule 14);
+  - the schedule: no earlier than the last `201` from that relay plus `block_ttl_ms`. When the SDK
+    has no `201` from that relay for the block, it MAY use the time of the first `200` it received
+    from that relay for the block (to a `PUT`, or to a `GET` that passed §3.4): the relay received the
+    block no later than that, so the block has expired there by that time plus `block_ttl_ms`. With
+    neither, there is no schedule; the `404` trigger remains. A `201` to a scheduled `PUT` sets a new
+    base. A `200` at the scheduled time follows ADR 0043 rule 5 (retry later with back-off).
+
+  *Implementation:* no schedule without a `201`; conforms (the `200` base is a MAY).
+- **S9. A batch body cut inside a record (rule 8).** The response is a failed request (core §4,
+  `POST /sbtp/v1/blocks`); the complete records before the cut MAY be used. The SDK backs off before
+  it requests the rest. Only a body that ends after a complete record is a prefix whose rest is
+  requested at once. *Reason:* a cut inside a record is a malformed or broken response, not a relay
+  choice; the core spec treats failed requests with back-off. When the cut came from a closed
+  connection, the single immediate retry of rule 9 MAY be used instead. *Implementation:* backs off;
+  conforms.
+- **S10. `follow` on a relay with `read_api` 1 (API shape, ADR 0054 rule 44).** Such a relay
+  publishes no `subscribe` (core §4: a relay without `read_api` ≥ 2 MUST NOT), so `follow` polls. It
+  has no `head`: the SDK walks each parent `asc`, one `parent` per request, to `more = false`, then
+  polls `asc` from the last cursor of each listing. That cursor names the gap after the last listed
+  block, so it plays the role of `head`. When the caller asks to follow from "now" and the walk would
+  be long, the SDK MAY instead start with `since` set to the relay's `Date` of a recent response minus
+  a margin, and deduplicate by `block_id` (core §4, "Fast first catch-up"). A walk stopped by its
+  bound leaves that listing incomplete until a poll ends with `more = false` (ADR 0029 rule 9).
+  *Implementation:* walks to the end, then polls; conforms.
+- **S11. One bad entry in `/info` `relays` (rule 15, ADR 0048 rule 20).** The whole member is read as
+  absent, an empty list: a list that breaks the format of ADR 0048 rule 20 is a member out of its
+  range (ADR 0029 rule 13). *Reason:* the format is a property of the list (at most 16 entries, no
+  duplicates after normalisation), and keeping some entries would let two clients learn different
+  sets from the same bytes. The member is only a hint. The per-hint rule of ADR 0040 rule 4 applies to
+  URI hints, not to lists. *Implementation:* ignores the member; conforms.
+- **S12. A `451` from a `read_only` URL (rule 14, ADR 0050 rule 5).** ADR 0050 rule 5 decides: on a
+  `read_only` URL any status other than `200` or `304` means "not served here", `451` included. It is
+  not the outcome `denied`: no denial is recorded, no delivery state or availability changes, and the
+  SDK reports it as not served (it MAY expose the status as data). Rule 14 applies to every route of a
+  URL that is not `read_only`. *Reason:* a `read_only` URL is an object store or a CDN, which applies
+  no operator deny list of ADR 0052 (ADR 0052 rule 18); a `451` there comes from the store or the CDN.
+  No `PUT` is sent there, so the denial rules have nothing to protect. *Implementation:* MUST map a
+  `451` on a `read_only` URL to "not served" if it now reports `denied`.
+- **S13. A malformed `read_only` or `demand_eviction` (rule 5, core §4).** A malformed flag (not a
+  JSON boolean) is read as absent, that is `false` (ADR 0029 rule 13), with one exception: the SDK
+  MUST NOT classify a relay as an archive relay when its `demand_eviction` or its `block_ttl_ms` is
+  malformed; its class is then unknown (S14). The rest of `/info` stays valid. *Reason:* ADR 0029
+  rule 13 already reads an out-of-range member as absent, and only the two required members make an
+  `/info` a failed request. Reading a malformed `read_only` as `false` costs at most one refused `PUT`
+  or `/query` (a `4xx`, a final refusal of ADR 0047 and a re-read under S1); reading it as `true`
+  would differ between implementations. The archive exception keeps a malformed member from removing
+  the presence checks and re-submissions an application relies on. Treating the whole `/info` as
+  invalid would cut a relay off because of one optional member. *Implementation:* reads a malformed
+  flag as `true`; MUST change.
+- **S14. `/info` without `block_ttl_ms` (rule 5, ADR 0048 rule 1).** An absent `block_ttl_ms` means
+  unknown, not `null`. The SDK MUST NOT classify such a relay as an archive relay, and has no
+  re-submission schedule for it (S8); the `404` trigger remains. *Reason:* ADR 0048 rule 1 reads the
+  archive role from an explicit `"block_ttl_ms": null`; an absent member says nothing about eviction
+  by age. *Implementation:* class "unknown"; conforms. The core spec states it (spec change below).
+- **S15. A page that does not advance (rule 7).** See ADR 0051 clarification B10: a relay MUST NOT
+  answer a request that carried cursor `C` with a page of that listing that holds no identifier, has
+  `more = true` and returns `C`; a client MAY treat such a page as a relay fault. *Implementation:*
+  ends the listing incomplete (reason "stalled"); conforms.
+
+### Spec change on acceptance of S1 to S15
+
+Core spec §4, `GET /sbtp/v1/info`:
+
+- **S2**, the bullet on `block_versions` becomes:
+  > - `block_versions`: array of the Version field values the relay accepts (F4). A client MUST read
+  >   an absent member as `[1]`. (ADR 0053, clarification S2)
+- **S14**, the bullet on `block_ttl_ms` gains:
+  > A client reads an absent member as unknown: it does not classify the relay as an archive relay
+  > (ADR 0048) and has no age-based re-submission schedule for it. (ADR 0053, clarification S14)
+- **S1**, the bullet on `read_api` gains:
+  > A `404`, `405` or `501`, or a `400` (`InvalidParameter`), to one of these forms makes the client
+  > read `/info` again before it sends that form to that relay again; if `/info` still announces it,
+  > the refusal is a failed request (see "Client bounds"). (ADR 0053, clarification S1)
+- **S13**, the bullet "A client MUST accept the absence of any member other than
+  `min_pow_difficulty` and `max_future_ms`." gains:
+  > A member it uses that is outside its type or range is read as absent. (ADR 0029, ADR 0053,
+  > clarification S13)
+
+Core spec §4, `GET /sbtp/v1/query`:
+
+- **S3**, in the bullet "Over several relays, a listing is complete only when…", the sentence "A
+  relay skipped because it lacks `read_api` ≥ 2 counts as not asked." becomes:
+  > A relay without `read_api` ≥ 2 is asked in the form it supports (one `parent` per request, `asc`,
+  > no `fields`); its identifiers then carry no hints. A relay skipped instead counts as not asked.
+  > (ADR 0051, clarification B8; ADR 0053, clarification S3)
+
+Core spec §4, "Client bounds":
+
+- **S5**, the bullet on a failed `/query` response gains:
+  > A duplicate identifier is not a failure: the client deduplicates it. (ADR 0029, ADR 0053,
+  > clarification S5)
+
+Core spec §4, "Admission control":
+
+- **S6**, after "After `408` or a closed connection it MAY retry once at once, then backs off.":
+  > A closed connection is one the relay or the network closed before the response was complete; the
+  > expiry of the client's own time limit is a failed request, followed by back-off. (ADR 0053,
+  > clarification S6)
+
+S4, S7 and S15: see ADR 0047 amendments D2 and D3 and ADR 0051 clarification B10. S8 to S12 change no
+spec text: they state how the SDK applies rules the specification already has.
+
+Test cases: `client-v1/` (planned, not frozen) gains one positive and one negative case for each
+accepted clarification that states a MUST (S1, S2, S3, S5, S6, S12, S13, S14), and the cases of ADR 0047
+amendments D2 and D3 and ADR 0051 clarification B10.
