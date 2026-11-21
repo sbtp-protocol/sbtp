@@ -2,12 +2,13 @@
 //! `object-store`, on only when `mirror_endpoint` is set.
 //!
 //! The uploader walks the relay's own index by position from a durable cursor (`meta` keys
-//! [`CURSOR_AT`] and [`CURSOR_N`]), one page of [`PAGE`] positions at a time. Each block of a
+//! [`CURSOR_AT`] and [`CURSOR_N`]), reading [`PAGE`] positions at a time. Each block of a
 //! page is read through the read path of ADR 0023 and sent as a conditional `PUT` signed with
 //! Signature Version 4 (`If-None-Match: *`) by one of `mirror_max_in_flight` lanes, each with its own
-//! connection. The cursor moves, durably, once every block of the page is done: uploaded,
-//! already there (`412`), no longer held, or damaged. A retryable failure retries the same block
-//! after back-off; a configuration error backs off at the maximum and never skips a block. The
+//! connection, from a window of at most [`WINDOW`] positions. The cursor moves, durably, to the
+//! lowest position not yet done: uploaded, already there (`412`), no longer held, or damaged. A
+//! retryable failure retries the same block after back-off while the other lanes go on; a
+//! configuration error backs off at the maximum and never skips a block. The
 //! relay never sends anything but `PUT` to the bucket, plus the `GET` of the public URL after a
 //! `412` (rule 9).
 //!
@@ -15,9 +16,10 @@
 
 pub mod sigv4;
 
+use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -381,6 +383,42 @@ enum Put {
     Refused(Class),
 }
 
+/// How far ahead of the cursor the lanes may get, in positions: four pages. It bounds the
+/// uploader's own state (one [`Slot`] each, about 24 KiB) and what a restart sends again (`412`,
+/// cheap). With rule 9's exponential back-off, the block with the longest run of failures holds
+/// the cursor, so a larger window copies more meanwhile; four pages copied a store failing one
+/// `PUT` in three about 1.5 times faster than two in a simulation of the lanes.
+pub const WINDOW: usize = 4 * PAGE;
+
+/// One position of the window.
+struct Slot {
+    at: Position,
+    id: BlockId,
+    /// Retryable failures so far, for the back-off of rule 9.
+    failures: u32,
+    turn: Turn,
+}
+
+#[derive(Clone, Copy)]
+enum Turn {
+    /// Waiting for a lane, not before this instant.
+    Ready(Instant),
+    /// In a lane.
+    Busy,
+    /// Uploaded, already there, no longer held or damaged.
+    Done,
+}
+
+/// The result of one attempt at a block.
+enum Attempt {
+    Done,
+    /// Try again after `delay`; `failure` counts towards the exponential back-off.
+    Wait {
+        delay: Duration,
+        failure: bool,
+    },
+}
+
 struct Shared {
     relay: Arc<Relay<RedbIndex>>,
     m: Mirror,
@@ -389,18 +427,32 @@ struct Shared {
 
 impl Shared {
     /// The walk of rule 7. Never returns; the caller stops it.
+    ///
+    /// The lanes take blocks from a window of at most [`WINDOW`] positions starting at the
+    /// cursor, refilled a page at a time. A block that fails waits out its back-off in the
+    /// window, not in a lane, so the other lanes keep copying: with a page barrier and lanes
+    /// asleep in back-off, a store failing one `PUT` in three held the copy at 7 blocks/s. The
+    /// cursor is the lowest position not yet done, so it never passes a block that is not done.
     async fn walk(self: &Arc<Self>) {
         let mut cursor = self.load_cursor().await;
-        let mut lanes: Vec<Option<Conn>> = (0..self.m.cfg.in_flight).map(|_| None).collect();
+        // Where the next page read starts: just after the last position in the window.
+        let mut next = cursor;
+        let mut window: VecDeque<Slot> = VecDeque::with_capacity(WINDOW);
+        // The sequence number of `window[0]`: a lane's result finds its slot by it.
+        let mut base = 0u64;
+        let mut idle: Vec<Option<Conn>> = (0..self.m.cfg.in_flight).map(|_| None).collect();
+        let mut lanes = JoinSet::new();
+        let mut unsaved = 0usize;
+        let mut read_at = Instant::now();
         let mut info_due = self.info_due().await;
         let mut info_failures = 0u32;
         let mut info_at = Instant::now();
         let mut counted: Option<Instant> = None;
         loop {
-            // Rule 3, before the page: a failure is retried before a later page, after back-off.
+            // Rule 3: a failure is retried after back-off; blocks do not wait for it.
             if info_due
                 && Instant::now() >= info_at
-                && let Some(conn) = lanes.first_mut()
+                && let Some(conn) = idle.last_mut()
             {
                 match self.put_info(conn).await {
                     Ok(()) => info_due = false,
@@ -411,112 +463,186 @@ impl Shared {
                     }
                 }
             }
-            let Ok(page) = self
-                .relay
-                .index()
-                .read(move |i| {
-                    use crate::index::IndexBackend as _;
-                    i.query(None, cursor, PAGE)
-                })
-                .await
-            else {
-                tokio::time::sleep(LOCAL_RETRY).await;
-                continue;
-            };
-            self.relay.index().record_read(&page);
-            let Ok(page) = page else {
-                tokio::time::sleep(LOCAL_RETRY).await;
-                continue;
-            };
-            let Some(&(first, _)) = page.entries.first() else {
-                metrics::set_lag(Some(0), 0);
-                counted = None;
-                tokio::time::sleep(IDLE).await;
-                continue;
-            };
-            let blocks = if counted.is_none_or(|t| t.elapsed() >= LAG_EVERY) {
-                counted = Some(Instant::now());
-                self.relay
-                    .index()
-                    .read(move |i| i.count_from(cursor, LAG_CAP).ok())
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-            let now = (self.relay.clock())();
-            metrics::set_lag(blocks, now.saturating_sub(first.received_at));
-            lanes = self.copy_page(page.entries, lanes).await;
-            cursor = page.next;
-            self.save_cursor(cursor).await;
-        }
-    }
-
-    /// Copies every block of `entries`, `mirror_max_in_flight` at a time; returns the lanes'
-    /// connections.
-    async fn copy_page(
-        self: &Arc<Self>,
-        entries: Vec<(Position, BlockId)>,
-        lanes: Vec<Option<Conn>>,
-    ) -> Vec<Option<Conn>> {
-        let entries = Arc::new(entries);
-        let next = Arc::new(AtomicUsize::new(0));
-        let mut set = JoinSet::new();
-        for mut conn in lanes {
-            let (me, entries, next) = (Arc::clone(self), Arc::clone(&entries), Arc::clone(&next));
-            set.spawn(async move {
-                while let Some(&(at, id)) = entries.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    me.copy_one(&mut conn, at, id).await;
+            let room = window.len() + PAGE <= WINDOW;
+            if room && Instant::now() >= read_at {
+                read_at = self.refill(&mut window, &mut next).await;
+            }
+            self.update_lag(window.front().map(|s| s.at), cursor, &mut counted)
+                .await;
+            // Hand every block whose turn has come to an idle lane.
+            let now = Instant::now();
+            let mut wake = room.then_some(read_at);
+            for (seq, slot) in (base..).zip(window.iter_mut()) {
+                let Turn::Ready(due) = slot.turn else {
+                    continue;
+                };
+                if due > now {
+                    wake = Some(wake.map_or(due, |w| w.min(due)));
+                } else if let Some(mut conn) = idle.pop() {
+                    slot.turn = Turn::Busy;
+                    let (me, at, id, failures) =
+                        (Arc::clone(self), slot.at, slot.id, slot.failures);
+                    lanes.spawn(async move {
+                        let r = me.attempt(&mut conn, at, id, failures).await;
+                        (seq, conn, r)
+                    });
                 }
-                conn
-            });
-        }
-        let mut out = Vec::with_capacity(self.m.cfg.in_flight);
-        while let Some(done) = set.join_next().await {
-            // A lane that panicked is a bug: the relay stops (ADR 0018 rule 37).
-            match done {
-                Ok(conn) => out.push(conn),
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(_) => out.push(None),
+            }
+            let wake = wake.unwrap_or(now + IDLE).max(now);
+            tokio::select! {
+                Some(done) = lanes.join_next() => {
+                    // A lane that panicked is a bug: the relay stops (ADR 0018 rule 37). Lanes
+                    // are never aborted, so no other error occurs while the walk runs.
+                    let (seq, conn, r) = match done {
+                        Ok(v) => v,
+                        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                        Err(_) => continue,
+                    };
+                    idle.push(conn);
+                    let slot = seq
+                        .checked_sub(base)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .and_then(|i| window.get_mut(i));
+                    if let Some(slot) = slot {
+                        slot.turn = match r {
+                            Attempt::Done => Turn::Done,
+                            Attempt::Wait { delay, failure } => {
+                                slot.failures = slot.failures.saturating_add(u32::from(failure));
+                                Turn::Ready(Instant::now() + delay)
+                            }
+                        };
+                    }
+                }
+                () = tokio::time::sleep_until(wake.into()) => {}
+            }
+            let before = base;
+            while window.front().is_some_and(|s| matches!(s.turn, Turn::Done)) {
+                window.pop_front();
+                base += 1;
+            }
+            if base > before {
+                cursor = window.front().map_or(next, |s| s.at);
+                unsaved += usize::try_from(base - before).unwrap_or(PAGE);
+                // About once per page, as before, and when the window drains.
+                if unsaved >= PAGE || window.is_empty() {
+                    self.save_cursor(cursor).await;
+                    unsaved = 0;
+                }
             }
         }
-        out
     }
 
-    /// One block, until it is done (rule 9).
-    async fn copy_one(&self, conn: &mut Option<Conn>, at: Position, id: BlockId) {
+    /// The `mirror_lag_*` gauges: from the oldest position not yet done; the block count is
+    /// recounted at most every [`LAG_EVERY`].
+    async fn update_lag(
+        &self,
+        front: Option<Position>,
+        cursor: Position,
+        counted: &mut Option<Instant>,
+    ) {
+        let Some(front) = front else {
+            metrics::set_lag(Some(0), 0);
+            *counted = None;
+            return;
+        };
+        let blocks = if counted.is_none_or(|t| t.elapsed() >= LAG_EVERY) {
+            *counted = Some(Instant::now());
+            self.relay
+                .index()
+                .read(move |i| i.count_from(cursor, LAG_CAP).ok())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let now = (self.relay.clock())();
+        metrics::set_lag(blocks, now.saturating_sub(front.received_at));
+    }
+
+    /// Appends the page at `next` to the window and moves `next` past it; returns when the
+    /// next read may happen: now after a page, after [`IDLE`] when caught up, after
+    /// [`LOCAL_RETRY`] on a local failure.
+    async fn refill(&self, window: &mut VecDeque<Slot>, next: &mut Position) -> Instant {
+        let Some(page) = self.read_page(*next).await else {
+            return Instant::now() + LOCAL_RETRY;
+        };
+        let now = Instant::now();
+        if page.entries.is_empty() {
+            return now + IDLE;
+        }
+        *next = page.next;
+        window.extend(page.entries.into_iter().map(|(at, id)| Slot {
+            at,
+            id,
+            failures: 0,
+            turn: Turn::Ready(now),
+        }));
+        now
+    }
+
+    /// The next page of the index from `from`; `None` on a local failure.
+    async fn read_page(&self, from: Position) -> Option<crate::index::Page> {
+        let page = self
+            .relay
+            .index()
+            .read(move |i| {
+                use crate::index::IndexBackend as _;
+                i.query(None, from, PAGE)
+            })
+            .await
+            .ok()?;
+        self.relay.index().record_read(&page);
+        page.ok()
+    }
+
+    /// One attempt at a block (rule 9).
+    async fn attempt(
+        &self,
+        conn: &mut Option<Conn>,
+        at: Position,
+        id: BlockId,
+        failures: u32,
+    ) -> Attempt {
         // ADR 0043: an expired position is not held.
         if self.relay.is_expired(at) {
             metrics::missed();
-            return;
+            return Attempt::Done;
         }
-        let bytes = loop {
-            match self.relay.read_for_copy(id).await {
-                Copied::Bytes(b) => break b,
-                Copied::Absent => return metrics::missed(),
-                Copied::Damaged => return metrics::damaged(),
-                Copied::Retry => tokio::time::sleep(LOCAL_RETRY).await,
+        // Read again on every attempt: a block waiting out its back-off holds no bytes.
+        let bytes = match self.relay.read_for_copy(id).await {
+            Copied::Bytes(b) => b,
+            Copied::Absent => {
+                metrics::missed();
+                return Attempt::Done;
+            }
+            Copied::Damaged => {
+                metrics::damaged();
+                return Attempt::Done;
+            }
+            Copied::Retry => {
+                return Attempt::Wait {
+                    delay: LOCAL_RETRY,
+                    failure: false,
+                };
             }
         };
-        let mut failures = 0u32;
-        loop {
-            let (class, delay) = match self.put_block(conn, &id, &bytes).await {
-                Put::Done => return metrics::uploaded(),
-                Put::Exists => {
-                    metrics::existing();
-                    return self.verify(&id).await;
-                }
-                Put::Retry(c) => {
-                    failures = failures.saturating_add(1);
-                    (c, self.backoff(failures))
-                }
-                Put::Refused(c) => (c, self.m.cfg.max_backoff),
-            };
-            metrics::failed(class);
-            log_failed(class, delay);
-            tokio::time::sleep(delay).await;
-        }
+        let (class, delay, failure) = match self.put_block(conn, &id, &bytes).await {
+            Put::Done => {
+                metrics::uploaded();
+                return Attempt::Done;
+            }
+            Put::Exists => {
+                metrics::existing();
+                self.verify(&id).await;
+                return Attempt::Done;
+            }
+            Put::Retry(c) => (c, self.backoff(failures.saturating_add(1)), true),
+            Put::Refused(c) => (c, self.m.cfg.max_backoff, false),
+        };
+        metrics::failed(class);
+        log_failed(class, delay);
+        Attempt::Wait { delay, failure }
     }
 
     /// Rule 9, after a `412`: the object at the public URL, validated once. Only bytes that
@@ -785,6 +911,13 @@ fn log_failed(class: Class, delay: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window's share of the memory bound (`EST_MIRROR_WINDOW` in `config.rs`) counts 96
+    /// bytes per slot.
+    #[test]
+    fn slot_size() {
+        assert!(size_of::<Slot>() <= 96, "{}", size_of::<Slot>());
+    }
 
     #[test]
     fn statuses() {

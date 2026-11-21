@@ -75,6 +75,9 @@ struct State {
     seen: Vec<Seen>,
     /// Statuses answered, in order, to the next `PUT`s under `/archive/sbtp/v1/block/`.
     script: VecDeque<u16>,
+    /// When not 0, every `fail_every`th block `PUT` (signed, not scripted) is answered `503`.
+    fail_every: usize,
+    block_puts: usize,
 }
 
 /// A fake S3-compatible server (path style, bucket `archive`, region `us-east-1`).
@@ -217,6 +220,11 @@ fn serve(mut s: TcpStream, state: &Mutex<State>) {
                     (403, b"<Error>SignatureDoesNotMatch</Error>".to_vec())
                 } else if let Some(code) = scripted {
                     (code, Vec::new())
+                } else if seen.path.starts_with("/archive/sbtp/v1/block/") && st.fail_every > 0 && {
+                    st.block_puts += 1;
+                    st.block_puts.is_multiple_of(st.fail_every)
+                } {
+                    (503, Vec::new())
                 } else if seen.header("if-none-match") == Some("*")
                     && st.objects.contains_key(&seen.path)
                 {
@@ -462,30 +470,81 @@ fn failures_are_retried_and_never_skip_a_block() {
     );
     let (id, b) = block(b"retried");
     let (id2, b2) = block(b"after");
-    let node = Node::mirrored(
-        &data,
-        &s3,
-        &[("MIRROR_MAX_BACKOFF_S", "1"), ("MIRROR_MAX_IN_FLIGHT", "1")],
-    );
+    let node = Node::mirrored(&data, &s3, &[("MIRROR_MAX_BACKOFF_S", "1")]);
     assert_eq!(node.put(&b), 201);
     assert_eq!(node.put(&b2), 201);
-    assert!(wait_until(Duration::from_secs(30), || s3
-        .object(&block_key(&id2))
-        .is_some()));
+    assert!(wait_until(Duration::from_secs(30), || {
+        s3.object(&block_key(&id)).is_some() && s3.object(&block_key(&id2)).is_some()
+    }));
     drop(node);
     assert_eq!(s3.object(&block_key(&id)).as_deref(), Some(b.as_slice()));
+    assert_eq!(s3.object(&block_key(&id2)).as_deref(), Some(b2.as_slice()));
     assert_eq!(metrics::failed_total(Class::Server) - server, 1);
     assert_eq!(metrics::failed_total(Class::Client) - client, 2);
     assert_eq!(metrics::failed_total(Class::Redirect) - redirect, 1);
-    // Four failures and the success, on the first block (one lane, in order); nothing was sent
-    // to the redirect target.
-    assert_eq!(s3.puts_of(&block_key(&id)), 5);
+    // Four failures and one success per block, over the two blocks (the lanes take them in
+    // any order); nothing was sent to the redirect target.
+    assert_eq!(
+        s3.puts_of(&block_key(&id)) + s3.puts_of(&block_key(&id2)),
+        6
+    );
     assert!(
         s3.state()
             .seen
             .iter()
             .all(|r| !r.path.contains("elsewhere"))
     );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Rule 9 with a store that fails one block `PUT` in three: a block in back-off waits in the
+/// window, not in a lane, so the others keep going; nothing is skipped and the cursor ends past
+/// every block, so a restart sends none again. The back-off is capped at 1 s so that the rate
+/// measures the lanes, not the longest run of failures (with the 1-hour default, that run
+/// bounds any design that never skips a block).
+#[test]
+fn a_failing_block_does_not_hold_the_other_lanes() {
+    const N: usize = 300;
+    let _g = serial();
+    let s3 = S3::start();
+    let data = tmp_dir("mirror-every-third");
+    let blocks: Vec<_> = (0..N)
+        .map(|i| block(&u32::try_from(i).unwrap().to_be_bytes()))
+        .collect();
+    // The backlog is stored first, by a relay without the archive copy.
+    {
+        let node = Node::try_start(&data, &[], &[]).unwrap();
+        let mut c = connect(node.addr);
+        for (_, b) in &blocks {
+            assert_eq!(put_block(&mut c, b).status, 201);
+        }
+    }
+    s3.state().fail_every = 3;
+    let (missed, server) = (
+        metrics::missed_total(),
+        metrics::failed_total(Class::Server),
+    );
+    let started = Instant::now();
+    let node = Node::mirrored(&data, &s3, &[("MIRROR_MAX_BACKOFF_S", "1")]);
+    assert!(wait_until(Duration::from_secs(60), || blocks
+        .iter()
+        .all(|(id, _)| s3.object(&block_key(id)).is_some())));
+    let rate = f64::from(u32::try_from(N).unwrap()) / started.elapsed().as_secs_f64();
+    drop(node);
+    assert!(metrics::failed_total(Class::Server) - server >= N as u64 / 3);
+    assert_eq!(metrics::missed_total(), missed);
+    for (id, b) in &blocks {
+        assert_eq!(s3.object(&block_key(id)).as_deref(), Some(b.as_slice()));
+    }
+    // With the page barrier and lanes asleep in back-off, about 9 blocks/s.
+    assert!(rate > 25.0, "{rate:.1} blocks/s");
+    let sent = s3.state().block_puts;
+    s3.state().fail_every = 0;
+    let node = Node::mirrored(&data, &s3, &[]);
+    std::thread::sleep(Duration::from_secs(3));
+    drop(node);
+    assert_eq!(s3.state().block_puts, sent);
+    eprintln!("every third PUT failing: {rate:.1} blocks/s");
     let _ = std::fs::remove_dir_all(&data);
 }
 

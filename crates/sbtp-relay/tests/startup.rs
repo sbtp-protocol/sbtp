@@ -1354,7 +1354,7 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
         &[("PEERS", "")],
         723_077,
     ),
-    // ADR 0050 rule 27: four uploads in flight (`small`) and the uploader's page; the root
+    // ADR 0050 rule 27: four uploads in flight (`small`) and the uploader's window; the root
     // store is counted once, by replication, which is on in the "every function" set.
     (
         "mirror",
@@ -1363,7 +1363,7 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
             ("MIRROR_BUCKET", "archive"),
         ],
         &[("MIRROR_ENDPOINT", "")],
-        4 * 155_909 + 2_048,
+        4 * 155_909 + 4 * 64 * 96 + 64 * 48,
     ),
 ];
 

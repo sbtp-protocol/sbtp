@@ -80,9 +80,11 @@ const MIN_INGEST_BYTES_PER_HOUR: u64 = 1_048_576;
 /// bytes, its control byte, and a table at most half full after growth. Not measured.
 const EST_CLIENT_COUNT_ENTRY: u64 = 64;
 /// ADR 0050 rule 27, estimates: one upload in flight (a block, the TLS and HTTP state), and the
-/// uploader's page of 64 identifiers.
+/// uploader's window of four pages (`mirror::WINDOW`, 96 bytes a slot, guarded by a `size_of`
+/// test) plus the page read into it (64 entries of 48 bytes). Rule 27's 64 × 32 counted one page
+/// of identifiers; the window lets the lanes pass a block in back-off.
 const EST_MIRROR_PER_REQUEST: u64 = 65_909 + 90_000;
-const EST_MIRROR_PAGE: u64 = 64 * 32;
+const EST_MIRROR_WINDOW: u64 = 4 * 64 * 96 + 64 * 48;
 /// ADR 0021 rule 21: the log queue, 256 lines of at most 1,024 bytes.
 const LOG_QUEUE_BYTES: u64 = (crate::log::QUEUE_LINES * crate::log::MAX_LINE) as u64;
 
@@ -1586,11 +1588,11 @@ impl Settings {
                 0
             },
             // ADR 0050 rule 27: per upload in flight, a block and the TLS and HTTP state; the
-            // uploader's page; the root store, unless replication already counts it.
+            // uploader's window; the root store, unless replication already counts it.
             if self.mirror_on() {
                 self.mirror_max_in_flight
                     .saturating_mul(EST_MIRROR_PER_REQUEST)
-                    .saturating_add(EST_MIRROR_PAGE)
+                    .saturating_add(EST_MIRROR_WINDOW)
                     .saturating_add(if self.replication_on() {
                         0
                     } else {
