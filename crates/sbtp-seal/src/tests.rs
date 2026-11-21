@@ -785,3 +785,331 @@ fn item_encoding_carries_the_profile_error() {
         OpenError::ItemEncoding(L2Error::Malformed)
     );
 }
+
+// --- Two-phase seal: the inner signature made outside the crate (spec §5.3) ---
+
+/// The prepare request matching [`request`], with `from` in place of the signing key.
+fn prepare_request<'a>(
+    x25519: &'a [u8; 32],
+    from: &'a [u8; 32],
+    msg: &'a [u8],
+    bucket: Option<Bucket>,
+) -> PrepareRequest<'a> {
+    PrepareRequest {
+        recipient_x25519: x25519,
+        recipient_id: &RECIPIENT_ID,
+        tag: &TAG,
+        from,
+        msg,
+        bucket,
+    }
+}
+
+/// An external signer: it sees only the bytes of `PendingSeal::message`, splits them into the
+/// fields of spec §5.3 and signs them with `key` through the typed builder.
+fn external_sign(key: &SigningKey, message: &[u8]) -> [u8; 64] {
+    let fixed = sbtp_core::SEALED_SIG_PREFIX.len();
+    assert_eq!(&message[..fixed], &sbtp_core::SEALED_SIG_PREFIX);
+    let field = |i: usize| -> [u8; 32] {
+        message[fixed + 32 * i..fixed + 32 * (i + 1)]
+            .try_into()
+            .unwrap()
+    };
+    let mut buf = vec![0u8; message.len()];
+    let typed = sealed_sig_message(
+        &field(0),
+        &field(1),
+        &field(2),
+        &message[fixed + 96..],
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(typed.as_bytes(), message);
+    sign_sealed(key, &typed).unwrap()
+}
+
+fn blake3_of(sealed: &Sealed) -> std::string::String {
+    let mut h = blake3::Hasher::new();
+    h.update(&sealed.payload);
+    h.update(&sealed.ephemeral.verifying_key().to_bytes());
+    std::string::ToString::to_string(&h.finalize().to_hex())
+}
+
+/// (msg body length, bucket, BLAKE3 of `payload ‖ ephemeral public key`) for the RNG label
+/// `"pin"`, recorded with the single-phase `seal` of `d328716`, before the two-phase API.
+const PINNED: [(usize, Option<Bucket>, &str); 5] = [
+    (
+        0,
+        None,
+        "f3eeb066d14543e42fb48901febffb06585b5f0f616e9ee73ca20e101df94c7f",
+    ),
+    (
+        20,
+        None,
+        "ef00b2f7db0c363b8679997b4ee3a9af854d346d58ba7bb4e8f5306b6a811df2",
+    ),
+    (
+        1_000,
+        None,
+        "03f0f402981fcb562827c1171f9cb23ac990702eff9a2dd2eeba4314e25c8c00",
+    ),
+    (
+        10,
+        Some(Bucket::B8192),
+        "e75b022ef665b651f5c21de3ba6aea827d4cdaefeec265df1fe06136325db0f9",
+    ),
+    (
+        30_000,
+        None,
+        "459e84a25b2ac93f53aa7b9c11520488c3cfe4d76e7d19d0ee31e67ab7f6f593",
+    ),
+];
+
+// `seal` produces the same bytes as before the two-phase API, for the same RNG stream.
+#[test]
+fn seal_output_is_pinned() {
+    let key = recipient();
+    for (n, bucket, want) in PINNED {
+        let m = msg(n);
+        let sealed = seal(
+            &request(key.public(), &sender(), &m, bucket),
+            &mut TestRng::new("pin"),
+        )
+        .unwrap();
+        assert_eq!(blake3_of(&sealed), want, "msg {n}");
+    }
+}
+
+// spec §5.3: prepare, an external signature, finish: byte-identical to `seal` for the same
+// RNG stream and key, and it opens.
+#[test]
+fn two_phase_equals_seal() {
+    let key = recipient();
+    let sender = sender();
+    let from = sender.verifying_key().to_bytes();
+    for (n, bucket, want) in PINNED {
+        let m = msg(n);
+        let mut rng = TestRng::new("pin");
+        let pending =
+            seal_prepare(&prepare_request(key.public(), &from, &m, bucket), &mut rng).unwrap();
+        assert_eq!(pending.from(), &from);
+        let sig = external_sign(&sender, pending.message());
+        let two_phase = pending.finish(&sig, &mut rng).unwrap();
+        let one_phase = seal(
+            &request(key.public(), &sender, &m, bucket),
+            &mut TestRng::new("pin"),
+        )
+        .unwrap();
+        assert_eq!(two_phase.payload, one_phase.payload, "msg {n}");
+        assert_eq!(
+            two_phase.ephemeral.verifying_key(),
+            one_phase.ephemeral.verifying_key()
+        );
+        assert_eq!(two_phase.bucket, one_phase.bucket);
+        assert_eq!(blake3_of(&two_phase), want);
+        assert_eq!(deliver(&two_phase, &[recipient()]).unwrap().msg(), &m[..]);
+    }
+}
+
+// spec §5.3: the message to sign is exactly
+// `SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖ recipient_x25519 ‖ msg`, with the outer
+// block's ephemeral key.
+#[test]
+fn prepare_message_layout() {
+    let key = recipient();
+    let sender = sender();
+    let from = sender.verifying_key().to_bytes();
+    let m = msg(30);
+    let mut rng = TestRng::new("layout");
+    let pending = seal_prepare(&prepare_request(key.public(), &from, &m, None), &mut rng).unwrap();
+    assert_eq!(pending.bucket(), Bucket::B512);
+    let message = pending.message().to_vec();
+    let sig = external_sign(&sender, &message);
+    let sealed = pending.finish(&sig, &mut rng).unwrap();
+    let mut want = sbtp_core::SEALED_SIG_PREFIX.to_vec();
+    want.extend_from_slice(&sealed.ephemeral.verifying_key().to_bytes());
+    want.extend_from_slice(&RECIPIENT_ID);
+    want.extend_from_slice(key.public());
+    want.extend_from_slice(&m);
+    assert_eq!(message, want);
+}
+
+// spec §5.3, core spec §3.2 V3 to V6: `finish` refuses a signature that does not verify, and
+// seals nothing.
+#[test]
+fn finish_signature() {
+    let key = recipient();
+    let sender = sender();
+    let from = sender.verifying_key().to_bytes();
+    let m = msg(12);
+    let pending = || {
+        seal_prepare(
+            &prepare_request(key.public(), &from, &m, None),
+            &mut TestRng::new("bad sig"),
+        )
+        .unwrap()
+    };
+    let good = external_sign(&sender, pending().message());
+    let mut flipped = good;
+    flipped[10] ^= 1;
+    // S = L, not canonical (V3).
+    let mut s_is_l = good;
+    s_is_l[32..].copy_from_slice(&hex(
+        "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010",
+    ));
+    let other = external_sign(&SigningKey::from_bytes(&[0x02; 32]), pending().message());
+    // A signature of another message (another `recipient_id`) by the right key.
+    let mut buf = vec![0u8; pending().message().len()];
+    let wrong_msg = pending().message().to_vec();
+    let fixed = sbtp_core::SEALED_SIG_PREFIX.len();
+    let typed = sealed_sig_message(
+        &wrong_msg[fixed..fixed + 32].try_into().unwrap(),
+        &[0x77; 32],
+        key.public(),
+        &m,
+        &mut buf,
+    )
+    .unwrap();
+    let wrong_id = sign_sealed(&sender, &typed).unwrap();
+    for sig in [flipped, s_is_l, other, wrong_id, [0; 64]] {
+        assert_eq!(
+            pending()
+                .finish(&sig, &mut TestRng::new("hpke"))
+                .unwrap_err(),
+            SealError::Signature
+        );
+    }
+    assert!(pending().finish(&good, &mut TestRng::new("hpke")).is_ok());
+}
+
+// spec §5.3, core spec §3.2 V1 and V2: a `from` that is not a usable Ed25519 key is refused by
+// `finish`, whatever the signature.
+#[test]
+fn finish_sender_key() {
+    let key = recipient();
+    let m = msg(12);
+    // The identity point (small order, V2) and a non-canonical y = p (V1).
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let non_canonical: [u8; 32] =
+        hex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+            .try_into()
+            .unwrap();
+    for from in [identity, non_canonical] {
+        let mut rng = TestRng::new("bad from");
+        let pending =
+            seal_prepare(&prepare_request(key.public(), &from, &m, None), &mut rng).unwrap();
+        let sig = external_sign(&sender(), pending.message());
+        assert_eq!(
+            pending.finish(&sig, &mut rng).unwrap_err(),
+            SealError::SenderKey
+        );
+    }
+}
+
+// The errors of the first phase come from `seal_prepare` itself, before any signature.
+#[test]
+fn prepare_errors() {
+    let key = recipient();
+    let from = sender().verifying_key().to_bytes();
+    let rng = || TestRng::new("prepare");
+    assert!(matches!(
+        seal_prepare(
+            &prepare_request(key.public(), &from, b"\xff", None),
+            &mut rng()
+        ),
+        Err(SealError::MsgInvalid(_))
+    ));
+    let big = msg(400);
+    assert_eq!(
+        seal_prepare(
+            &prepare_request(key.public(), &from, &big, Some(Bucket::B512)),
+            &mut rng()
+        )
+        .unwrap_err(),
+        SealError::TooLong
+    );
+    let m = msg(5);
+    let mut same = TestRng::with_prefix("ephemeral", &[0x01; 32]);
+    assert_eq!(
+        seal_prepare(&prepare_request(key.public(), &from, &m, None), &mut same).unwrap_err(),
+        SealError::EphemeralIsSender
+    );
+    // An all-zero shared secret is found when sealing, in `finish`.
+    let zero = [0u8; 32];
+    let mut r = rng();
+    let pending = seal_prepare(&prepare_request(&zero, &from, &m, None), &mut r).unwrap();
+    let sig = external_sign(&sender(), pending.message());
+    assert_eq!(pending.finish(&sig, &mut r).unwrap_err(), SealError::Hpke);
+}
+
+// `PendingSeal` and `PrepareRequest` show neither `msg`, nor `from`, nor the recipient, nor the
+// ephemeral key.
+#[test]
+fn pending_debug_hides_secrets() {
+    let key = recipient();
+    let from = sender().verifying_key().to_bytes();
+    let m = msg(40);
+    let req = prepare_request(key.public(), &from, &m, None);
+    let pending = seal_prepare(&req, &mut TestRng::new("debug")).unwrap();
+    let outer = &pending.message()[18..50].to_vec();
+    for dbg in [std::format!("{req:?}"), std::format!("{pending:?}")] {
+        assert!(dbg.contains("msg_len"), "{dbg}");
+        for secret in [&m[..], &from, key.public(), &RECIPIENT_ID, outer, &TAG] {
+            assert!(!leaks(&dbg, secret), "{dbg}");
+        }
+    }
+}
+
+// The item length used to pick the bucket before signing is the encoder's, at every CBOR head
+// size.
+#[test]
+fn item_len_matches_the_encoder() {
+    for n in [0usize, 1, 23, 24, 255, 256, 65_429, 65_535, 65_536] {
+        let body = vec![0x5a; n];
+        let item = Value::Map(vec![
+            ("from", Value::Bytes(&[1; 32])),
+            ("msg", Value::Bytes(&body)),
+            ("sig", Value::Bytes(&[2; 64])),
+        ]);
+        // `cbor::encode` refuses items over 65,535 bytes; compare the length below that bound.
+        match cbor::encode(&item) {
+            Ok(bytes) => assert_eq!(crate::seal::item_len(n), Some(bytes.len()), "msg {n}"),
+            Err(L2Error::PayloadTooLong) => assert!(crate::seal::item_len(n).unwrap() > 65_535),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+// Review L-1: the item written in place into the bucket buffer is byte for byte the encoder's
+// (deterministic profile, spec §1.2), at every head size of `msg`, and it is followed by the
+// untouched `0x00` padding.
+#[test]
+fn in_place_item_matches_the_encoder() {
+    let from = [0x01; 32];
+    let sig = [0x02; 64];
+    for n in [0usize, 1, 23, 24, 255, 256, 1_000, 65_429 - 117] {
+        #[allow(clippy::cast_possible_truncation)]
+        let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let want = cbor::encode(&Value::Map(vec![
+            ("from", Value::Bytes(&from)),
+            ("msg", Value::Bytes(&body)),
+            ("sig", Value::Bytes(&sig)),
+        ]))
+        .unwrap();
+        let bucket = Bucket::smallest_for(want.len()).unwrap();
+        let mut buf = vec![0u8; bucket.plaintext_len()];
+        let layout = crate::seal::encode_item_into(&mut buf, &from, &body).unwrap();
+        assert_eq!(
+            &buf[layout.msg_start..layout.msg_start + layout.msg_len],
+            &body[..]
+        );
+        buf[layout.sig_start..layout.sig_start + 64].copy_from_slice(&sig);
+        assert_eq!(&buf[..want.len()], &want[..], "msg {n}");
+        assert!(buf[want.len()..].iter().all(|&b| b == 0));
+        assert_eq!(crate::seal::item_len(n), Some(want.len()));
+    }
+    // A buffer too small is an error, not a panic.
+    let mut small = [0u8; 100];
+    assert!(crate::seal::encode_item_into(&mut small, &from, &[0; 10]).is_err());
+}

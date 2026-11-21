@@ -25,8 +25,9 @@ The port is deliberately uncommon: the identity key lives in this origin's Index
 server run later on the same origin (`127.0.0.1:8000` is the default of `python -m http.server` and many
 tools) would serve scripts that can use or delete the key. Do not reuse this origin for another project;
 a public deployment uses its own host name.
-`web/pkg/` is a build output and is not committed. Optimised module (2026-11-20): 139,170 bytes,
-78,512 bytes with `gzip -9`; JS glue 23,315 bytes.
+`web/pkg/` is a build output and is not committed. Optimised module (2026-11-21, layer 2 grammar and
+sealed envelope included): 237,091 bytes, 119,069 bytes with `gzip -9`; JS glue 43,069 bytes. Layer 0
+only (`--no-default-features`): 139,170 and 78,512 bytes (`crates/sbtp-wasm/README.md`).
 
 Any static server works if it serves `.wasm` as `application/wasm` and `.js` as `text/javascript`;
 `serve.mjs` also sends the headers below.

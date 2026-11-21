@@ -1,6 +1,8 @@
-//! WebAssembly bindings of `sbtp-core` (target `wasm32-unknown-unknown`).
+//! WebAssembly bindings of `sbtp-core` (target `wasm32-unknown-unknown`), plus, behind the
+//! features `l2` and `seal` (on by default), the generic layer 2 grammar of `sbtp-l2` and the
+//! sealed envelope of `sbtp-seal` (Q-78: one module, measured within the ADR 0048 budget).
 //!
-//! Every protocol rule runs in `sbtp-core`: this crate only moves bytes across the boundary.
+//! Every protocol rule runs in those crates: this crate only moves bytes across the boundary.
 //! Browsers MUST verify blocks through these bindings, not through a JS Ed25519 library or Web
 //! Crypto `verify`, which diverge from the strict criteria V1 to V6 (interop finding 2026-11-18,
 //! the roadmap (not published) Phase 3).
@@ -26,6 +28,14 @@
 //! | `attachSignature(block, signature)` | Inserts an external signature, verified before returning. |
 //! | `DemoSigningKey.generate()`, `.fromSeed(seed)` | In-WASM key, demo and CLI-like use only. |
 //! | `key.publicKey`, `key.signBlock(block)`, `key.exportSeed()`, `key.free()` | |
+//! | `validateL2Payload(parents, payload)` | Layer 2 grammar validation (feature `l2`), returns an `L2Payload`. |
+//! | `seal(sender, recipientX25519, recipientId, tag, msg, bucket?)` | Sealed envelope (feature `seal`), returns a `SealedEnvelope`. |
+//! | `sealPrepare(from, recipientX25519, recipientId, tag, msg, bucket?)` | Two-phase seal for an identity key outside WASM: returns a `SealPending`. |
+//! | `pending.message`, `pending.finish(signature)` | The bytes to sign; the signature is verified, then sealed into a `SealedEnvelope` (once). |
+//! | `env.unsignedBlock(timestamp)`, `env.signBlock(block)` | The outer block; the ephemeral key signs once, then is wiped. |
+//! | `openSealed(key, outerPublicKey, tag, payload, recipientId, allowedKinds)` | Opens, returns an `OpenedMessage`; every failure is `OpenFailed`. |
+//! | `EncKeyPair.generate()`, `.fromSecret(secret)`, `.publicKey`, `.exportSecret()` | X25519 key of `sbtp.enc_key`. |
+//! | `directoryTag(pk)`, `isDirectoryTag(pk, tag)`, `applicationTag(context, input)` | Tags (spec §5.4, §5.5). |
 //!
 //! # Argument checks
 //!
@@ -44,6 +54,10 @@
 mod api;
 mod error;
 mod key;
+#[cfg(feature = "l2")]
+mod l2;
+#[cfg(feature = "seal")]
+mod seal;
 
 use js_sys::Uint8Array;
 use sbtp_core::layout::{HASH_LEN, MAX_BLOCK_LEN, SIGNATURE_LEN};
@@ -57,6 +71,12 @@ pub use api::{
 };
 pub use error::{BindError, names};
 pub use key::DemoSigningKey;
+#[cfg(feature = "l2")]
+pub use l2::{L2Payload, validate_l2_payload};
+#[cfg(feature = "seal")]
+pub use seal::{
+    EncKeyPair, OpenedMessage, SealPending, SealedEnvelope, open_sealed, prepare_seal, seal_message,
+};
 
 /// Largest integer a JS `number` represents exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;

@@ -4,7 +4,7 @@ use core::fmt;
 
 use sbtp_l2::L2Error;
 
-/// Why [`crate::seal`] refused to produce a sealed payload. The sender does not send.
+/// Why [`crate::seal`], [`crate::seal_prepare`] or [`crate::PendingSeal::finish`] refused to produce a sealed payload. The sender does not send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealError {
     /// `msg` is not a valid grammar payload for a block with 0 parents (spec §5.3). This also
@@ -21,6 +21,12 @@ pub enum SealError {
     /// The inner signature could not be made (spec §5.3). Not reachable with `ed25519-dalek`'s
     /// signer, whose signing does not fail.
     Signing,
+    /// `from` fails criterion V1 or V2 of core spec §3.2: no signature by it can verify
+    /// (spec §5.3 `sig`; two-phase seal, [`crate::PendingSeal::finish`]).
+    SenderKey,
+    /// The signature given to [`crate::PendingSeal::finish`] fails a criterion among V3 to V6 of
+    /// core spec §3.2 over the sealed message (spec §5.3 `sig`). Nothing is sealed.
+    Signature,
     /// The outer payload failed its own grammar validation (spec §5.2). Not reachable with a
     /// conforming encoder; kept as defence in depth.
     Encoding(L2Error),
@@ -34,6 +40,8 @@ impl fmt::Display for SealError {
             Self::EphemeralIsSender => f.write_str("ephemeral signer equals the sender key"),
             Self::Hpke => f.write_str("HPKE seal failed"),
             Self::Signing => f.write_str("inner signature failed"),
+            Self::SenderKey => f.write_str("invalid sender key"),
+            Self::Signature => f.write_str("inner signature does not verify"),
             Self::Encoding(e) => write!(f, "outer payload invalid: {e}"),
         }
     }

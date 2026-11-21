@@ -44,6 +44,27 @@ pub mod names {
     pub const ENTROPY_UNAVAILABLE: &str = "EntropyUnavailable";
     /// The start-up replay of the frozen `S + L` vector failed (ADR 0003 rule 16).
     pub const SELF_TEST_FAILED: &str = "SelfTestFailed";
+    /// A layer 2 grammar payload is invalid (`l2-grammar.md` §1 to §3). The `message` is exactly
+    /// the name of the `sbtp-l2` rule that failed (`MapKeysUnsorted`, `InvalidKind`...).
+    pub const INVALID_PAYLOAD: &str = "InvalidPayload";
+    /// A sealed block did not open (`l2-grammar.md` §5.3). Deliberately opaque: the message is
+    /// always the same and never says which check failed (security review 2026-11-21, I-4).
+    pub const OPEN_FAILED: &str = "OpenFailed";
+    /// The sealed item does not fit the requested bucket, or any bucket (`l2-grammar.md` §5.2).
+    pub const SEAL_TOO_LONG: &str = "SealTooLong";
+    /// The recipient X25519 key cannot be sealed to (all-zero shared secret, RFC 9180 §7.1.4).
+    pub const INVALID_RECIPIENT_KEY: &str = "InvalidRecipientKey";
+    /// A tag context uses a reserved prefix (`l2-grammar.md` §5.4, core spec §3.5).
+    pub const RESERVED_CONTEXT: &str = "ReservedContext";
+    /// The ephemeral key of a sealed envelope already signed its outer block (`l2-grammar.md`
+    /// §5.2: it signs that block only), or the block is not that envelope's outer block.
+    pub const EPHEMERAL_KEY_USED: &str = "EphemeralKeyUsed";
+    /// `SealPending.finish` (or its `message`) was called after a first `finish`: the pending
+    /// seal is single use (`l2-grammar.md` §5.2, one ephemeral key per sealed block).
+    pub const PENDING_SEAL_USED: &str = "PendingSealUsed";
+    /// The block given to `SealedEnvelope.signBlock` is not the envelope's outer block (other
+    /// parents or other payload).
+    pub const NOT_OUTER_BLOCK: &str = "NotOuterBlock";
     /// A `sbtp-core` error the bindings never let reach JS (`BufferTooSmall`: the bindings size
     /// every buffer; `PowNotFound`: `mineSlice` turns it into `undefined`). Kept so that the
     /// mapping stays total.

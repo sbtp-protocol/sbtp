@@ -1,6 +1,6 @@
 [package]
 name = "sbtp-wasm"
-description = "WebAssembly bindings of sbtp-core for the PWA and the web client."
+description = "WebAssembly bindings of sbtp-core, the generic layer 2 grammar (sbtp-l2) and the sealed envelope (sbtp-seal)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,20 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Q-78: the layer 2 grammar and the sealed envelope ship in the core module, behind features that
+# are on by default (measured within the 200 KB gzip budget of ADR 0048, see README.md). Build with
+# `--no-default-features` for a layer 0 module only.
+[features]
+default = ["seal"]
+# Generic layer 2 grammar validation (`validateL2Payload`).
+l2 = ["dep:sbtp-l2"]
+# Sealed envelope: `seal`, `openSealed`, `EncKeyPair`, the tag helpers.
+seal = ["l2", "dep:sbtp-seal"]
+
 [dependencies]
 sbtp-core = { workspace = true, features = ["std"] }
+sbtp-l2 = { workspace = true, optional = true }
+sbtp-seal = { workspace = true, optional = true }
 wasm-bindgen.workspace = true
 js-sys.workspace = true
 getrandom.workspace = true
