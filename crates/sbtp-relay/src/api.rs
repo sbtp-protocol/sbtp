@@ -39,7 +39,9 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
     let queries = Router::new()
         .route("/sbtp/v1/query", get(query::<I>))
         .with_state(Arc::new(
-            QueryState::new(settings, relay.index().clone()).with_clock(relay.clock()),
+            QueryState::new(settings, relay.index().clone())
+                .with_clock(relay.clock())
+                .with_deny(Arc::clone(relay.deny_arc())),
         ));
     // ADR 0051 rules 1 to 12.
     let batches = Router::new()
@@ -79,10 +81,10 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
 }
 
 /// The JSON body of `GET /sbtp/v1/info`: the members of ADR 0007 rule 11, ADR 0012 rule 20,
-/// ADR 0046 rule 4 and ADR 0051 rule 31, nothing else (ADR 0018 rule 38). `software` (ADR 0012 rule 21, optional) is not published
+/// ADR 0046 rule 4, ADR 0051 rule 31 and ADR 0052 rule 11, nothing else (ADR 0018 rule 38). `software` (ADR 0012 rule 21, optional) is not published
 /// (ADR 0019 rule 25).
 fn info_body(s: &Settings) -> String {
-    serde_json::json!({
+    let mut info = serde_json::json!({
         "min_pow_difficulty": s.min_pow_difficulty,
         "max_future_ms": s.max_future_ms,
         "block_versions": [sbtp_core::layout::VERSION_V1],
@@ -93,8 +95,15 @@ fn info_body(s: &Settings) -> String {
         "demand_eviction": s.demand_eviction,
         // ADR 0051 rule 31: every rule of ADR 0051 is implemented.
         "read_api": 2,
-    })
-    .to_string()
+    });
+    // ADR 0052 rule 11: present when `deny_file` is set, whatever its entries; nothing about
+    // them. An absent member reads as `false`.
+    if s.deny_file.is_some()
+        && let Some(o) = info.as_object_mut()
+    {
+        o.insert("deny_list".into(), true.into());
+    }
+    info.to_string()
 }
 
 /// Wraps `router` in the relay's middleware.

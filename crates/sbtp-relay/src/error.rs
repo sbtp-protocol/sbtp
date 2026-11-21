@@ -4,6 +4,9 @@ use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+/// The message of every `451` (ADR 0052 rule 6): fixed, independent of the entry.
+const DENIED_MESSAGE: &str = "the operator of this relay does not serve this block";
+
 /// A relay error: an HTTP status, an error name of ADR 0012 rule 17 and an optional message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -114,6 +117,20 @@ impl ApiError {
         }
     }
 
+    /// `451 Denied` (ADR 0052 rule 6): the operator of this relay does not serve the block. A
+    /// fixed message, the same for every entry and every ground.
+    #[must_use]
+    pub fn denied() -> Self {
+        Self::new(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "Denied").with_message(DENIED_MESSAGE)
+    }
+
+    /// `451 DeniedKey` (ADR 0052 rule 7): a `PUT` of a block whose public key is denied.
+    #[must_use]
+    pub fn denied_key() -> Self {
+        Self::new(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "DeniedKey")
+            .with_message(DENIED_MESSAGE)
+    }
+
     /// `500 Internal`. No detail is disclosed.
     #[must_use]
     pub fn internal() -> Self {
@@ -183,6 +200,13 @@ impl IntoResponse for ApiError {
         );
         // ADR 0012 rule 32: error responses are not cached.
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        // ADR 0052 rule 10: no shared cache keeps a denial the operator may lift.
+        if self.status == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
+            h.insert(
+                header::HeaderName::from_static("cdn-cache-control"),
+                HeaderValue::from_static("no-store"),
+            );
+        }
         if let Some(s) = self.retry_after_s {
             h.insert(header::RETRY_AFTER, HeaderValue::from(s));
         }

@@ -475,6 +475,13 @@ impl<I: IndexBackend<Error = IndexError> + CursorStore + 'static> Shared<I> {
                     w.resume_after = Some(*id);
                     continue;
                 }
+                // ADR 0052 rule 17: a listed `block_id` is skipped without a fetch.
+                if self.relay.deny().list().is_some_and(|l| l.denies_id(id)) {
+                    crate::metrics::denied(crate::metrics::DenyRoute::Replication, false, 1);
+                    metrics::skipped(peer, Skip::Denied);
+                    w.resume_after = Some(*id);
+                    continue;
+                }
                 let now = Instant::now();
                 if fetched >= TURN_FETCHES {
                     return (w, now);
@@ -540,6 +547,12 @@ impl<I: IndexBackend<Error = IndexError> + CursorStore + 'static> Shared<I> {
             metrics::skipped(peer, Skip::NotFound);
             return Fetched::Handled;
         }
+        // ADR 0052 rule 17: a peer's `451` is a skip, like a `404`, not retried in this walk and
+        // never a reason to deny the block here.
+        if reply.status == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
+            metrics::skipped(peer, Skip::Denied);
+            return Fetched::Handled;
+        }
         if !reply.status.is_success() {
             return Fetched::Failed(fail(Failed::Client));
         }
@@ -547,6 +560,11 @@ impl<I: IndexBackend<Error = IndexError> + CursorStore + 'static> Shared<I> {
             Replicated::New => metrics::stored(peer),
             Replicated::Known => metrics::skipped(peer, Skip::Held),
             Replicated::Future => metrics::skipped(peer, Skip::Future),
+            // ADR 0052 rule 17: discarded after validation, never stored.
+            Replicated::Denied(m) => {
+                crate::metrics::denied(crate::metrics::DenyRoute::Replication, m.is_key(), 1);
+                metrics::skipped(peer, Skip::Denied);
+            }
             Replicated::Invalid => {
                 metrics::skipped(peer, Skip::Invalid);
                 return Fetched::Invalid;

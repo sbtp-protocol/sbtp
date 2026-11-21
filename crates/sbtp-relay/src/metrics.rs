@@ -796,6 +796,109 @@ pub fn ingest_snapshot() -> [(&'static str, u64); 9] {
     ]
 }
 
+/// The `route` label of `denied_total` (ADR 0052 rule 20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyRoute {
+    /// `PUT /sbtp/v1/block`.
+    Put,
+    /// `GET` or `HEAD /sbtp/v1/block/{id}`.
+    Get,
+    /// A record of `POST /sbtp/v1/blocks`.
+    Batch,
+    /// An identifier left out of a `/query` page.
+    Query,
+    /// A block replication skipped or discarded (ADR 0048).
+    Replication,
+    /// A read-through fetch (ADR 0050 rules 15 to 19).
+    Fallback,
+    /// A block the archive copy did not upload (ADR 0050).
+    Mirror,
+}
+
+impl DenyRoute {
+    /// Every route, in label order.
+    pub const ALL: [Self; 7] = [
+        Self::Put,
+        Self::Get,
+        Self::Batch,
+        Self::Query,
+        Self::Replication,
+        Self::Fallback,
+        Self::Mirror,
+    ];
+
+    /// The label value.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Get => "get",
+            Self::Batch => "batch",
+            Self::Query => "query",
+            Self::Replication => "replication",
+            Self::Fallback => "fallback",
+            Self::Mirror => "mirror",
+        }
+    }
+}
+
+/// `denied_total{route, match}`: `route` major, `match` (`block`, `key`) minor.
+static DENIED: [AtomicU64; 14] = zeros();
+/// `deny_entries{kind}`: `block`, `key`.
+static DENY_ENTRIES: [AtomicU64; 2] = zeros();
+/// `deny_marking_pending`.
+static DENY_MARKING_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `n` denied blocks on `route` (ADR 0052 rule 20); `key` is a match by public key.
+/// Never a client tag, never a `block_id`.
+pub fn denied(route: DenyRoute, key: bool, n: u64) {
+    if let Some(c) = DENIED.get(route as usize * 2 + usize::from(key)) {
+        c.fetch_add(n, Relaxed);
+    }
+}
+
+/// `denied_total{route, match}` since start-up.
+#[must_use]
+pub fn denied_total(route: DenyRoute, key: bool) -> u64 {
+    DENIED
+        .get(route as usize * 2 + usize::from(key))
+        .map_or(0, |n| n.load(Relaxed))
+}
+
+/// Sets the `deny_entries` gauges.
+pub fn set_deny_entries(blocks: u64, keys: u64) {
+    let [b, k] = &DENY_ENTRIES;
+    b.store(blocks, Relaxed);
+    k.store(keys, Relaxed);
+}
+
+/// Sets the `deny_marking_pending` gauge.
+pub fn set_deny_marking_pending(n: u64) {
+    DENY_MARKING_PENDING.store(n, Relaxed);
+}
+
+/// The deny list counters and gauges, by their ADR 0052 rule 20 names (tests, `/metrics` later).
+#[must_use]
+pub fn deny_snapshot() -> Vec<(String, u64)> {
+    let mut out = Vec::with_capacity(DENIED.len() + 3);
+    for r in DenyRoute::ALL {
+        for (key, m) in [(false, "block"), (true, "key")] {
+            out.push((
+                format!("denied_total{{route=\"{}\",match=\"{m}\"}}", r.name()),
+                denied_total(r, key),
+            ));
+        }
+    }
+    let [b, k] = &DENY_ENTRIES;
+    out.push(("deny_entries{kind=\"block\"}".to_owned(), b.load(Relaxed)));
+    out.push(("deny_entries{kind=\"key\"}".to_owned(), k.load(Relaxed)));
+    out.push((
+        "deny_marking_pending".to_owned(),
+        DENY_MARKING_PENDING.load(Relaxed),
+    ));
+    out
+}
+
 /// `demand_lost_total` since start-up.
 #[must_use]
 pub fn demand_lost_total() -> u64 {
@@ -903,6 +1006,9 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("demand_suspended", DEMAND_SUSPENDED.load(Relaxed)),
         ("not_modified", BLOCK_NOT_MODIFIED.load(Relaxed)),
         ("ingest_capped", INGEST_CAPPED.load(Relaxed)),
+        // ADR 0052 rule 20: every route and match together.
+        ("denied", sum(&DENIED)),
+        ("deny_marking_pending", DENY_MARKING_PENDING.load(Relaxed)),
         ("ingest_group_limited", sum(&INGEST_GROUP_LIMITED)),
         (
             "ingest_group_unchecked",

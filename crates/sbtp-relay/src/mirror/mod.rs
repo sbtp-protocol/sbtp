@@ -99,7 +99,8 @@ pub mod metrics {
     const POISONED: usize = 4;
     const LAG_BLOCKS: usize = 5;
     const LAG_MS: usize = 6;
-    const FAILED: usize = 7;
+    const DENIED: usize = 7;
+    const FAILED: usize = 8;
     static C: [AtomicU64; FAILED + 4] = [const { AtomicU64::new(0) }; FAILED + 4];
 
     fn add(i: usize) {
@@ -130,6 +131,9 @@ pub mod metrics {
     }
     pub(super) fn poisoned() {
         add(POISONED);
+    }
+    pub(super) fn denied() {
+        add(DENIED);
     }
     pub(super) fn failed(c: Class) {
         add(FAILED + c as usize);
@@ -165,6 +169,11 @@ pub mod metrics {
     #[must_use]
     pub fn poisoned_total() -> u64 {
         get(POISONED)
+    }
+    /// `mirror_denied_total` (ADR 0052 rule 18).
+    #[must_use]
+    pub fn denied_total() -> u64 {
+        get(DENIED)
     }
     /// `mirror_failed_total{status}`.
     #[must_use]
@@ -308,14 +317,6 @@ impl Mirror {
             None
         };
         let info = s.mirror_info.then(|| Bytes::from(info_body(s)));
-        log::emit(
-            Event::Mirror,
-            &[
-                ("in_flight", Value::Int(s.mirror_max_in_flight)),
-                ("info", Value::Bool(info.is_some())),
-                ("verify", Value::Bool(s.mirror_public_url.is_some())),
-            ],
-        );
         Ok(Some(Self {
             target,
             creds,
@@ -331,6 +332,18 @@ impl Mirror {
                 max_backoff: Duration::from_secs(s.mirror_max_backoff_s),
             },
         }))
+    }
+
+    /// The start-up line `mirror` (ADR 0050 rule 29), written after the `setting` lines.
+    pub fn announce(&self, s: &Settings) {
+        log::emit(
+            Event::Mirror,
+            &[
+                ("in_flight", Value::Int(s.mirror_max_in_flight)),
+                ("info", Value::Bool(self.info.is_some())),
+                ("verify", Value::Bool(s.mirror_public_url.is_some())),
+            ],
+        );
     }
 
     /// Starts the uploader. The task ends when `stop` turns `true`, or if it panics: the caller
@@ -618,6 +631,12 @@ impl Shared {
             }
             Copied::Damaged => {
                 metrics::damaged();
+                return Attempt::Done;
+            }
+            // ADR 0052 rule 18: not uploaded, done, so that the cursor passes it.
+            Copied::Denied(m) => {
+                metrics::denied();
+                crate::metrics::denied(crate::metrics::DenyRoute::Mirror, m.is_key(), 1);
                 return Attempt::Done;
             }
             Copied::Retry => {

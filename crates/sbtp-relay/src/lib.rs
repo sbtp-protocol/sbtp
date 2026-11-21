@@ -20,6 +20,7 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod demand;
+pub mod deny;
 pub mod error;
 pub mod index;
 pub mod ingest;
@@ -137,12 +138,19 @@ where
         log::client_tag_key().map_err(|e| StartError::Io("drawing the client tag key", e))?;
     }
     log::global().configure(&LogConfig::from_settings(&settings));
-    log_settings(&settings)?;
-    // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
-    let replication = prepare_replication(&settings)?;
-    // ADR 0050 rule 22: the credentials are read once, from the start-up environment.
+    // ADR 0050 rule 22: the credentials are read once, from the start-up environment. Security
+    // review 2026-11-21 (archive copy), L-1: before the `setting` lines, so that a `*_ref`
+    // setting holding a value instead of a variable name stops the start-up before it is
+    // logged.
     let mirror = prepare_mirror(&settings, &env_kept)?;
     drop(env_kept);
+    log_settings(&settings)?;
+    announce_mirror(mirror.as_ref(), &settings);
+    // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
+    let replication = prepare_replication(&settings)?;
+    // ADR 0052 rule 4: an invalid or missing `deny_file` stops the start-up, before anything
+    // is opened; the line number and a fixed reason only, never the line's content.
+    let deny = Arc::new(deny::Deny::open(&settings).map_err(StartError::Config)?);
 
     // Mode `0700` for what this creates (security review L-4); an existing directory is kept.
     store::dir_builder()
@@ -195,7 +203,7 @@ where
             Ok(relay) => {
                 start.empty = empty;
                 relay.demand().start(&start, log::unix_ms());
-                let relay = Arc::new(relay);
+                let relay = Arc::new(relay.with_deny(deny));
                 let kept = Arc::clone(&relay);
                 let app = api::app(&settings, Arc::clone(&relay));
                 let drain = serve(
@@ -302,6 +310,21 @@ fn prepare_mirror(
     _: &[(OsString, OsString)],
 ) -> Result<Option<Mirrorer>, StartError> {
     Ok(None)
+}
+
+/// The start-up line of the archive copy, when prepared.
+fn announce_mirror(m: Option<&Mirrorer>, settings: &Settings) {
+    #[cfg(feature = "object-store")]
+    if let Some(m) = m {
+        m.announce(settings);
+    }
+    #[cfg(not(feature = "object-store"))]
+    {
+        let _ = settings;
+        if let Some(never) = m {
+            match *never {}
+        }
+    }
 }
 
 /// Starts the archive copy, when prepared; the task ends at the stop, or if it panics.
@@ -470,6 +493,19 @@ where
         let mut replicator = spawn_replication(replication, &relay, &stopped);
         // ADR 0050: the archive copy, likewise.
         let mut mirrorer = spawn_mirror(mirror, &relay, &stopped);
+        // ADR 0052 rule 4: the reload task and the marking pass, likewise; `SIGHUP` asks for a
+        // reload. Without `deny_file`, `SIGHUP` keeps its default action.
+        let batch = usize::try_from(settings.sweep_batch).unwrap_or(index::MAX_QUERY_LIMIT);
+        let mut denier = if relay.deny().enabled() {
+            spawn_hangup(&relay)?;
+            Some(tokio::spawn(deny::run(
+                Arc::clone(&relay),
+                batch,
+                stopped.clone(),
+            )))
+        } else {
+            None
+        };
         let mut sweeper = tokio::spawn(sweep::run(
             relay,
             std::time::Duration::from_millis(settings.sweep_interval_ms),
@@ -493,6 +529,11 @@ where
                 log::flush();
                 std::process::exit(pool::EXIT_THREAD_ENDED);
             }
+            () = ended(denier.as_mut()) => {
+                log::emit(Event::Fatal, &[("msg", Value::Str("the deny list task ended"))]);
+                log::flush();
+                std::process::exit(pool::EXIT_THREAD_ENDED);
+            }
         };
         let _ = stop.send(true);
         let _ = sweeper.await;
@@ -500,6 +541,9 @@ where
             let _ = h.await;
         }
         if let Some(h) = mirrorer {
+            let _ = h.await;
+        }
+        if let Some(h) = denier {
             let _ = h.await;
         }
         // ADR 0046 rule 12: the last flush of the demand set, at a clean shutdown, after the
@@ -513,6 +557,28 @@ where
         }
         Ok(drain)
     })
+}
+
+/// ADR 0052 rule 4: forwards each `SIGHUP` to the deny list as a reload request, for the life
+/// of the process.
+#[cfg(unix)]
+fn spawn_hangup(relay: &Arc<Relay<RedbIndex>>) -> Result<(), StartError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = signal(SignalKind::hangup())
+        .map_err(|e| StartError::Io("installing signal handlers", e))?;
+    let deny = Arc::clone(relay.deny_arc());
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            deny.request_reload();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // The signature of the unix build.
+fn spawn_hangup(_: &Arc<Relay<RedbIndex>>) -> Result<(), StartError> {
+    Ok(())
 }
 
 /// The stop signal of the shipped binary: `SIGTERM` or `SIGINT`. The handlers stay installed,

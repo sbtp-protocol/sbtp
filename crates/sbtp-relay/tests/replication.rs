@@ -659,3 +659,60 @@ fn replication_settings_are_checked_at_start_up() {
         ("PEER_CA_FILE", ca.to_str().unwrap())
     ]));
 }
+
+/// ADR 0052 rule 17: a `block_id` on the replica's own deny list is skipped without a fetch; a
+/// fetched block whose key is listed is discarded after validation; a peer's `451` is a skip,
+/// counted `denied`, not retried in the walk, and never a denial on the replica.
+#[test]
+fn replication_skips_denied_blocks() {
+    let _g = serial();
+    let (listed, listed_b) = block(b"listed by id", 0);
+    let other = SigningKey::from_bytes(&[23; 32]);
+    let keyed_b = BlockBuilder::for_key(&other)
+        .timestamp(now_ms())
+        .payload(b"listed by key")
+        .build(&other, 0)
+        .unwrap();
+    let keyed = sbtp_core::parse(&keyed_b).unwrap().block_id();
+    let key_hex = BlockId(*sbtp_core::parse(&keyed_b).unwrap().pubkey()).to_string();
+    let (refused, refused_b) = block(b"451 at the peer", 0);
+    let (good, good_b) = block(b"replicated", 0);
+    let ids = [listed, keyed, refused, good];
+    let peer = Peer::start(move |t| {
+        let is = |id: &BlockId| t.ends_with(&id.to_string());
+        if !t.contains("/sbtp/v1/block/") {
+            Answer::page(&ids, "c1", false)
+        } else if is(&listed) {
+            Answer::ok(listed_b.clone())
+        } else if is(&keyed) {
+            Answer::ok(keyed_b.clone())
+        } else if is(&refused) {
+            Answer::status(451)
+        } else {
+            Answer::ok(good_b.clone())
+        }
+    });
+    let dir = tmp_dir("repl-deny");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("deny.txt");
+    std::fs::write(&file, format!("block {listed}\nkey {key_hex}\n")).unwrap();
+    let denied = metrics::skipped_total(0, Skip::Denied);
+    let b = Node::start(
+        &dir.join("data"),
+        "127.0.0.1:0",
+        &[
+            ("PEERS", &peer.url()),
+            ("DENY_FILE", file.to_str().unwrap()),
+        ],
+    );
+    assert!(wait_until(Duration::from_secs(15), || b.holds(&good)));
+    assert!(wait_until(Duration::from_secs(5), || {
+        metrics::skipped_total(0, Skip::Denied) - denied >= 3
+    }));
+    assert_eq!(peer.count(&listed.to_string()), 0, "never fetched");
+    assert_eq!(peer.count(&keyed.to_string()), 1, "fetched, then discarded");
+    assert_eq!(peer.count(&refused.to_string()), 1, "not retried");
+    assert_eq!(b.listed(), vec![good.to_string()]);
+    // The peer's `451` is not a denial here: the block is accepted from a client.
+    assert_eq!(b.put(&refused_b), 201);
+}

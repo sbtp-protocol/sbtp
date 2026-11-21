@@ -205,6 +205,10 @@ events! {
     Mirror => "mirror", Info, Startup;
     MirrorFailed => "mirror_failed", Warn, Bounded;
     MirrorPoisoned => "mirror_poisoned", Error, Bounded;
+    // ADR 0052 rule 20 (adds two rows to rule 7; the ADR names them without a table, the levels
+    // are this implementation's). Counts, a line number and a fixed reason only.
+    DenyListLoaded => "deny_list_loaded", Info, Bounded;
+    DenyListInvalid => "deny_list_invalid", Error, Bounded;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1200,6 +1204,13 @@ mod tests {
             assert!(adr0050.contains(&format!("`{name}`")), "{name}");
         }
         table.extend_from_slice(&mirror);
+        // ADR 0052 rule 20 names two events without a level table.
+        let adr0052 = include_str!("../../../docs/decisions/0052-operator-deny-list.md");
+        let deny = [("deny_list_loaded", "info"), ("deny_list_invalid", "error")];
+        for (name, _) in deny {
+            assert!(adr0052.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&deny);
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))

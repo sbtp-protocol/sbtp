@@ -47,10 +47,19 @@ impl RelayProcess {
     /// Starts the binary on `data` with only the listen address and the data directory set: every
     /// other setting is the built-in default. Waits for its `listening` line.
     fn start(data: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sbtp-relay"))
-            .env_clear()
+        Self::start_with(data, &[])
+    }
+
+    /// [`RelayProcess::start`] with extra `SBTP_RELAY_*` settings (`SBTP_RELAY_` left out).
+    fn start_with(data: &Path, extra: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbtp-relay"));
+        cmd.env_clear()
             .env("SBTP_RELAY_LISTEN", "127.0.0.1:0")
-            .env("SBTP_RELAY_DATA_DIR", data)
+            .env("SBTP_RELAY_DATA_DIR", data);
+        for (k, v) in extra {
+            cmd.env(format!("SBTP_RELAY_{k}"), v);
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -346,4 +355,97 @@ fn blocks_and_cursors_survive_a_clean_restart() {
     assert_eq!((ids, more), (vec![hex(&b_id)], false));
     let (status, log) = second.stop();
     assert!(status.success(), "{status}\n{log}");
+}
+
+/// ADR 0052 rules 4 and 20: `SIGHUP` reloads the deny list (polling is set to an hour, so only
+/// the signal can have done it); the relay keeps running. The log carries the counts of the list
+/// and the path of `deny_file`, never a `block_id` or a key from it, and nothing for the denied
+/// requests.
+#[test]
+fn sighup_reloads_the_deny_list() {
+    let dir = tmp_dir("e2e-deny");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("deny.txt");
+    std::fs::write(&file, "# empty\n").unwrap();
+    let relay = RelayProcess::start_with(
+        &dir.join("data"),
+        &[
+            ("DENY_FILE", file.to_str().unwrap()),
+            ("DENY_RELOAD_MS", "3600000"),
+        ],
+    );
+    let mut c = relay.connect();
+    let (bytes, id) = mined(41, MARKER.as_bytes(), &[], DIFFICULTY);
+    assert_eq!(put_block(&mut c, &bytes).status, 201);
+    let key = hex(&BlockId(*sbtp_core::parse(&bytes).unwrap().pubkey()));
+    std::fs::write(&file, format!("key {key}\nblock {}\n", hex(&id))).unwrap();
+    let path = format!("/sbtp/v1/block/{}", hex(&id));
+    assert_eq!(http_get(&mut c, &path, "").status, 200, "not reloaded yet");
+    let pid = relay.child.as_ref().unwrap().id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let t = Instant::now();
+    while http_get(&mut c, &path, "").status != 451 {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "SIGHUP did not reload"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(put_block(&mut c, &bytes).status, 451);
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{log}");
+    assert!(
+        log.contains("event=deny_list_loaded blocks=1 keys=1 purge=0"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("name=deny_file value={}", file.display())),
+        "{log}"
+    );
+    assert!(!log.contains(&key), "a key in the log");
+    assert!(!log.contains(&hex(&id)[56..]), "a block_id in the log");
+    assert!(!log.contains(MARKER));
+}
+
+/// Security review 2026-11-21 (archive copy), L-1: a value pasted into a `*_ref` setting
+/// instead of a variable name, which passes the name check, stops the start-up before any
+/// `setting` line: it appears in no line of the log.
+#[cfg(feature = "object-store")]
+#[test]
+fn a_value_in_a_ref_setting_is_never_logged() {
+    // Shaped like a variable name, as an identifier pasted by mistake would be.
+    const PASTED: &str = "PASTEDVALUEX7Q2Z9W4K8";
+    for setting in [
+        "MIRROR_ACCESS_KEY_REF",
+        "MIRROR_SECRET_KEY_REF",
+        "MIRROR_SESSION_TOKEN_REF",
+    ] {
+        let data = tmp_dir("e2e-ref");
+        let out = Command::new(env!("CARGO_BIN_EXE_sbtp-relay"))
+            .env_clear()
+            .env("SBTP_RELAY_LISTEN", "127.0.0.1:0")
+            .env("SBTP_RELAY_DATA_DIR", &data)
+            .env("SBTP_RELAY_MIRROR_ENDPOINT", "https://s3.example")
+            .env("SBTP_RELAY_MIRROR_BUCKET", "archive")
+            .env(format!("SBTP_RELAY_{setting}"), PASTED)
+            .env("SBTP_MIRROR_ACCESS_KEY_ID", "test-access")
+            .env("SBTP_MIRROR_SECRET_ACCESS_KEY", "test-secret")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{setting}: {log}");
+        assert!(log.contains("event=fatal"), "{setting}: {log}");
+        assert!(!log.contains("event=setting"), "{setting}: {log}");
+        for line in log.lines() {
+            assert!(!line.contains(PASTED), "{setting}: {line}");
+        }
+        assert!(!data.exists(), "nothing is opened");
+    }
 }

@@ -73,6 +73,10 @@ pub struct TestServer {
     /// One sweeper run (`sweep::sweep_once` with a batch of 1,000) over the server's relay; the
     /// test server runs no sweeper task of its own.
     sweeper: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// The whole marking pass of the deny list (ADR 0052), batches of 2 blocks.
+    marker: Box<dyn Fn() -> bool + Send + Sync>,
+    /// The deny list, loaded from `deny_file` when set; its reload task runs on the server.
+    pub deny: std::sync::Arc<sbtp_relay::deny::Deny>,
 }
 
 impl TestServer {
@@ -126,13 +130,18 @@ impl TestServer {
         reconcile(&store, &*index).unwrap();
         let pool = IndexPool::start(&index, settings).unwrap();
         drop(index); // Held by the index threads from here on.
+        let deny = std::sync::Arc::new(sbtp_relay::deny::Deny::open(settings).unwrap());
         let relay = std::sync::Arc::new(
             Relay::new(settings, store, pool.handle())
                 .unwrap()
-                .with_clock(clock),
+                .with_clock(clock)
+                .with_deny(std::sync::Arc::clone(&deny)),
         );
         let swept = std::sync::Arc::clone(&relay);
         let sweeper = Box::new(move || sbtp_relay::sweep::sweep_once(&swept, 1_000));
+        let walked = std::sync::Arc::clone(&relay);
+        let marker = Box::new(move || sbtp_relay::deny::mark_all(&walked, 2));
+        let denied = std::sync::Arc::clone(&relay);
         let app = sbtp_relay::api::layered(
             sbtp_relay::api::routes(settings, relay).merge(extra),
             settings,
@@ -149,7 +158,17 @@ impl TestServer {
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                // ADR 0052 rule 4: the reload task, as `sbtp_relay::run` starts it.
+                let (deny_stop, deny_stopped) = tokio::sync::watch::channel(false);
+                let task = denied
+                    .deny()
+                    .enabled()
+                    .then(|| tokio::spawn(sbtp_relay::deny::run(denied, 2, deny_stopped)));
                 serve(listener, app, limits, stopped).await.unwrap();
+                let _ = deny_stop.send(true);
+                if let Some(t) = task {
+                    let _ = t.await;
+                }
             });
         });
         Self {
@@ -159,6 +178,8 @@ impl TestServer {
             thread: Some(thread),
             pool: Some(Box::new(pool)),
             sweeper,
+            marker,
+            deny,
         }
     }
 
@@ -169,6 +190,11 @@ impl TestServer {
     /// One sweeper run; the number of index entries removed, `None` on a failure.
     pub fn sweep(&self) -> Option<u64> {
         (self.sweeper)()
+    }
+
+    /// The whole marking pass of the deny list; `false` on a failure.
+    pub fn mark(&self) -> bool {
+        (self.marker)()
     }
 }
 

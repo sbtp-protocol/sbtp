@@ -432,6 +432,8 @@ pub struct QueryState<I> {
     retry_after_s: u64,
     /// The relay clock in Unix milliseconds ([`log::unix_ms`]; a test clock in unit tests).
     clock: fn() -> u64,
+    /// ADR 0052 rule 9: the operator deny list.
+    deny: Arc<crate::deny::Deny>,
 }
 
 impl<I: IndexBackend + 'static> QueryState<I> {
@@ -444,7 +446,15 @@ impl<I: IndexBackend + 'static> QueryState<I> {
             block_ttl_ms: s.block_ttl_ms,
             retry_after_s: s.shed_retry_after_s,
             clock: log::unix_ms,
+            deny: Arc::new(crate::deny::Deny::off()),
         }
+    }
+
+    /// Applies the operator deny list (ADR 0052 rule 9).
+    #[must_use]
+    pub fn with_deny(mut self, deny: Arc<crate::deny::Deny>) -> Self {
+        self.deny = deny;
+        self
     }
 
     /// Replaces the clock of the expiry bound (the relay clock, `blocks::Relay::clock`).
@@ -520,6 +530,8 @@ pub async fn query<I: IndexBackend + 'static>(
         lower: since,
         limit: usize::try_from(limit).unwrap_or(MAX_QUERY_LIMIT),
         fields,
+        // ADR 0052 rule 9: the list in force when the request is handled.
+        deny: q.deny.list(),
     };
     let (ttl, clock) = (q.block_ttl_ms, q.clock);
     // ADR 0051 rule 25: one job of the reader threads, one read transaction.
@@ -556,6 +568,10 @@ pub async fn query<I: IndexBackend + 'static>(
             return ApiError::unavailable(q.retry_after_s).into_response();
         }
     };
+    // ADR 0052 rule 20: counted, never logged.
+    let (by_id, by_key) = answer.denied;
+    metrics::denied(metrics::DenyRoute::Query, false, by_id);
+    metrics::denied(metrics::DenyRoute::Query, true, by_key);
     let body = if grouped.is_empty() {
         let page = answer.pages.first().unwrap_or(&EMPTY_PAGE);
         page_body(epoch, page, answer.head)

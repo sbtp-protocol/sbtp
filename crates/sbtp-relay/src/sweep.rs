@@ -1007,16 +1007,44 @@ mod demand_tests {
         let store = Store::open(&dir, measured, settings.max_store_bytes).unwrap();
         store::reconcile(&store, &*index).unwrap();
         let pool = IndexPool::start(&index, &settings).unwrap();
+        let deny = Arc::new(crate::deny::Deny::open(&settings).unwrap());
         let relay = Arc::new(
             Relay::new(&settings, store, pool.handle())
                 .unwrap()
-                .with_clock(clock),
+                .with_clock(clock)
+                .with_deny(deny),
         );
         Fixture {
             relay,
             dir,
             _pool: pool,
         }
+    }
+
+    /// ADR 0052 rule 15 (amends ADR 0046 rule 10): a `GET` answered `451`, with or without
+    /// `If-None-Match`, is not a demand; the same block is a demand once the entry is lifted.
+    #[tokio::test]
+    async fn a_denied_read_is_not_demand() {
+        fn now() -> u64 {
+            T0
+        }
+        let list = std::env::temp_dir().join(format!("sbtp-deny-demand-{}", std::process::id()));
+        std::fs::write(&list, "").unwrap();
+        let f = fixture("deny", now, &[("DENY_FILE", list.to_str().unwrap())]);
+        let (bytes, id) = block(1, 16, &[]);
+        assert_eq!(put(&f, &bytes).await.status(), StatusCode::CREATED);
+        std::fs::write(&list, format!("block {id}\n")).unwrap();
+        assert_eq!(f.relay.deny().reload(), crate::deny::Reload::Loaded);
+        for inm in [None, Some(format!("\"{id}\""))] {
+            let r = get(&f, &id, inm.as_deref()).await;
+            assert_eq!(r.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        }
+        assert!(!f.relay.demand().contains(&id), "a 451 is not demand");
+        std::fs::write(&list, "").unwrap();
+        assert_eq!(f.relay.deny().reload(), crate::deny::Reload::Loaded);
+        assert_eq!(get(&f, &id, None).await.status(), StatusCode::OK);
+        assert!(f.relay.demand().contains(&id));
+        let _ = std::fs::remove_file(&list);
     }
 
     /// A block of `len` payload bytes, distinct per `n`, with `parents`.

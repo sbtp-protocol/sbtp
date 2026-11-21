@@ -22,11 +22,12 @@ use crate::cache::BlockCache;
 use crate::client::Counts;
 use crate::config::Settings;
 use crate::demand::{Demand, epoch_start};
+use crate::deny::{Deny, Match, pubkey_of};
 use crate::error::ApiError;
 use crate::index::{FileState, IndexBackend, Position};
 use crate::ingest::{Ingest, Ticket};
 use crate::log::{self, Event, Level, Throttle, Value};
-use crate::metrics::{self, Accepted, Damage, Refused, StorageFull, StoreOp};
+use crate::metrics::{self, Accepted, Damage, DenyRoute, Refused, StorageFull, StoreOp};
 use crate::pool::{IndexHandle, PoolError};
 use crate::query::expiry_floor;
 use crate::server::RequestClient;
@@ -135,12 +136,17 @@ pub struct Relay<I> {
     sweep_retry_after_s: u64,
     /// ADR 0049: the byte budgets per network group and the global cap under disk pressure.
     ingest: Ingest,
+    /// ADR 0052: the operator deny list, off unless [`Relay::with_deny`] sets one.
+    deny: Arc<Deny>,
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Tests: run by [`Relay::evict_locked`] right after each file deletion, under the lock.
     #[cfg(test)]
     after_evict: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Tests: run by [`Relay::load`] before each move of a damaged file to quarantine.
+    #[cfg(test)]
+    before_quarantine: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl<I: IndexBackend + 'static> Relay<I> {
@@ -189,10 +195,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
             low_water_pct: s.demand_low_water_pct,
             sweep_retry_after_s: s.sweep_interval_ms.div_ceil(1_000),
             ingest: Ingest::from_settings(s)?,
+            deny: Arc::new(Deny::off()),
             #[cfg(test)]
             before_insert: Mutex::new(None),
             #[cfg(test)]
             after_evict: Mutex::new(None),
+            #[cfg(test)]
+            before_quarantine: Mutex::new(None),
         })
     }
 
@@ -269,6 +278,25 @@ impl<I: IndexBackend + 'static> Relay<I> {
     #[must_use]
     pub fn ingest(&self) -> &Ingest {
         &self.ingest
+    }
+
+    /// Applies the operator deny list `deny` (ADR 0052), loaded by [`Deny::open`].
+    #[must_use]
+    pub fn with_deny(mut self, deny: Arc<Deny>) -> Self {
+        self.deny = deny;
+        self
+    }
+
+    /// The operator deny list (ADR 0052).
+    #[must_use]
+    pub fn deny(&self) -> &Deny {
+        &self.deny
+    }
+
+    /// The operator deny list, shared (ADR 0052).
+    #[must_use]
+    pub fn deny_arc(&self) -> &Arc<Deny> {
+        &self.deny
     }
 
     /// The relay clock.
@@ -422,6 +450,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
             }));
         }
         *seen = Some(id);
+        // spec §4 `PUT` step 5, ADR 0052 rule 7: after C3, before storage, whether or not the
+        // block is held. C2 and C3 run first, so that only a holder of a validly signed block
+        // learns of the denial; a block that fails them gets their answer.
+        if let Some(m) = self.deny.check(&id, Some(block.pubkey())) {
+            checked.verify_signature().map_err(Rejection::Block)?;
+            return Err(Rejection::Denied(m));
+        }
         // Held until the index insert: one `PUT` of a given block at a time.
         let _id = self.lock_id(&id);
         let result = self.decide(bytes, id, &block, checked, ticket);
@@ -465,6 +500,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
             Ok(Err(Rejection::Block(_))) => Replicated::Invalid,
             Ok(Err(Rejection::Future)) => Replicated::Future,
             Ok(Err(Rejection::Full(_))) => Replicated::Full,
+            Ok(Err(Rejection::Denied(m))) => Replicated::Denied(m),
             // `Capped` never comes with `Ticket::Replicated` (ADR 0049 rule 9).
             Ok(Err(Rejection::Shed(_) | Rejection::Capped(_))) => Replicated::Busy,
             Ok(Err(Rejection::Internal)) | Err(_) => Replicated::Internal,
@@ -815,6 +851,15 @@ impl<I: IndexBackend + 'static> Relay<I> {
             // The lock of `id`, as on `PUT`, on this rare path only: a `PUT` of the block never
             // sees the final name emptied by this move halfway through its decision.
             let _id = self.lock_id(id);
+            #[cfg(test)]
+            if let Some(f) = self
+                .before_quarantine
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                f();
+            }
             match self.store.quarantine(id, &bytes) {
                 Ok(Quarantine::Moved) => store::log_quarantined(Cause::Get, damage),
                 Ok(Quarantine::MovedUnsynced(e)) => {
@@ -826,7 +871,9 @@ impl<I: IndexBackend + 'static> Relay<I> {
             }
             return Ok(Loaded::Damaged);
         }
-        Ok(Loaded::Absent)
+        // Security review 2026-11-21 (archive copy), L-3: the file changed under the lock twice
+        // in a row; the block may well be held, so this is not "absent".
+        Ok(Loaded::Changed)
     }
 }
 
@@ -838,6 +885,8 @@ enum Loaded {
     Absent,
     /// A damaged file, moved to quarantine (or left in place when the move failed).
     Damaged,
+    /// The file changed during both decisions (a concurrent writer): undecided.
+    Changed,
 }
 
 /// The index entry of a stored block, at the relay clock.
@@ -924,6 +973,8 @@ pub(crate) enum Replicated {
     Future,
     /// No room (`507` for a `PUT`).
     Full,
+    /// The operator denies the block (`451` for a `PUT`, ADR 0052 rule 17).
+    Denied(Match),
     /// No `PUT` permit within `queue_timeout_ms`, or the index writer refused the job.
     Busy,
     /// A local storage or index failure.
@@ -938,6 +989,8 @@ enum Rejection {
     Shed(Refused),
     /// `503`: the global cap of ADR 0049 rule 6, with its `Retry-After` in seconds.
     Capped(u64),
+    /// `451`: the operator denies the block (spec §4 `PUT` step 5, ADR 0052 rule 7).
+    Denied(Match),
     Internal,
 }
 
@@ -980,6 +1033,16 @@ impl<I: IndexBackend + 'static> Relay<I> {
             // ADR 0049 rule 6: counted and logged by `Ingest::check_cap`.
             Rejection::Capped(retry_after_s) => {
                 return ApiError::unavailable(retry_after_s).into_response();
+            }
+            // ADR 0052 rules 7 and 20: `DeniedKey` only when the key is listed and the
+            // `block_id` is not; counted, never logged.
+            Rejection::Denied(m) => {
+                metrics::denied(DenyRoute::Put, m.is_key(), 1);
+                let e = match m {
+                    Match::Block => ApiError::denied(),
+                    Match::Key => ApiError::denied_key(),
+                };
+                return e.into_response();
             }
         };
         if e.status() != StatusCode::INTERNAL_SERVER_ERROR {
@@ -1113,6 +1176,13 @@ pub async fn get_block<I: IndexBackend + 'static>(
     match Arc::clone(&relay).fetch(id).await {
         Fetched::Served(bytes) => relay.block_response(bytes, &id, &headers),
         Fetched::Missing => ApiError::not_found().into_response(),
+        // ADR 0052 rules 6 and 20: before any `304`, whatever `If-None-Match` or
+        // `Sbtp-Replication`; the same answer for a match by block or by key; counted, not
+        // logged, not demand (rule 15).
+        Fetched::Denied(m) => {
+            metrics::denied(DenyRoute::Get, m.is_key(), 1);
+            ApiError::denied().into_response()
+        }
         Fetched::Busy(r) => relay.shed(r, None),
         Fetched::Failed => ApiError::internal().into_response(),
     }
@@ -1131,6 +1201,8 @@ pub(crate) enum Fetched {
     Busy(Refused),
     /// An I/O error while reading, or a failed blocking task: `500`.
     Failed,
+    /// The operator denies the block (ADR 0052 rule 6): `451`, `length = 0` in a batch.
+    Denied(Match),
 }
 
 /// The outcome of [`Relay::read_for_copy`].
@@ -1143,6 +1215,8 @@ pub(crate) enum Copied {
     Absent,
     /// Damaged, moved to quarantine (`mirror_damaged_total`).
     Damaged,
+    /// On the operator deny list (ADR 0052 rule 18, `mirror_denied_total`).
+    Denied(Match),
     /// No permit, an I/O error or a failed task: tried again later.
     Retry,
 }
@@ -1151,8 +1225,25 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// The read path of `GET /block` without its response (ADR 0023 rules 10 and 11): a cache hit
     /// takes no permit and verifies nothing; a miss takes a block-read permit, in which the file
     /// is read and fully validated as one job of the blocking threads, and is cached.
+    ///
+    /// ADR 0052 rule 6: a block whose `block_id` is listed is denied before any read, held or
+    /// not, cached or not; a block whose key is listed is denied once its bytes are read, and a
+    /// miss is then not cached.
     pub(crate) async fn fetch(self: Arc<Self>, id: BlockId) -> Fetched {
+        let deny = self.deny.list();
+        if deny.as_ref().is_some_and(|l| l.denies_id(&id)) {
+            return Fetched::Denied(Match::Block);
+        }
+        let by_key = |bytes: &Bytes| {
+            deny.as_ref()
+                .filter(|l| l.has_keys())
+                .and_then(|l| pubkey_of(bytes).filter(|k| l.denies_key(k)))
+                .is_some()
+        };
         if let Some(bytes) = self.cache.get(&id) {
+            if by_key(&bytes) {
+                return Fetched::Denied(Match::Key);
+            }
             return Fetched::Served(bytes);
         }
         let permit = match self.read.acquire().await {
@@ -1168,11 +1259,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
         })
         .await;
         match loaded {
+            Ok(Ok(Loaded::Bytes(bytes))) if by_key(&bytes) => Fetched::Denied(Match::Key),
             Ok(Ok(Loaded::Bytes(bytes))) => {
                 self.cache_loaded(&id, bytes.clone(), evicted);
                 Fetched::Served(bytes)
             }
-            Ok(Ok(Loaded::Absent | Loaded::Damaged)) => Fetched::Missing,
+            // `Changed` stays a `404` for a read: the client asks again.
+            Ok(Ok(Loaded::Absent | Loaded::Damaged | Loaded::Changed)) => Fetched::Missing,
             Ok(Err(())) | Err(_) => Fetched::Failed,
         }
     }
@@ -1181,8 +1274,23 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// miss takes a block-read permit like a `GET`, but the block is not put in the cache: a walk
     /// of the whole history must not push the blocks clients read out of it.
     #[cfg(feature = "object-store")]
+    ///
+    /// ADR 0052 rule 18: a denied block is never handed to the uploader, by `block_id` before
+    /// any read, by key once read.
     pub(crate) async fn read_for_copy(self: &Arc<Self>, id: BlockId) -> Copied {
+        let deny = self.deny.list();
+        if deny.as_ref().is_some_and(|l| l.denies_id(&id)) {
+            return Copied::Denied(Match::Block);
+        }
+        let by_key = |b: &Bytes| {
+            deny.as_ref()
+                .and_then(|l| pubkey_of(b).filter(|k| l.denies_key(k)))
+                .is_some()
+        };
         if let Some(bytes) = self.cache.get(&id) {
+            if by_key(&bytes) {
+                return Copied::Denied(Match::Key);
+            }
             return Copied::Bytes(bytes);
         }
         let Ok(permit) = self.read.acquire().await else {
@@ -1195,10 +1303,12 @@ impl<I: IndexBackend + 'static> Relay<I> {
         })
         .await;
         match loaded {
+            Ok(Ok(Loaded::Bytes(b))) if by_key(&b) => Copied::Denied(Match::Key),
             Ok(Ok(Loaded::Bytes(b))) => Copied::Bytes(b),
             Ok(Ok(Loaded::Absent)) => Copied::Absent,
             Ok(Ok(Loaded::Damaged)) => Copied::Damaged,
-            Ok(Err(())) | Err(_) => Copied::Retry,
+            // L-3: tried again later, never counted as missed.
+            Ok(Ok(Loaded::Changed) | Err(())) | Err(_) => Copied::Retry,
         }
     }
 
@@ -1363,6 +1473,50 @@ mod tests {
         assert!(!check(&[&"ab".repeat(32)]), "unquoted");
         assert!(!check(&[&format!("\"{}\"", "AB".repeat(32))]), "case");
         assert!(!check(&["\"x,\""]));
+    }
+
+    /// Security review 2026-11-21 (archive copy), L-3: a damaged file that changes under the
+    /// lock in both decisions of a load is not "absent" to the uploader: it is tried again
+    /// (`Copied::Retry`); a `GET` still answers `404`. Once the file stops changing, the
+    /// damaged file is moved to quarantine as before.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn a_file_changing_twice_is_retried_by_the_uploader() {
+        use crate::index::RedbIndex;
+        use crate::pool::IndexPool;
+        let dir = std::env::temp_dir().join(format!("sbtp-blocks-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = Settings::load(Vec::<std::ffi::OsString>::new(), Vec::new()).unwrap();
+        let index_file = dir.join("index.redb");
+        let index = Arc::new(RedbIndex::open(&index_file, 1 << 20).unwrap());
+        let pool = IndexPool::start(&index, &settings).unwrap();
+        let store = Store::open(&dir, index_file, settings.max_store_bytes).unwrap();
+        store::reconcile(&store, &*index).unwrap();
+        let relay = Arc::new(Relay::new(&settings, store, pool.handle()).unwrap());
+        let id = BlockId::from_bytes([0x5a; 32]);
+        let path = relay.store().path(&id);
+        std::fs::write(&path, b"damaged, first").unwrap();
+        // A concurrent writer replaces the damaged file before each move to quarantine.
+        let (writer, rounds) = (path.clone(), Arc::new(AtomicUsize::new(0)));
+        let counted = Arc::clone(&rounds);
+        *relay.before_quarantine.lock().unwrap() = Some(Box::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&writer, format!("damaged, round {n}")).unwrap();
+        }));
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Retry));
+        assert_eq!(rounds.load(Ordering::SeqCst), 2, "both decisions ran");
+        assert!(matches!(
+            Arc::clone(&relay).fetch(id).await,
+            Fetched::Missing
+        ));
+        // The writer stops: the damaged file goes to quarantine.
+        *relay.before_quarantine.lock().unwrap() = None;
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Damaged));
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Absent));
+        drop(relay);
+        assert!(pool.shutdown().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR 0018 clarification M1: an orphan repair that the writer queue refuses (the relay is
