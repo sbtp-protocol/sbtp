@@ -9,4 +9,5 @@ button { font: inherit; margin: 0.2rem 0.3rem 0.2rem 0; }
 pre, .mono { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
 .muted { color: var(--muted); } .bad { color: var(--bad); } .ok { color: var(--ok); }
 .block { border: 1px solid var(--line); border-radius: 4px; padding: 0.4rem; margin: 0.4rem 0; }
+.block.reply { margin-left: 2rem; }
 table { border-collapse: collapse; } td, th { border: 1px solid var(--line); padding: 0.2rem 0.5rem; text-align: right; }

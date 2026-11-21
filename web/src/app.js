@@ -9,11 +9,12 @@ import { openDb } from "./idb.js";
 import { createIdentity, deleteIdentity, loadIdentity, signBlock } from "./keys.js";
 import { mineInWorker } from "./miner.js";
 import {
-  fetchBlocksFrom, fetchOne, publishAll, publishDifficulty, RelaySet, retryPlan, walkAll,
+  fetchBlocksFrom, publishAll, publishDifficulty, RelaySet, retryPlan, walkAll,
 } from "./relays.js";
 import { announceRelays, loadRelays, onRelaysChange, RELAYS_KEY, saveRelays } from "./settings.js";
 import { BlockStore } from "./store.js";
-import { traverse } from "./traverse.js";
+import { traverseLevels } from "./traverse.js";
+import { loadDescendants, loadView, refreshView } from "./view.js";
 import { buildUnsignedBlock, loadSbtp, verifyFetched, verifySubmitted } from "./wasm.js";
 
 const $ = (id) => document.getElementById(id);
@@ -104,10 +105,13 @@ function showIdentity() {
   $("key-new").disabled = !!identity || !!brokenKey;
 }
 
-/** Renders one block. Never throws: one odd block cannot abort a view (review L-1). */
-function renderBlock(b, note) {
+/**
+ * Renders one block, indented when `reply` (a child of a shown item). Never throws: one odd block
+ * cannot abort a view (review L-1).
+ */
+function renderBlock(b, note, reply = false) {
   const div = document.createElement("div");
-  div.className = "block";
+  div.className = reply ? "block reply" : "block";
   try {
     const head = document.createElement("div");
     head.className = "mono muted";
@@ -133,7 +137,9 @@ function renderBlock(b, note) {
  * (review L-2): at most one at a time, buttons disabled while it runs.
  */
 const BROWSE_DEADLINE_MS = 120_000;
-const BROWSE_BUTTONS = ["list", "ancestors", "local"];
+const BROWSE_BUTTONS = ["list", "ancestors", "descendants", "local"];
+/** The view shown by List with a block id (view.js), kept for "Refresh the view". */
+let currentView = null;
 let browsing = null;
 
 async function browse(run) {
@@ -141,6 +147,7 @@ async function browse(run) {
   browsing = new AbortController();
   const signal = deadline(BROWSE_DEADLINE_MS, browsing.signal);
   for (const id of BROWSE_BUTTONS) $(id).disabled = true;
+  $("view-refresh").disabled = true;
   $("browse-cancel").disabled = false;
   $("blocks").replaceChildren();
   try {
@@ -154,6 +161,7 @@ async function browse(run) {
     }
     browsing = null;
     for (const id of BROWSE_BUTTONS) $(id).disabled = false;
+    $("view-refresh").disabled = currentView === null;
     $("browse-cancel").disabled = true;
   }
 }
@@ -276,29 +284,89 @@ async function onRepublish() {
     `${why ? ` (${why.name}: ${why.message})` : ""}.`, why ? "bad" : "ok");
 }
 
+/**
+ * Validates a block from a relay (R1 and full validation, spec §3.4) and keeps it locally; a full
+ * store only means it is not cached. Used by every fetch of the browse operations.
+ */
+function validateAndKeep(bytes, idHex) {
+  const b = verifyFetched(bytes, LIMITS.receiptDifficulty, idHex);
+  store.put(idHex, bytes).catch(() => {});
+  return b;
+}
+
+/** The bytes of a block held locally, or null (validated again by the caller). */
+const haveLocal = (id) => store.get(id).catch(() => null);
+
+/**
+ * Renders a view (view.js): each item, then its children indented. An item's children listing is
+ * shown as complete only when every relay asked gave a complete listing (ADR 0051 rule 29).
+ */
+function renderView(v) {
+  $("blocks").replaceChildren();
+  for (const item of v.items) {
+    if (!item.block) continue;
+    const note = !v.grouped ? "" : item.complete
+      ? `replies ${item.children.length} (complete)`
+      : `replies ${item.children.length}+ (incomplete${item.incompleteOn.length ? ` on ${item.incompleteOn.join(", ")}` : ""})`;
+    renderBlock(item.block, note);
+    for (const c of item.children) {
+      const b = v.blocks.get(c);
+      if (b) renderBlock(b, "", true);
+    }
+  }
+}
+
+/** One line per relay of a walkAll result. */
+const describeWalks = (w) => w.runs.map((x) =>
+  `${x.base}: ${x.ids.length} id(s), ${x.stop}${x.readApi ? ", read_api 2" : ""}${x.error ? ` (${x.error.message})` : ""}`)
+  .concat(w.backingOff.map((b) => `${b}: not asked, backing off`)).join("; ");
+
 function onList() {
   return browse(async (signal) => {
     const parent = $("parent-filter").value.trim();
     if (parent && !isIdHex(parent)) throw new Error("the filter is not a 64-character lowercase hex id");
     say("list-out", `Walking /query on ${relays.bases.length} relay(s)…`);
+    currentView = null;
+    if (parent) {
+      // The view of a block: its newest children and their children from relays with the read
+      // API of ADR 0051; its children only, oldest first, from the others (as before).
+      const v = await loadView(relays, parent, { validate: validateAndKeep, have: haveLocal, signal });
+      currentView = v;
+      renderView(v);
+      const s = v.stats;
+      say("list-out", `${v.items.length} child(ren) of the block listed [${describeWalks({ runs: s.runs, backingOff: [] })}]; ` +
+        `${v.blocks.size} block(s) shown, ${s.fetched} fetched and verified, ${s.notFound} not found, ${s.failed} failed` +
+        `${s.partial ? ". Partial view: a bound or a failure stopped it." : "."}`, s.partial ? "bad" : "ok");
+      return;
+    }
     // The view fetches at most fetchMaxBlocks blocks: walking further would be wasted (review L-2).
-    // Each relay is walked with its own cursor; the ids are merged and deduplicated.
-    const w = await walkAll(relays, parent ? { parent } : {}, {
+    // Each relay is walked with its own cursor; the ids are merged and deduplicated. A relay with
+    // the read API lists newest first.
+    const w = await walkAll(relays, {}, {
       signal, perRelayMaxIds: LIMITS.fetchMaxBlocks, maxTotalIds: LIMITS.fetchMaxBlocks,
+      upgrade: { filter: { order: "desc" } },
     });
     // Every block is validated (R1 and full validation) whatever relay serves it.
-    const got = await fetchBlocksFrom(relays, w.ids,
-      (bytes, id) => ({ b: verifyFetched(bytes, LIMITS.receiptDifficulty, id), bytes }), { signal });
-    for (const { b, bytes } of got.blocks) {
-      await store.put(b.idHex, bytes).catch(() => {}); // a full store only means it is not cached
-      renderBlock(b);
-    }
+    const got = await fetchBlocksFrom(relays, w.ids, validateAndKeep, { signal });
+    for (const b of got.blocks) renderBlock(b);
     const partial = w.partial || got.partial;
-    const walks = w.runs.map((x) => `${x.base}: ${x.ids.length} id(s), ${x.stop}${x.error ? ` (${x.error.message})` : ""}`)
-      .concat(w.backingOff.map((b) => `${b}: not asked, backing off`)).join("; ");
-    say("list-out", `${w.ids.length} distinct id(s) listed [${walks}]; ` +
+    say("list-out", `${w.ids.length} distinct id(s) listed [${describeWalks(w)}]; ` +
       `${got.blocks.length} fetched and verified, ${got.notFound.length} not found, ${got.failed.length} failed` +
       `${partial ? ". Partial view: a bound or a failure stopped it." : "."}`, partial ? "bad" : "ok");
+  });
+}
+
+/** Polls the shown parents from the kept cursors (ADR 0051 rule 29) and shows what is new. */
+function onRefresh() {
+  const v = currentView;
+  if (!v) return undefined;
+  return browse(async (signal) => {
+    currentView = v; // browse() clears the blocks; the view itself is kept
+    say("list-out", "Polling the shown blocks…");
+    const r = await refreshView(relays, v, { validate: validateAndKeep, have: haveLocal, signal });
+    renderView(v);
+    say("list-out", `${r.newItems.length} new child(ren), ${r.newChildren.length} new repl(ies); ` +
+      `${r.fetch.blocks.length} fetched and verified, ${r.fetch.failed.length} failed.`, r.fetch.partial ? "bad" : "ok");
   });
 }
 
@@ -307,29 +375,62 @@ function onAncestors() {
     const start = $("parent-filter").value.trim();
     if (!isIdHex(start)) throw new Error("enter a block id in the field above");
     say("list-out", "Walking ancestors…");
-    const budget = { left: LIMITS.fetchMaxAttempts };
-    const t = await traverse(start, async (id) => {
-      let b;
-      try {
-        const local = await store.get(id);
-        if (local !== null) {
-          b = await receive(local, id);
-        } else {
-          // Failover over the relays; each answer is validated (§3.4) before it is used or stored.
-          const r = await fetchOne(relays, id,
-            (bytes, i) => ({ b: verifyFetched(bytes, LIMITS.receiptDifficulty, i), bytes }), { budget, signal });
-          if (r.status !== "ok") return null;
-          b = r.block.b;
-          await store.put(id, r.block.bytes).catch(() => {}); // a full store only means it is not cached
+    let budget = LIMITS.fetchMaxAttempts;
+    // One level at a time, so that a level is fetched together: in batches from a relay with the
+    // read API (a walk, ADR 0051 rule 12), with single GETs from the others.
+    const t = await traverseLevels(start, async (ids) => {
+      const found = new Map();
+      const missing = [];
+      for (const id of ids) {
+        const local = await haveLocal(id);
+        let b = null;
+        try {
+          if (local !== null) b = await receive(local, id);
+        } catch {
+          b = null; // fails §3.4: fetched again
         }
-      } catch {
-        return null; // unreachable, or fails §3.4: discarded, never stored
+        if (b) found.set(id, b);
+        else missing.push(id);
       }
-      renderBlock(b);
-      return b.parents;
+      if (missing.length > 0 && budget > 0) {
+        const got = await fetchBlocksFrom(relays, missing, validateAndKeep, {
+          mode: "bulk", max: missing.length, maxAttempts: budget, signal,
+        });
+        budget -= got.attempts;
+        for (const b of got.blocks) found.set(b.idHex, b);
+      }
+      const out = new Map();
+      for (const id of ids) {
+        const b = found.get(id);
+        if (!b) continue; // unreachable, or fails §3.4: discarded, never stored
+        renderBlock(b);
+        out.set(id, b.parents);
+      }
+      return out;
     }, { signal });
     say("list-out", `${t.visited.length} block(s) visited, ${t.unavailable.length} unavailable` +
       `${t.partial ? `; partial: stopped at ${LIMITS.traverseMaxVisited} blocks or cancelled` : ""}.`, t.partial ? "bad" : "ok");
+  });
+}
+
+/**
+ * Cold start of the subgraph under a block: with the read API, one relay-wide walk with parent
+ * ids, then batches of the descendants only (ADR 0051 rule 13); otherwise per-parent walks.
+ */
+function onDescendants() {
+  return browse(async (signal) => {
+    const root = $("parent-filter").value.trim();
+    if (!isIdHex(root)) throw new Error("enter a block id in the field above");
+    say("list-out", "Listing descendants…");
+    const d = await loadDescendants(relays, root, { validate: validateAndKeep, have: haveLocal, signal });
+    for (const id of [root, ...d.members]) {
+      const b = d.blocks.get(id);
+      if (b) renderBlock(b, id === root ? "root" : "");
+    }
+    say("list-out", `${d.members.length} descendant(s) found` +
+      `${d.listed ? ` among ${d.listed} block id(s) listed with their parents` : ""}; ${d.blocks.size} block(s) shown` +
+      `${d.partial ? `. Partial: a bound (${LIMITS.traverseMaxVisited} blocks) or a failure stopped it.` : "."}`,
+    d.partial ? "bad" : "ok");
   });
 }
 
@@ -461,6 +562,7 @@ async function main() {
       try {
         const info = await e.relay.info();
         relays.ok(e);
+        relays.noteInfo(e, info);
         return `${e.base}\n${JSON.stringify(info, null, 1)}`;
       } catch (err) {
         relays.fail(e, err);
@@ -500,6 +602,8 @@ async function main() {
   $("list").addEventListener("click", onList);
   $("browse-cancel").addEventListener("click", () => browsing?.abort());
   $("ancestors").addEventListener("click", onAncestors);
+  $("descendants").addEventListener("click", onDescendants);
+  $("view-refresh").addEventListener("click", onRefresh);
   $("local").addEventListener("click", onLocal);
   $("stranded-check").addEventListener("click", showStranded);
   showStranded();

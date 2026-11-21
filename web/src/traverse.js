@@ -41,3 +41,46 @@ export async function traverse(start, visit, { maxVisited = LIMITS.traverseMaxVi
   }
   return { visited, unavailable, partial: overflow };
 }
+
+/**
+ * `traverse`, one breadth-first level at a time, so that a level's blocks are fetched together
+ * (in batches with a `read_api >= 2` relay, ADR 0051 rule 12). `visitLevel(ids)` resolves with a
+ * Map id → neighbour ids, or null when the block is unavailable (a missing entry counts as null).
+ * Same bound and result as `traverse`: at most `maxVisited` blocks visited or unavailable.
+ */
+export async function traverseLevels(start, visitLevel, { maxVisited = LIMITS.traverseMaxVisited, signal } = {}) {
+  let level = [...new Set(Array.isArray(start) ? start : [start])].slice(0, maxVisited);
+  const known = new Set(level);
+  const visited = [];
+  const unavailable = [];
+  let overflow = known.size < (Array.isArray(start) ? new Set(start).size : 1);
+  while (level.length > 0) {
+    if (signal?.aborted) return { visited, unavailable, partial: true };
+    const room = maxVisited - visited.length - unavailable.length;
+    if (room <= 0) return { visited, unavailable, partial: true };
+    const ask = level.slice(0, room);
+    const cut = ask.length < level.length;
+    const answers = await visitLevel(ask);
+    const next = [];
+    for (const id of ask) {
+      const ns = answers.get(id) ?? null;
+      if (ns === null) {
+        unavailable.push(id);
+        continue;
+      }
+      visited.push(id);
+      for (const n of ns) {
+        if (known.has(n)) continue;
+        if (known.size >= maxVisited) {
+          overflow = true;
+          continue;
+        }
+        known.add(n);
+        next.push(n);
+      }
+    }
+    if (cut) return { visited, unavailable, partial: true };
+    level = next;
+  }
+  return { visited, unavailable, partial: overflow };
+}

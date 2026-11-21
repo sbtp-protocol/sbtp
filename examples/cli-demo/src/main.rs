@@ -167,6 +167,8 @@ cli-demo get: fetch a block from a relay and verify it
 USAGE:
     cli-demo get --relay <URL>... [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
                  [--force] <BLOCK_ID>
+    cli-demo get --relay <URL>... [--out-dir <DIR>] [--difficulty <D>] [--force]
+                 <BLOCK_ID> <BLOCK_ID>...
 
 Sends GET /sbtp/v1/block/<BLOCK_ID>, then, before writing or printing anything, recomputes the
 block_id and checks it equals <BLOCK_ID> (R1) and applies the full validation (spec §3.4). A 404
@@ -178,11 +180,24 @@ that failed before it are shown as warnings. A block below --difficulty is refus
 proof of work depends on its block_id only, so no other relay could serve a different answer.
 If no relay serves a valid block, the exit status is 4 when one served an invalid block.
 
+SEVERAL BLOCK IDS (up to 1,024):
+The relays are asked in order for the blocks still missing. A relay whose /info announces
+read_api 2 (ADR 0051) gets batches: POST /sbtp/v1/blocks with up to 256 ids, answered with one
+length-prefixed record per id. Each record is checked against the id at its position (R1) and
+fully validated, like a single GET. A record of length 0 (not served), a block that fails
+verification, or a failed request (an error status, a body over 1 MiB, a record longer than a
+block, a body cut inside a record) moves those ids on to the next relay; a relay may answer
+only the first records, and the rest is asked again. Any other relay, or one whose /info fails,
+gets one GET per block. With one id, nothing changes: no /info is read. The fetched blocks are
+printed one after the other (and written to --out-dir as <BLOCK_ID>.sbtp); the command fails
+if one is missing, listing why for each.
+
 OPTIONS:
     --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required). Repeat,
                             or give a comma list, for several relays (at most 8), in order
-    --out <FILE>            Write the raw block to this new file
-    --payload-out <FILE>    Write the payload to this new file
+    --out <FILE>            Write the raw block to this new file (one block id)
+    --payload-out <FILE>    Write the payload to this new file (one block id)
+    --out-dir <DIR>         Write each block to <DIR>/<BLOCK_ID>.sbtp (an existing directory)
     --difficulty <D>        Local proof-of-work floor, 0 to 256 (default: 0, any). It is this
                             client's own anti-spam filter, independent of the relay: the
                             min_pow_difficulty of /info only applies to what the relay
@@ -196,7 +211,10 @@ cli-demo query: list block_ids held by a relay
 
 USAGE:
     cli-demo query --relay <URL>... [--parent <BLOCK_ID>] [--since <MS>] [--limit <N>]
-                   [--cursor <CURSOR>]... [--follow [--interval <S>]]
+                   [--cursor <CURSOR>]... [--desc] [--fields parents]
+                   [--follow [--interval <S>]]
+    cli-demo query --relay <URL>... --parent <BLOCK_ID>[.<CURSOR>] --parent ... [--desc]
+                   [--since <MS>] [--limit <N>]
 
 Walks GET /sbtp/v1/query page by page, following the returned cursor until the relay has no
 more, and prints each block_id once, one per line, in the relay's storage order. The order is
@@ -226,10 +244,32 @@ relay whose walk fails is shown as a warning with its resume cursor and is not a
 that run (with --follow too); the command fails when every relay has failed. The block_ids
 printed over all relays are bounded by the same 1,000,000.
 
+READ API (ADR 0051):
+--desc, --fields and a repeated --parent use forms that only a relay whose /info announces
+read_api 2 takes; /info is read first, and only then. Without them, the requests are those of
+before. A relay without read_api 2 is skipped with a warning for --desc and --fields; for a
+repeated --parent it is walked once per parent instead.
+  --desc lists newest first and prints `head: <CURSOR>`: an ascending poll from it
+  (--cursor <HEAD>) lists exactly the blocks stored after the listing began. The printed
+  `cursor` continues the newest-first listing further back (with --desc --cursor).
+  --fields parents prints `<BLOCK_ID> len=<BYTES> parents=<ID>,<ID>` from the relay's index:
+  hints only, to choose what to fetch; the fetched block's own header is authoritative.
+  Relay-wide only (not with --parent); pages are at most 200 entries.
+  --parent given 2 to 32 times lists the children of each in grouped requests and prints
+  `<PARENT> <CHILD>` per line. On standard error, per parent: its count, `complete` when the
+  relay said it has no more (only a complete listing shows that a block is absent), and
+  `cursor: <PARENT>.<CURSOR>`, given back as `--parent <PARENT>.<CURSOR>` (one relay only) to
+  continue, or with the printed head to poll for new children.
+
 OPTIONS:
     --relay <URL>           Relay base URL, such as http://127.0.0.1:8080 (required). Repeat,
                             or give a comma list, for several relays (at most 8)
-    --parent <BLOCK_ID>     Only the children of this block (the relay need not hold it)
+    --parent <BLOCK_ID>     Only the children of this block (the relay need not hold it).
+                            Repeat (2 to 32 times, read_api 2) for several parents, each
+                            optionally as <BLOCK_ID>.<CURSOR>
+    --desc                  Newest first (read_api 2); not with --follow
+    --fields parents        Print each block's length and parents (read_api 2); not with
+                            --parent
     --since <MS>            Only blocks the relay stored at or after this Unix time in
                             milliseconds, by the relay's clock (not the block Timestamp)
     --limit <N>             Page size, at least 1 (default: 100; the relay lowers a value
