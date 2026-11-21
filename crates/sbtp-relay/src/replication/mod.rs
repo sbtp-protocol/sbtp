@@ -183,16 +183,6 @@ impl Replication {
     }
 }
 
-/// The operating system's PEM bundle of trust roots, in the order they are looked for: Debian,
-/// Ubuntu and the distroless runtime image; Fedora and RHEL; openSUSE; Alpine, macOS and the BSDs.
-/// Rule 19 names `rustls-native-certs`; this reads the same Linux files without its platform
-/// crates (see the module documentation of [`http`] and the implementation report).
-pub const OS_BUNDLES: [&str; 4] = [
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/ca-bundle.pem",
-    "/etc/ssl/cert.pem",
-];
 /// The largest trust file read.
 const MAX_TRUST_FILE: u64 = 4 << 20;
 
@@ -225,17 +215,10 @@ fn client_config(s: &Settings) -> Result<rustls::ClientConfig, ConfigError> {
         })?;
         ("peer_ca_file", certs)
     } else {
-        let found = OS_BUNDLES
-            .iter()
-            .map(std::path::Path::new)
-            .find(|p| p.is_file())
-            .map(read_pem)
-            .transpose()
-            .map_err(|reason| ConfigError::Invalid {
-                setting: "peer_ca_file",
-                reason,
-            })?;
-        ("peer_ca_file", found.unwrap_or_default())
+        // `rustls-native-certs`: `SSL_CERT_FILE` or `SSL_CERT_DIR` when set, else the platform
+        // store (openssl-probe's file locations on Linux, Security.framework on macOS). Errors on
+        // single certificates are ignored; what matters is that some root loads.
+        ("peers", rustls_native_certs::load_native_certs().certs)
     };
     let mut roots = rustls::RootCertStore::empty();
     let (added, _) = roots.add_parsable_certificates(certs);
@@ -597,7 +580,10 @@ impl<I: IndexBackend<Error = IndexError> + CursorStore + 'static> Shared<I> {
             &[
                 ("peer", Value::Int(p)),
                 ("status", Value::Str(f.kind.name())),
-                ("delay_s", Value::Int(delay.as_secs())),
+                (
+                    "delay_ms",
+                    Value::Int(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+                ),
             ],
             None,
         );

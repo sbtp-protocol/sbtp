@@ -84,17 +84,20 @@ Initial public version. Pre-release software: no version is supported for produc
   minus `replication_resync_margin_ms`. Bounds: `replication_max_in_flight`,
   `replication_blocks_per_min`, `replication_bytes_per_hour` (profile rows), round robin turns,
   ADR 0029 body ceilings, a total time limit, the peer's `Retry-After`, exponential back-off, a
-  pause above the high-water mark. Outbound TLS 1.3 with rustls and `ring` against the operating
-  system bundle or `peer_ca_file`; no redirect followed; resolved private, loopback and link-local
+  pause above the high-water mark. Outbound HTTP/1.1 with hyper's low-level client; TLS 1.3 with
+  rustls and `ring` against the operating system store (`rustls-native-certs`) or `peer_ca_file`; no redirect followed; resolved private, loopback and link-local
   addresses refused unless `replication_allow_private`. New settings `peers`, `replication_start`,
   `replication_allow_private`, `peer_ca_file`, `replication_max_peers`,
   `replication_max_in_flight`, `replication_blocks_per_min`, `replication_bytes_per_hour`,
   `replication_poll_ms`, `replication_request_timeout_ms`, `replication_max_backoff_s`,
   `replication_resync_margin_ms`; counters `replication_*`; events `replication`,
   `replication_peer_backoff`, `replication_paused`, `replication_cursor_reset`. New dependencies:
-  `rustls` 0.23.46, `tokio-rustls` 0.26.6 (and through them `ring` 0.17.14, `rustls-webpki`
-  0.103.16, `rustls-pki-types` 1.15.1, `untrusted` 0.9.0); `httparse` becomes a direct dependency.
-  Computed `small` memory bound with replication on: 15,634,073 bytes. `deploy/README.md` gains a
+  `rustls` 0.23.46, `tokio-rustls` 0.26.6, `rustls-native-certs` 0.8.5 and the hyper feature
+  `client`; through them `ring` 0.17.14, `rustls-webpki` 0.103.16, `rustls-pki-types` 1.15.1,
+  `untrusted` 0.9.0, `want` 0.3.2, `try-lock` 0.2.5, and per platform `openssl-probe` 0.2.2
+  (Linux), `security-framework` 3.7.0, `security-framework-sys` 2.17.0, `core-foundation` 0.10.1
+  (macOS), `schannel` 0.1.30 (Windows). Computed `small` memory bound with replication on:
+  15,634,073 bytes, under the 20 MB budget of every function on. `deploy/README.md` gains a
   "Replication" section.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)

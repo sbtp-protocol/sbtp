@@ -227,11 +227,11 @@ block. A copy is not a read: the source does not count it as demand.
 - **Minimum difficulty.** A relay with `peers` set refuses to start with `min_pow_difficulty`
   above the network difficulty (16).
 - **Memory.** With replication on, the computed bound of `small` grows by 723,077 bytes (bound
-  under 16 MB); it is logged at start-up (`memory_bound`).
-- **Trust roots.** `https` peers are verified with TLS 1.3 against the operating system bundle
-  (`/etc/ssl/certs/ca-certificates.crt` in the image; the first of the usual Debian, RHEL, SUSE
-  and Alpine or macOS paths elsewhere) or, when set, `peer_ca_file` (a PEM file of at most
-  4 MiB). A relay with an `https` peer and no root refuses to start. No redirect is followed.
+  under the 20 MB budget of `small` with every function on); it is logged at start-up (`memory_bound`).
+- **Trust roots.** `https` peers are verified with TLS 1.3 against the operating system store
+  (`rustls-native-certs`: `SSL_CERT_FILE` or `SSL_CERT_DIR` when set, else the usual bundle
+  files on Linux, `/etc/ssl/certs/ca-certificates.crt` in the image, and the system keychain on
+  macOS) or, when set, `peer_ca_file` (a PEM file of at most 4 MiB), which replaces it. A relay with an `https` peer and no root refuses to start. No redirect is followed.
 - **Private addresses.** A peer name that resolves to a loopback, private, shared (RFC 6598),
   link-local (cloud metadata), unspecified, multicast or reserved address is not contacted,
   unless the peer URL is that literal address or `replication_allow_private = true`. Names are

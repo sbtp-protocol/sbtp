@@ -35,7 +35,9 @@ tower-http = { version = "0.7.1", default-features = false, features = ["cors", 
 # ADR 0018 accept loop: hyper's HTTP/1.1 server builder (no HTTP/2: rule 27) and hyper-util's tokio
 # adapters. Both were already in the graph through axum. `hyper_util::server::conn::auto` is not
 # used: its feature `server-auto` forces HTTP/2 (and the `h2` crate) into the build.
-hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+# ADR 0048 rule 19: `client` adds `hyper::client::conn::http1` (no pool, no redirect following) for
+# the outbound replication client.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 http-body = "1.1.0"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
@@ -53,9 +55,9 @@ libc = "0.2.191"
 # weeks (ADR 0028 rule 54); do not `cargo update` them before 2026-11-24 and 2026-11-26.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
-# The response head parser of the replication client (ADR 0048 rule 19, see
-# crates/sbtp-relay/src/replication/http.rs). Already in the graph through hyper.
-httparse = "1.10.1"
+# The operating system trust store of the replication client (ADR 0048 rule 19); `webpki-roots`
+# is not used.
+rustls-native-certs = "0.8.5"
 # Relay index backend (ADR 0013 rules 22 to 26). Exact pin, default features only (no `experimental-*`,
 # never `Builder::set_concurrency_mode()`). 4.6.0 is younger than two weeks: owner-approved exception of
 # 2026-11-18, see docs/security/dependency-exceptions.md and docs/security/2026-11-18-redb-4.6-exception.md.

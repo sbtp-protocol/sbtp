@@ -1196,12 +1196,12 @@ fn peers_need_the_replication_feature() {
     assert!(load(&[], &[("PEERS", "")]).is_ok());
 }
 
-/// ADR 0048 rule 3, item 2, and rule 16: `small` with replication on (TLS off) has its own bound,
-/// 16,000,000 bytes (under the owner's 20 MB budget with every function on); the terms count
-/// `replication_max_peers` peers and only when `peers` is not empty.
+/// ADR 0048 rule 16 and the owner's budget decision: `small` with replication on stays under
+/// 20,000,000 bytes, the "every function on" budget that replaced the 16 MB bound of rule 3; the
+/// terms count `replication_max_peers` peers and only when `peers` is not empty.
 #[cfg(feature = "replication")]
 #[test]
-fn small_profile_memory_bound_with_replication_is_under_16_mb() {
+fn small_profile_memory_bound_with_replication_is_under_20_mb() {
     let off = Settings::load(Vec::<OsString>::new(), Vec::new()).unwrap();
     let on = Settings::load(
         Vec::<OsString>::new(),
@@ -1213,7 +1213,7 @@ fn small_profile_memory_bound_with_replication_is_under_16_mb() {
     assert!(!off.replication_on());
     assert_eq!(on.memory_bound_bytes() - off.memory_bound_bytes(), 723_077);
     assert!(
-        on.memory_bound_bytes() < 16_000_000,
+        on.memory_bound_bytes() < 20_000_000,
         "{}",
         on.memory_bound_bytes()
     );
