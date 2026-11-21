@@ -45,6 +45,17 @@
 //! plus retries, and the `/info` object is one more. The lag is measured by signed `HEAD`
 //! probes of every `--probe-every`th block (default 10), at most `--max-heads` (default 1,000).
 //!
+//! `s3put` sends the uploader's conditional `PUT` straight to a remote bucket (same headers and
+//! signature, same TLS client) from `--in-flight` lanes paced at `--rate`, for the store's own
+//! latency distribution; with `--load-blocks` (a file written by `--save-blocks`) it reruns the
+//! same blocks, which the store answers with `412`. `--payload-mix` spreads payloads around a 4 KiB
+//! median with every 20th block at 64,000 bytes. `fake-s3` runs the fake store alone, with the
+//! credentials of the target's variables, so that the remote paths can be tried offline.
+//!
+//! **Guards for a shared store** (remote runs and `s3put`): the run stops when the p99 of the last
+//! 200 store requests exceeds 1 s, after 10 `5xx` answers or one `507`, after three `HEAD` probes
+//! slower than 1 s, or when the relay has logged 10 `mirror_failed` lines.
+//!
 //! **Test key.** Blocks are signed with the key derived from the public seed
 //! `sbtp-relay-mirror-bench-public-key`: a published constant, not a secret, never to be trusted
 //! outside this benchmark.
@@ -95,7 +106,11 @@ fn main() {
     let res = match args.first().map(String::as_str) {
         Some("run") => Opts::parse(&args[1..]).and_then(|o| run(&o)),
         Some("sigv4") => Opts::parse(&args[1..]).and_then(|o| sigv4_cost(&o)),
-        _ => Err("usage: mirror_bench run|sigv4 [options] (see the file's documentation)".into()),
+        Some("s3put") => Opts::parse(&args[1..]).and_then(|o| s3put(&o)),
+        Some("fake-s3") => Opts::parse(&args[1..]).and_then(|o| fake_s3(&o)),
+        _ => Err(
+            "usage: mirror_bench run|s3put|sigv4 [options] (see the file's documentation)".into(),
+        ),
     };
     if let Err(e) = res {
         eprintln!("mirror_bench: {e}");
@@ -126,7 +141,10 @@ impl Opts {
                 return Err(format!("unexpected argument {a:?}").into());
             };
             // Switches without a value.
-            if matches!(name, "replica" | "allow-private" | "no-verify" | "backlog") {
+            if matches!(
+                name,
+                "replica" | "allow-private" | "no-verify" | "backlog" | "payload-mix"
+            ) {
                 flags.insert(name.to_owned(), "true".to_owned());
                 continue;
             }
@@ -425,7 +443,18 @@ impl Fake {
             let block = path
                 .strip_prefix(&format!("/{BUCKET}/sbtp/v1/block/"))
                 .map(str::to_owned);
-            let status = if method != "PUT" {
+            let status = if method == "HEAD" {
+                if self.verify && !self.signature_ok(&method, &path, &headers, body) {
+                    403
+                } else if block
+                    .as_ref()
+                    .is_some_and(|id| lock(&self.arrived).contains_key(id))
+                {
+                    200
+                } else {
+                    404
+                }
+            } else if method != "PUT" {
                 405
             } else if self.verify && !self.signature_ok(&method, &path, &headers, body) {
                 self.bad_sig.fetch_add(1, Ordering::Relaxed);
@@ -548,8 +577,11 @@ impl Relay {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     n.fetch_add(1, Ordering::Relaxed);
                     // The relay logs `key=value` lines (ADR 0021).
-                    if line.contains(" event=mirror_failed") {
-                        f.fetch_add(1, Ordering::Relaxed);
+                    if line.contains(" event=mirror_failed")
+                        && f.fetch_add(1, Ordering::Relaxed) + 1
+                            >= FAILED_LINE_LIMIT.load(Ordering::Relaxed)
+                    {
+                        abort("the relay logged 10 mirror_failed lines");
                     }
                     if line.contains(" event=listening ")
                         && let Some(addr) = line
@@ -699,7 +731,20 @@ struct Blocks {
     ids: Vec<String>,
 }
 
-fn generate(n: usize, payload: usize, pow: u32) -> R<Blocks> {
+/// The payload size of block `i`: `payload`, or with `mix` a spread with median 4 KiB (4,096 ×
+/// 2^x, x uniform in [-1.5, 1.5], so 1,448 to 11,585 bytes) and every 20th block at 64,000 bytes.
+fn payload_len(i: usize, payload: usize, mix: bool, run: u64) -> usize {
+    if !mix {
+        return payload;
+    }
+    if i % 20 == 19 {
+        return 64_000;
+    }
+    let u = (RandomState::new().hash_one((run, i)) % 1_000_001) as f64 / 1_000_000.0;
+    (4096.0 * (3.0 * u - 1.5).exp2()).round() as usize
+}
+
+fn generate(n: usize, payload: usize, mix: bool, pow: u32) -> R<Blocks> {
     // Public seed (see the file's documentation): not a secret.
     let seed = *blake3::hash(b"sbtp-relay-mirror-bench-public-key").as_bytes();
     let threads = std::thread::available_parallelism().map_or(4, usize::from);
@@ -717,7 +762,7 @@ fn generate(n: usize, payload: usize, pow: u32) -> R<Blocks> {
                     }
                     // Deterministic per run and block, distinct across runs (fresh ids, so a
                     // remote bucket never answers `412` for a block of an earlier run).
-                    let mut body = vec![0u8; payload];
+                    let mut body = vec![0u8; payload_len(i, payload, mix, run)];
                     let mut h = blake3::Hasher::new();
                     h.update(&run.to_le_bytes());
                     h.update(&(i as u64).to_le_bytes());
@@ -752,6 +797,60 @@ fn generate(n: usize, payload: usize, pow: u32) -> R<Blocks> {
     Ok(Blocks { bytes, ids })
 }
 
+/// The blocks of a run: generated (`--blocks`, `--payload` or `--payload-mix`, `--pow`) or read
+/// back with `--load-blocks` (a rerun of the same blocks); `--save-blocks` writes them.
+fn blocks_from(o: &Opts) -> R<Blocks> {
+    let blocks = if let Some(path) = o.str("load-blocks") {
+        let raw = std::fs::read(path)?;
+        let (mut bytes, mut ids, mut at) = (Vec::new(), Vec::new(), 0usize);
+        while at < raw.len() {
+            let len = raw
+                .get(at..at + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_be_bytes)
+                .ok_or("--load-blocks: truncated file")? as usize;
+            let b = raw
+                .get(at + 4..at + 4 + len)
+                .ok_or("--load-blocks: truncated file")?
+                .to_vec();
+            let id = sbtp_core::parse(&b)
+                .map_err(|e| format!("--load-blocks: {e:?}"))?
+                .block_id();
+            ids.push(sbtp_relay::store::hex(&id));
+            bytes.push(b);
+            at += 4 + len;
+        }
+        Blocks { bytes, ids }
+    } else {
+        let n: usize = o.num("blocks", 5_000)?;
+        let payload: usize = o.num("payload", 1_024)?;
+        let pow: u32 = o.num("pow", 0)?;
+        if n == 0 {
+            return Err("--blocks must be positive".into());
+        }
+        eprintln!("generating {n} blocks (difficulty {pow})");
+        generate(n, payload, o.on("payload-mix"), pow)?
+    };
+    if let Some(path) = o.str("save-blocks") {
+        let mut out = Vec::new();
+        for b in &blocks.bytes {
+            out.extend_from_slice(&u32::try_from(b.len())?.to_be_bytes());
+            out.extend_from_slice(b);
+        }
+        std::fs::write(path, out)?;
+    }
+    let mut sizes: Vec<usize> = blocks.bytes.iter().map(Vec::len).collect();
+    sizes.sort_unstable();
+    println!(
+        "RESULT blocks={} block_bytes_total={} block_bytes_median={} block_bytes_max={}",
+        sizes.len(),
+        sizes.iter().sum::<usize>(),
+        sizes.get(sizes.len() / 2).copied().unwrap_or(0),
+        sizes.last().copied().unwrap_or(0)
+    );
+    Ok(blocks)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Load phases
 
@@ -763,7 +862,14 @@ struct PutOut {
     wall: Duration,
 }
 
-fn put_phase(addr: SocketAddr, blocks: &Blocks, clients: usize, rate: f64) -> PutOut {
+/// `probe`: every `.1`th acknowledged block is sent to the remote probes as it is acknowledged.
+fn put_phase(
+    addr: SocketAddr,
+    blocks: &Blocks,
+    clients: usize,
+    rate: f64,
+    probe: Option<(&mpsc::Sender<(usize, Instant)>, usize)>,
+) -> PutOut {
     let n = blocks.bytes.len();
     let next = AtomicUsize::new(0);
     let start = Instant::now();
@@ -778,7 +884,7 @@ fn put_phase(addr: SocketAddr, blocks: &Blocks, clients: usize, rate: f64) -> Pu
                 let mut errors = 0;
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
+                    if i >= n || aborted() {
                         break;
                     }
                     if rate > 0.0 {
@@ -802,6 +908,11 @@ fn put_phase(addr: SocketAddr, blocks: &Blocks, clients: usize, rate: f64) -> Pu
                             *st.entry(s).or_default() += 1;
                             if s == 201 || s == 200 {
                                 acks.push((i, done));
+                                if let Some((tx, every)) = probe
+                                    && i % every.max(1) == every.max(1) - 1
+                                {
+                                    let _ = tx.send((i, done));
+                                }
                             }
                         }
                         Err(_) => errors += 1,
@@ -926,8 +1037,170 @@ impl Remote {
     }
 }
 
-/// Signed `HEAD` probes of `(index, ack)` pairs from `rx`, in order, every 250 ms until the
-/// object exists; returns the lag of each probe in milliseconds.
+/// Set when a guard trips (store latency or errors, see [`guard`]): every load loop stops.
+static ABORT: AtomicBool = AtomicBool::new(false);
+/// `mirror_failed` lines of the relay that trip the guard (remote runs only).
+static FAILED_LINE_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static ABORT_WHY: Mutex<String> = Mutex::new(String::new());
+
+fn abort(why: &str) {
+    if !ABORT.swap(true, Ordering::SeqCst) {
+        why.clone_into(&mut lock(&ABORT_WHY));
+        eprintln!("mirror_bench: aborting: {why}");
+    }
+}
+
+fn aborted() -> bool {
+    ABORT.load(Ordering::Relaxed)
+}
+
+/// The guards agreed for runs against a shared store: stop when the p99 of the last 200
+/// requests is above 1 s, or after 10 answers of `5xx` (a `507` stops at once).
+#[derive(Default)]
+struct Guard {
+    recent: std::collections::VecDeque<u64>,
+    server_errors: u64,
+}
+
+impl Guard {
+    fn record(&mut self, ms: u64, status: Option<u16>) {
+        self.recent.push_back(ms);
+        if self.recent.len() > 200 {
+            self.recent.pop_front();
+        }
+        if let Some(s) = status {
+            if s == 507 {
+                abort("the store answered 507 (insufficient storage)");
+            }
+            if s >= 500 {
+                self.server_errors += 1;
+                if self.server_errors >= 10 {
+                    abort("10 answers of 5xx from the store");
+                }
+            }
+        }
+        if self.recent.len() >= 200 {
+            let mut v: Vec<u64> = self.recent.iter().copied().collect();
+            v.sort_unstable();
+            if v[197] > 1_000 {
+                abort("the p99 of the last 200 store requests is above 1 s");
+            }
+        }
+    }
+}
+
+/// A remote bucket: where requests go and how they are signed.
+struct Target {
+    url: sbtp_relay::peers::PeerUrl,
+    /// The path of `{prefix}sbtp/v1/block/` under `url`, with the bucket for path style.
+    base: String,
+    region: String,
+    creds: Credentials,
+    client: sbtp_relay::replication::http::Client,
+}
+
+impl Target {
+    /// The same URL rules as the relay (`mirror/mod.rs`, `Target::new`).
+    fn new(remote: &Remote) -> R<Self> {
+        use sbtp_relay::peers::PeerUrl;
+        let endpoint = PeerUrl::parse(&remote.endpoint).map_err(|_| "the endpoint is not a URL")?;
+        let (url, base) = if remote.url_style == "virtual" {
+            let scheme = if endpoint.is_https() { "https" } else { "http" };
+            let url = PeerUrl::parse(&format!(
+                "{scheme}://{}.{}{}",
+                remote.bucket,
+                endpoint.authority(),
+                endpoint.path()
+            ))
+            .map_err(|_| "virtual-hosted URL")?;
+            let base = format!("{}/{}sbtp/v1/block/", url.path(), remote.key_prefix);
+            (url, base)
+        } else {
+            let base = format!(
+                "{}/{}/{}sbtp/v1/block/",
+                endpoint.path(),
+                remote.bucket,
+                remote.key_prefix
+            );
+            (endpoint, base)
+        };
+        let settings = sbtp_relay::config::Settings::load(Vec::<OsString>::new(), Vec::new())?;
+        let tls = if url.is_https() {
+            Some(Arc::new(sbtp_relay::replication::client_config(
+                &settings,
+                "mirror_endpoint",
+            )?))
+        } else {
+            None
+        };
+        Ok(Self {
+            url,
+            base,
+            region: remote.region.clone(),
+            creds: remote.creds()?,
+            client: sbtp_relay::replication::http::Client::new(
+                tls,
+                remote.allow_private,
+                Duration::from_secs(30),
+            ),
+        })
+    }
+
+    /// A signed request for block `id`: `HEAD` with an empty body, or the conditional `PUT` the
+    /// uploader sends (same headers, `mirror/mod.rs`, `request`).
+    fn request(
+        &self,
+        id: &str,
+        put: Option<&[u8]>,
+    ) -> Option<axum::http::Request<axum::body::Body>> {
+        use axum::body::Body;
+        use axum::http::{HeaderValue, Request};
+        let path = format!("{}{id}", self.base);
+        let hash = sigv4::sha256_hex(put.unwrap_or_default());
+        let date = sigv4::amz_date(now_ms());
+        let host = self.url.authority();
+        let mut signed: Vec<(&str, &str)> = Vec::with_capacity(6);
+        if put.is_some() {
+            signed.push(("cache-control", "public, max-age=31536000, immutable"));
+            signed.push(("content-type", "application/octet-stream"));
+        }
+        signed.push(("host", host));
+        signed.push(("x-amz-content-sha256", &hash));
+        signed.push(("x-amz-date", &date));
+        if put.is_some() {
+            signed.push(("if-none-match", "*"));
+        }
+        let method = if put.is_some() { "PUT" } else { "HEAD" };
+        let auth = Zeroizing::new(sigv4::authorization(
+            &Signing {
+                method,
+                path: &path,
+                headers: &signed,
+                payload_hash: &hash,
+                amz_date: &date,
+                region: &self.region,
+            },
+            &self.creds,
+        ));
+        let mut b = Request::builder()
+            .method(method)
+            .uri(sigv4::encode_path(&path));
+        for (n, v) in &signed {
+            b = b.header(*n, *v);
+        }
+        if let Some(body) = put {
+            b = b.header("content-length", body.len());
+        }
+        let mut av = HeaderValue::from_str(&auth).ok()?;
+        av.set_sensitive(true);
+        let body = put.map_or_else(Body::empty, |p| Body::from(p.to_vec()));
+        b.header("authorization", av).body(body).ok()
+    }
+}
+
+/// Signed `HEAD` probes of `(index, since)` pairs from `rx`, in order, every 250 ms until the
+/// object exists; returns the lag of each probe in milliseconds and the number of `HEAD`s.
+/// A `HEAD` slower than 1 s three times trips the guard.
 fn probe_remote(
     remote: &Remote,
     ids: &[String],
@@ -935,91 +1208,39 @@ fn probe_remote(
     max_heads: u64,
     limit: Duration,
 ) -> R<(Vec<u64>, u64)> {
-    use axum::body::Body;
-    use axum::http::Request;
-    use sbtp_relay::peers::PeerUrl;
-    use sbtp_relay::replication::http::Client;
-
-    let creds = remote.creds()?;
-    let endpoint = PeerUrl::parse(&remote.endpoint).map_err(|_| "the endpoint is not a URL")?;
-    let (url, base) = if remote.url_style == "virtual" {
-        let scheme = if endpoint.is_https() { "https" } else { "http" };
-        let url = PeerUrl::parse(&format!(
-            "{scheme}://{}.{}{}",
-            remote.bucket,
-            endpoint.authority(),
-            endpoint.path()
-        ))
-        .map_err(|_| "virtual-hosted URL")?;
-        let base = format!("{}/{}sbtp/v1/block/", url.path(), remote.key_prefix);
-        (url, base)
-    } else {
-        let base = format!(
-            "{}/{}/{}sbtp/v1/block/",
-            endpoint.path(),
-            remote.bucket,
-            remote.key_prefix
-        );
-        (endpoint, base)
-    };
-    let settings = sbtp_relay::config::Settings::load(Vec::<OsString>::new(), Vec::new())?;
-    let tls = if url.is_https() {
-        Some(Arc::new(sbtp_relay::replication::client_config(
-            &settings,
-            "mirror_endpoint",
-        )?))
-    } else {
-        None
-    };
-    let client = Client::new(tls, remote.allow_private, Duration::from_secs(30));
+    let target = Target::new(remote)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let empty = sigv4::sha256_hex(b"");
     let mut heads = 0u64;
+    let mut slow = 0u32;
     let mut lags = Vec::new();
     rt.block_on(async {
         let mut conn = None;
-        while let Ok((i, ack)) = rx.recv() {
-            let path = format!("{base}{}", ids[i]);
+        while let Ok((i, since)) = rx.recv() {
             loop {
-                if heads >= max_heads || ack.elapsed() > limit {
+                if heads >= max_heads || since.elapsed() > limit || aborted() {
                     return;
                 }
                 heads += 1;
-                let date = sigv4::amz_date(now_ms());
-                let host = url.authority();
-                let signed = [
-                    ("host", host),
-                    ("x-amz-content-sha256", empty.as_str()),
-                    ("x-amz-date", date.as_str()),
-                ];
-                let auth = Zeroizing::new(sigv4::authorization(
-                    &Signing {
-                        method: "HEAD",
-                        path: &path,
-                        headers: &signed,
-                        payload_hash: &empty,
-                        amz_date: &date,
-                        region: &remote.region,
-                    },
-                    &creds,
-                ));
-                let mut b = Request::head(sigv4::encode_path(&path));
-                for (n, v) in signed {
-                    b = b.header(n, v);
+                let Some(req) = target.request(&ids[i], None) else {
+                    return;
+                };
+                let t = Instant::now();
+                let r = target
+                    .client
+                    .send_discard(&mut conn, &target.url, req)
+                    .await;
+                if t.elapsed() > Duration::from_secs(1) {
+                    slow += 1;
+                    if slow >= 3 {
+                        abort("three HEAD probes slower than 1 s");
+                    }
                 }
-                let Ok(mut av) = axum::http::HeaderValue::from_str(&auth) else {
-                    return;
-                };
-                av.set_sensitive(true);
-                let Ok(req) = b.header("authorization", av).body(Body::empty()) else {
-                    return;
-                };
-                if let Ok(s) = client.send_discard(&mut conn, &url, req).await
+                if let Ok(s) = r
                     && s.as_u16() == 200
                 {
-                    lags.push(ack.elapsed().as_millis() as u64);
+                    lags.push(since.elapsed().as_millis() as u64);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1027,6 +1248,182 @@ fn probe_remote(
         }
     });
     Ok((lags, heads))
+}
+
+/// `s3put`: the uploader's conditional `PUT` sent straight to the bucket by `--in-flight` lanes,
+/// paced at `--rate`, to measure the store's latency distribution (`201`/`200` and, on a rerun of
+/// the same blocks with `--load-blocks`, `412`).
+fn s3put(o: &Opts) -> R<()> {
+    let remote = remote_from(o)?;
+    let max_puts: u64 = o.num("max-puts", DEFAULT_MAX_PUTS)?;
+    let max_rate: f64 = o.num("max-rate", DEFAULT_MAX_RATE)?;
+    let blocks = blocks_from(o)?;
+    let n = blocks.ids.len();
+    if n as u64 > max_puts {
+        return Err(format!("{n} blocks is above --max-puts {max_puts}").into());
+    }
+    if max_rate.is_nan() || max_rate <= 0.0 {
+        return Err("--max-rate must be positive".into());
+    }
+    let rate: f64 = o.num::<f64>("rate", max_rate)?.min(max_rate);
+    let lanes: usize = o.num("in-flight", 1)?;
+    let target = Arc::new(Target::new(&remote)?);
+    let blocks = Arc::new(blocks);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let next = Arc::new(AtomicUsize::new(0));
+    let guard = Arc::new(Mutex::new(Guard::default()));
+    let start = Instant::now();
+    let results = rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..lanes.max(1) {
+            let (t, b, next, guard) = (
+                Arc::clone(&target),
+                Arc::clone(&blocks),
+                Arc::clone(&next),
+                Arc::clone(&guard),
+            );
+            set.spawn(async move {
+                let mut conn = None;
+                let mut out: Vec<(u64, Option<u16>)> = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= b.ids.len() || aborted() {
+                        return out;
+                    }
+                    let due = start + Duration::from_secs_f64(i as f64 / rate);
+                    tokio::time::sleep_until(due.into()).await;
+                    let Some(req) = t.request(&b.ids[i], Some(&b.bytes[i])) else {
+                        out.push((0, None));
+                        continue;
+                    };
+                    let at = Instant::now();
+                    let status = t
+                        .client
+                        .send_discard(&mut conn, &t.url, req)
+                        .await
+                        .ok()
+                        .map(|s| s.as_u16());
+                    let ms = at.elapsed().as_millis() as u64;
+                    lock(&guard).record(ms, status);
+                    out.push((at.elapsed().as_micros() as u64, status));
+                }
+            });
+        }
+        let mut all = Vec::new();
+        while let Some(r) = set.join_next().await {
+            all.extend(r.unwrap_or_default());
+        }
+        all
+    });
+    let wall = start.elapsed();
+    let mut by: HashMap<String, Vec<u64>> = HashMap::new();
+    for (us, s) in &results {
+        let k = s.map_or_else(|| "error".to_owned(), |s| s.to_string());
+        by.entry(k).or_default().push(*us);
+    }
+    let mut keys: Vec<_> = by.keys().cloned().collect();
+    keys.sort();
+    println!(
+        "RESULT s3put_requests={} s3put_statuses={} lanes={lanes} rate={rate}",
+        results.len(),
+        keys.iter()
+            .map(|k| format!("{k}:{}", by[k].len()))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    stats(
+        "s3put_all",
+        results.iter().map(|(us, _)| *us).collect(),
+        wall,
+    );
+    for k in keys {
+        stats(
+            &format!("s3put_{k}"),
+            by.remove(&k).unwrap_or_default(),
+            wall,
+        );
+    }
+    println!(
+        "RESULT s3put_bytes={} aborted={}",
+        blocks.bytes.iter().map(Vec::len).sum::<usize>(),
+        lock(&ABORT_WHY).replace(' ', "_")
+    );
+    Ok(())
+}
+
+/// `fake-s3 --target minio|s3`: the fake store alone, on loopback, with the credentials of the
+/// target's environment variables, until killed. It lets the remote code paths (`run --mirror
+/// remote`, `s3put`) be tried without a real store: point `..._ENDPOINT` at the printed address.
+fn fake_s3(o: &Opts) -> R<()> {
+    let r = Remote {
+        prefix: match o.str("target") {
+            Some("minio") => "SBTP_MIRROR_BENCH_MINIO_",
+            Some("s3") => "SBTP_MIRROR_BENCH_S3_",
+            _ => return Err("fake-s3 needs --target minio|s3".into()),
+        },
+        endpoint: String::new(),
+        bucket: BUCKET.into(),
+        region: REGION.into(),
+        url_style: "path".into(),
+        key_prefix: String::new(),
+        allow_private: false,
+    };
+    let f = Arc::new(Fake {
+        latency: Duration::from_millis(o.num("s3-latency-ms", 0)?),
+        fail_status: 503,
+        fail_from: 0,
+        fail_to: 0,
+        fail_every: o.num("s3-fail-every", 0)?,
+        verify: true,
+        creds: r.creds()?,
+        t0: AtomicU64::new(0),
+        block_puts: AtomicU64::new(0),
+        failed: AtomicU64::new(0),
+        exists: AtomicU64::new(0),
+        bad_sig: AtomicU64::new(0),
+        requests: AtomicU64::new(0),
+        arrived: Mutex::new(HashMap::new()),
+        info: AtomicBool::new(false),
+    });
+    let addr = f.start()?;
+    println!("RESULT fake_s3_addr={addr} bucket={BUCKET}");
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        eprintln!(
+            "fake-s3: requests={} block_puts={} 412={} bad_signatures={} objects={}",
+            f.requests.load(Ordering::Relaxed),
+            f.block_puts.load(Ordering::Relaxed),
+            f.exists.load(Ordering::Relaxed),
+            f.bad_sig.load(Ordering::Relaxed),
+            lock(&f.arrived).len()
+        );
+    }
+}
+
+/// The remote target of `--target minio|s3`: endpoint and credentials from the environment.
+fn remote_from(o: &Opts) -> R<Remote> {
+    let prefix = match o.str("target") {
+        Some("minio") => "SBTP_MIRROR_BENCH_MINIO_",
+        Some("s3") => "SBTP_MIRROR_BENCH_S3_",
+        _ => return Err("a remote run needs --target minio|s3".into()),
+    };
+    let endpoint_var = format!("{prefix}ENDPOINT");
+    let endpoint = std::env::var(&endpoint_var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{endpoint_var} is unset or empty"))?;
+    Ok(Remote {
+        prefix,
+        endpoint,
+        bucket: o.str("bucket").ok_or("--bucket is required")?.to_owned(),
+        region: o.str("region").unwrap_or(REGION).to_owned(),
+        url_style: o.str("url-style").unwrap_or("path").to_owned(),
+        key_prefix: o.str("prefix").unwrap_or("").to_owned(),
+        allow_private: o.on("allow-private"),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1067,24 +1464,20 @@ fn run(o: &Opts) -> R<()> {
         "remote" => Mode::Remote,
         _ => return Err("--mirror off|fake|remote".into()),
     };
-    let n: usize = o.num("blocks", 5_000)?;
-    let payload: usize = o.num("payload", 1_024)?;
     let clients: usize = o.num("clients", 4)?;
     let mut rate: f64 = o.num("rate", 0.0)?;
-    let gets: usize = o.num("gets", n)?;
+    let gets: Option<usize> = o.str("gets").map(str::parse).transpose()?;
     let pow: u32 = o.num("pow", 0)?;
     let in_flight: u64 = o.num("in-flight", 1)?;
     let drain_limit = Duration::from_secs(o.num("drain-timeout-s", 300)?);
-    if n == 0 || clients == 0 {
-        return Err("--blocks and --clients must be positive".into());
+    if clients == 0 {
+        return Err("--clients must be positive".into());
     }
 
+    prepare_work(&work)?;
+    let blocks = blocks_from(o)?;
+    let n = blocks.ids.len();
     let remote = if mode == Mode::Remote {
-        let prefix = match o.str("target") {
-            Some("minio") => "SBTP_MIRROR_BENCH_MINIO_",
-            Some("s3") => "SBTP_MIRROR_BENCH_S3_",
-            _ => return Err("--mirror remote needs --target minio|s3".into()),
-        };
         let max_puts: u64 = o.num("max-puts", DEFAULT_MAX_PUTS)?;
         let max_rate: f64 = o.num("max-rate", DEFAULT_MAX_RATE)?;
         if n as u64 > max_puts {
@@ -1098,27 +1491,12 @@ fn run(o: &Opts) -> R<()> {
         } else {
             max_rate
         };
-        let endpoint_var = format!("{prefix}ENDPOINT");
-        let endpoint = std::env::var(&endpoint_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{endpoint_var} is unset or empty"))?;
-        Some(Remote {
-            prefix,
-            endpoint,
-            bucket: o.str("bucket").ok_or("--bucket is required")?.to_owned(),
-            region: o.str("region").unwrap_or(REGION).to_owned(),
-            url_style: o.str("url-style").unwrap_or("path").to_owned(),
-            key_prefix: o.str("prefix").unwrap_or("").to_owned(),
-            allow_private: o.on("allow-private"),
-        })
+        // Relay `mirror_failed` lines are rate-capped; ten of them mean a store in trouble.
+        FAILED_LINE_LIMIT.store(10, Ordering::Relaxed);
+        Some(remote_from(o)?)
     } else {
         None
     };
-
-    prepare_work(&work)?;
-    eprintln!("generating {n} blocks of {payload} payload bytes (difficulty {pow})");
-    let blocks = generate(n, payload, pow)?;
     let bytes_total: usize = blocks.bytes.iter().map(Vec::len).sum();
 
     // The archive copy's settings.
@@ -1216,8 +1594,23 @@ fn run(o: &Opts) -> R<()> {
     let mut env_a = relay_env(&work.join("a"), pow, &extra);
     env_a.extend(secret_env);
     if o.on("backlog") {
-        let f = fake.as_ref().ok_or("--backlog needs --mirror fake")?;
-        return drain_backlog(&bin, &work, pow, &env_a, &blocks, clients, f, drain_limit);
+        let probe_every: usize = o.num("probe-every", 10)?;
+        let max_heads: u64 = o.num("max-heads", 1_000)?;
+        let sink = match (&fake, &remote) {
+            (Some(f), _) => Sink::Fake(f),
+            (None, Some(r)) => Sink::Remote(r, probe_every, max_heads),
+            _ => return Err("--backlog needs --mirror fake or remote".into()),
+        };
+        return drain_backlog(
+            &bin,
+            &work,
+            pow,
+            &env_a,
+            &blocks,
+            clients,
+            &sink,
+            drain_limit,
+        );
     }
     let relay = Relay::start(&bin, &env_a)?;
     let b = if replica {
@@ -1256,7 +1649,13 @@ fn run(o: &Opts) -> R<()> {
             let ids = &blocks.ids;
             sc.spawn(move || probe_remote(r, ids, &probe_rx, max_heads, drain_limit))
         });
-        let put = put_phase(relay.addr, &blocks, clients, rate);
+        let put = put_phase(
+            relay.addr,
+            &blocks,
+            clients,
+            rate,
+            remote.as_ref().map(|_| (&probe_tx, probe_every)),
+        );
         let cpu_put = ps(pid).map_or(0, |(_, c)| c);
         stats("put", put.latencies.clone(), put.wall);
         let mut st: Vec<_> = put.statuses.iter().collect();
@@ -1271,19 +1670,10 @@ fn run(o: &Opts) -> R<()> {
             put.wall.as_secs_f64(),
             cpu_put.saturating_sub(cpu0)
         );
-        if remote.is_some() {
-            for (i, a) in put.acked.iter().enumerate() {
-                if let Some(t) = a
-                    && i % probe_every.max(1) == probe_every.max(1) - 1
-                {
-                    let _ = probe_tx.send((i, *t));
-                }
-            }
-        }
         drop(probe_tx);
 
         sampler.enter(2);
-        let (glat, gwall, gbad) = get_phase(relay.addr, &blocks.ids, clients, gets);
+        let (glat, gwall, gbad) = get_phase(relay.addr, &blocks.ids, clients, gets.unwrap_or(n));
         stats("get", glat, gwall);
         println!("RESULT get_not_200={gbad}");
 
@@ -1374,7 +1764,11 @@ fn run(o: &Opts) -> R<()> {
     if let Some(b) = b {
         let _ = b.stop();
     }
-    println!("RESULT relay_log_lines={lines} relay_mirror_failed_lines={failed_lines} exit={code}");
+    println!(
+        "RESULT relay_log_lines={lines} relay_mirror_failed_lines={failed_lines} exit={code} \
+         aborted={}",
+        lock(&ABORT_WHY).replace(' ', "_")
+    );
     if code != 0 {
         eprintln!("relay exit {code}; last lines:\n{}", tail.join("\n"));
     }
@@ -1384,6 +1778,13 @@ fn run(o: &Opts) -> R<()> {
 /// `--backlog`: the blocks are first stored by a relay without the archive copy, which then
 /// restarts with it on the same data directory. The uploader starts with the whole set to copy,
 /// so the rate it drains at is its own, not the ingest rate.
+/// Where a backlog drain is observed.
+enum Sink<'a> {
+    Fake(&'a Fake),
+    /// The remote bucket, probed every `.1`th block (and the last) with at most `.2` `HEAD`s.
+    Remote(&'a Remote, usize, u64),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_backlog(
     bin: &Path,
@@ -1392,12 +1793,12 @@ fn drain_backlog(
     env: &[(String, OsString)],
     blocks: &Blocks,
     clients: usize,
-    f: &Fake,
+    sink: &Sink<'_>,
     limit: Duration,
 ) -> R<()> {
     let n = blocks.ids.len();
     let plain = Relay::start(bin, &relay_env(&work.join("a"), pow, &[]))?;
-    let put = put_phase(plain.addr, blocks, clients, 0.0);
+    let put = put_phase(plain.addr, blocks, clients, 0.0, None);
     if put.statuses.get(&201) != Some(&(n as u64)) {
         return Err("backlog: not every block was accepted".into());
     }
@@ -1408,36 +1809,71 @@ fn drain_backlog(
     let cpu0 = ps(pid).map_or(0, |(_, c)| c);
     let sampler = Sampler::start(pid);
     sampler.enter(3);
-    f.t0.store(now_ms(), Ordering::Relaxed);
-    let end = Instant::now() + limit;
-    while lock(&f.arrived).len() < n && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
+    match sink {
+        Sink::Fake(f) => {
+            f.t0.store(now_ms(), Ordering::Relaxed);
+            let end = Instant::now() + limit;
+            while lock(&f.arrived).len() < n && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let arrived = lock(&f.arrived);
+            let first = arrived.values().map(|(t, _)| *t).min();
+            let last = arrived.values().map(|(t, _)| *t).max();
+            let bytes: usize = arrived.values().map(|(_, l)| *l).sum();
+            if let (Some(a), Some(b)) = (first, last) {
+                let span = (b - a).as_secs_f64().max(1e-9);
+                println!(
+                    "RESULT backlog_copied={} backlog_blocks_per_s={:.0} backlog_mb_per_s={:.2} \
+                     backlog_done_s_after_start={:.2} s3_block_puts={} s3_injected_failures={} \
+                     s3_bad_signatures={}",
+                    arrived.len(),
+                    arrived.len() as f64 / span,
+                    bytes as f64 / span / 1e6,
+                    (b - start).as_secs_f64(),
+                    f.block_puts.load(Ordering::Relaxed),
+                    f.failed.load(Ordering::Relaxed),
+                    f.bad_sig.load(Ordering::Relaxed),
+                );
+            }
+        }
+        Sink::Remote(r, every, max_heads) => {
+            // The uploader copies in index order: the probes, in the same order, see the drain
+            // progress; the last block marks its end. Times are from the relay's restart.
+            let (tx, rx) = mpsc::channel();
+            let every = (*every).max(1);
+            let mut probes: Vec<usize> = (every - 1..n).step_by(every).collect();
+            if probes.last() != Some(&(n - 1)) {
+                probes.push(n - 1);
+            }
+            for &i in &probes {
+                let _ = tx.send((i, start));
+            }
+            drop(tx);
+            let (lags, heads) = probe_remote(r, &blocks.ids, &rx, *max_heads, limit)?;
+            let bytes: usize = blocks.bytes.iter().map(Vec::len).sum();
+            let done = lags.len() == probes.len();
+            let last = lags.last().copied().unwrap_or(0);
+            println!(
+                "RESULT backlog_probes_found={} backlog_complete={done} \
+                 backlog_done_s_after_start={:.2} backlog_blocks_per_s={:.0} \
+                 backlog_mb_per_s={:.2} remote_heads={heads}",
+                lags.len(),
+                last as f64 / 1e3,
+                n as f64 / (last as f64 / 1e3).max(1e-3),
+                bytes as f64 / (last as f64 / 1e3).max(1e-3) / 1e6,
+            );
+        }
     }
     let cpu = ps(pid).map_or(0, |(_, c)| c).saturating_sub(cpu0);
     let peaks = sampler.finish();
-    let arrived = lock(&f.arrived);
-    let first = arrived.values().map(|(t, _)| *t).min();
-    let last = arrived.values().map(|(t, _)| *t).max();
-    let bytes: usize = arrived.values().map(|(_, l)| *l).sum();
-    if let (Some(a), Some(b)) = (first, last) {
-        let span = (b - a).as_secs_f64().max(1e-9);
-        println!(
-            "RESULT backlog_copied={} backlog_blocks_per_s={:.0} backlog_mb_per_s={:.2} \
-             backlog_done_s_after_start={:.2} relay_cpu_drain_ms={cpu} rss_peak_drain_kib={} \
-             s3_block_puts={} s3_injected_failures={} s3_bad_signatures={}",
-            arrived.len(),
-            arrived.len() as f64 / span,
-            bytes as f64 / span / 1e6,
-            (b - start).as_secs_f64(),
-            peaks[3],
-            f.block_puts.load(Ordering::Relaxed),
-            f.failed.load(Ordering::Relaxed),
-            f.bad_sig.load(Ordering::Relaxed),
-        );
-    }
-    drop(arrived);
+    let failed = relay.mirror_failed_lines.load(Ordering::Relaxed);
     let code = relay.stop()?;
-    println!("RESULT exit={code}");
+    println!(
+        "RESULT relay_cpu_drain_ms={cpu} rss_peak_drain_kib={} relay_mirror_failed_lines={failed} \
+         exit={code} aborted={}",
+        peaks[3],
+        lock(&ABORT_WHY).replace(' ', "_")
+    );
     Ok(())
 }
 
