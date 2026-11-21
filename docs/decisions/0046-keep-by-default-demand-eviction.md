@@ -1,6 +1,10 @@
 # 0046: Relays keep by default; eviction under disk pressure by least recent demand
 
 - Status: accepted (by the project owner, 2026-11-21)
+- Amended by: 0048 (rules 10 and 15: a request carrying `Sbtp-Replication: 1` is not demand and is
+  answered `no-store`)
+- Clarified: 2026-11-21, by the project owner after the security review
+  `docs/security/2026-11-21-demand-eviction.md` (clarifications D1 to D8 below: rules 8, 13, 22 and 25)
 - Date: 2026-11-20
 - Revised: 2026-11-20, owner review: demand hidden by shared caches is recovered, not accepted
   (rules 7, 12 to 17, 24 to 28)
@@ -9,7 +13,8 @@
 - Amends:
   - ADR 0013 rule 12 (default of `block_ttl_ms`; "Eviction does not depend on reads"), rule 16 (what an
     archive relay is) and rule 21 ("MUST NOT evict unexpired blocks to make room");
-  - ADR 0023 rule 13 (`Cache-Control` of a block response when demand eviction is on);
+  - ADR 0023 rule 13 (`Cache-Control` of a block response when demand eviction is on) and rule 18
+    (`Retry-After` on `507`, rule 8 and clarification D5);
   - ADR 0019 rule 4 (default of `block_ttl_ms`), rule 37 (one profile row) and rule 38 (policy
     settings);
   - ADR 0018 rule 35 (one more term in the memory bound);
@@ -344,9 +349,95 @@ interruption); write-flood eviction of cold blocks (rule 21) against the `small`
 headers of rule 15 (no shared lifetime above `S`, unchanged `immutable` for private caches); that logs
 and metrics carry no `block_id` or client key.
 
+## Clarifications (2026-11-21, after security review)
+
+Decided by the project owner after the security review of the implementation
+(`docs/security/2026-11-21-demand-eviction.md`). D1 to D6 close gaps in rules 8, 13 and 22 where
+rule 13 ("MUST NOT evict by demand while a lost demand could be the one that protects a block") was
+not quite kept; they are normative. D7 replaces stale figures. D8 is a reference.
+
+- **D1. Demand never recorded is a lost demand (review M-1).** Rule 13 gains a third case. At a start
+  with `demand_eviction = true`, when the index metadata does not record that the previous start ran
+  with `demand_eviction = true`, demand eviction is suspended until `start + 2 × E`. This covers:
+  - the first start after an upgrade: an index written before this ADR, whose demand tables the
+    start-up migration fills from `received_at` (implementation plan, step 2);
+  - an index rebuilt from the block files (its metadata is new);
+  - every transition of `demand_eviction` from `false` to `true`.
+
+  With demand eviction off, the relay records no `GET` demand and sends the one-year shared lifetime
+  (rule 16), so `last_demand` reflects acceptances and children only. An index created empty at this
+  start holds no block and is not suspended.
+
+  The relay records the value of `demand_eviction` of the current start in the index metadata,
+  durably, before it listens; `false` is recorded too, so that each later transition is seen.
+
+  The suspension does not cover entries that a shared cache stored with the one-year lifetime before
+  the transition: such an entry may serve visitors for up to a year without asking the relay. An
+  operator who turns demand eviction on for a relay whose `/sbtp/v1/block/*` responses a shared cache
+  may hold MUST purge that path from the cache after the relay runs with `demand_eviction = true`,
+  and before the suspension ends. A purge made before the restart lets the requests made in between
+  be cached again with the one-year lifetime. A deployment that bypasses the cache on `/sbtp/v1/*`
+  needs no purge.
+
+  `deploy/README.md`, Cloudflare section, gains (written by the relay engineer, content as follows):
+  "Turning demand eviction on. A relay that served blocks with `demand_eviction = false` sent a
+  one-year shared lifetime, and the CDN may serve those entries for a year without asking the relay,
+  so their demand never reaches it. Restart the relay with `demand_eviction = true` first, then purge
+  `/sbtp/v1/block/*` from the CDN cache (a purge by prefix where the plan offers it, otherwise a
+  purge of everything cached for the relay's host), within `2 × demand_epoch_ms` of the restart. A
+  purge before the restart is not enough. With the cache bypassed on `/sbtp/v1/*`, no purge is
+  needed."
+- **D2. A running suspension survives a clean restart (review L-1).** Rule 13, "The suspension end is
+  kept in memory and set again by the next loss or unclean start", is replaced by: the relay keeps the
+  suspension end in memory and writes it (`suspended_until`) into the index metadata at a clean
+  shutdown, with the clean mark. At start, demand eviction is suspended until the latest of the stored
+  end and, when a start case of rule 13 or D1 applies, `start + 2 × E`. A stored end in the past has no
+  effect. An unclean stop needs no stored end: the start case gives `start + 2 × E`, which is later
+  than any end set before the stop.
+- **D3. Each candidate re-checks the suspension (review L-2).** In the re-check at deletion time of
+  rule 22, the sweeper also checks, for each candidate, that demand eviction is not suspended. A
+  suspension that begins during a pass ends the pass; blocks deleted before it stay deleted. A demand
+  lost by a `PUT` answered `200` (rule 14) sets the suspension before that `PUT` releases the
+  serialisation of its `block_id`.
+- **D4. A forced or timed-out drain is an unclean stop (review L-3).** A shutdown is clean, for rule 13
+  and ADR 0013 rule 9, only when the drain of ADR 0019 rule 21 completed with no request in flight and
+  the final flush then succeeded. When the drain ends at its deadline or by a forced stop (a second
+  signal), the relay does not mark the index clean, and the next start suspends demand eviction for
+  `2 × E`.
+- **D5. `Retry-After` on `507` (review L-4).** This ADR amends ADR 0023 rule 18 ("not sent by the
+  reference relay"). Rule 8 is narrowed: the relay MAY send `Retry-After` on a `507` only while demand
+  eviction is on, the store is above the high-water mark, eviction is not suspended (rule 13, D1, D2),
+  and the last sweeper run was not stuck (`demand_stuck`, rule 8, or D6). Otherwise it sends none: the
+  sweeper frees nothing within `sweep_interval_ms`, and a client should try another relay.
+- **D6. Index part above the low-water mark (review I-2).** The watermarks compare the stored total of
+  ADR 0013 rule 18, which includes the index part (the index size and its growth reserve, ADR 0025).
+  Demand eviction does not reduce it: the index file does not shrink when entries are removed. When the
+  index part alone is at or above `demand_low_water_pct` of `max_store_bytes`, the sweeper does not
+  evict by demand; it logs `demand_stuck` with the cause `index`, and new blocks get `507` (rule 8). A
+  run also ends when its deletions did not lower the stored total.
+- **D7. Memory figures (rule 25, review I-5).** Rule 25 is replaced by: the set costs at most
+  `demand_touch_max × 64` bytes (two 32-byte slots per entry, the table at most half full) plus one
+  flush buffer of 32,768 bytes: 1,081,344 bytes on `small`, 8 MiB plus 32 KiB on `standard`, 64 MiB
+  plus 32 KiB on `large`, added to the bound of ADR 0018 rule 35. The `small` bound before this ADR is
+  13,665,748 bytes (ADR 0021 rule 45 as recomputed by ADR 0027 clarification T1; the 13,018,580 of
+  "Context" is stale); with this ADR it is 14,747,092 bytes, 252,908 bytes under 15,000,000. The
+  suspension state of rule 13 is one integer.
+- **D8. Write floods (review M-2).** Rule 21 accepts that a write flood pushes cold blocks out. The
+  bounds on ingest and storage per client are the subject of ADR 0049 (ingest and storage bounds).
+
+Tests added to the implementation plan, step 7: a first start on an index written before this ADR
+suspends for `2 × E`; an off-to-on transition suspends, an on-to-on restart does not; an empty new
+index does not; `suspended_until` survives a clean restart and a past value has no effect; a loss
+during a pass stops it before the next candidate; a drain ended by its deadline or by a second signal
+gives a suspension at the next start; no `Retry-After` on `507` while suspended or stuck; the guard of
+D6.
+
 ## Spec change on acceptance
 
-Applied on acceptance (2026-11-21).
+Applied on acceptance (2026-11-21). Clarification D1 adds to the `architecture.md` §2 "Eviction"
+sentence "A lost demand suspends eviction by demand for `2 × E`." the words ", as do an unclean stop,
+a first start without demand history and a change of `demand_eviction` from off to on" (applied
+2026-11-21).
 
 Core spec §4, `GET /sbtp/v1/block/{block_id}`, the `Cache-Control` sentence ("A `200` response SHOULD
 carry `Cache-Control: public, max-age=31536000, immutable`.") replaced by:

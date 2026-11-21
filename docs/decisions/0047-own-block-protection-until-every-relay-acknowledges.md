@@ -1,6 +1,7 @@
 # 0047: An own block stays protected locally until every relay of the list acknowledges it, within a bound
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21), as proposed, with the starting values of
+  rule 11: `publish_min_attempts` 5, `publish_min_wait` 24 hours, `publish_max_wait` 7 days
 - Date: 2026-11-21
 - Questions: none open; owner direction of 2026-11-21 (a block published to several relays is kept
   until each of them has it, not only the first)
@@ -153,6 +154,8 @@ the list, the client keeps a **delivery state**: `pending`, `acknowledged`, `ref
   `pending` on every relay of the list.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 Core spec §4, "Client bounds", the bullet "When it drops blocks to stay within its storage budget, a
 client MUST NOT drop the user's private keys, nor a block the user created that no relay has

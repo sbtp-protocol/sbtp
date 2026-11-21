@@ -100,7 +100,9 @@ On the first failure, the block is rejected without allocating any persistent re
   blocks requested least recently until it is at a low-water mark. Demand is its acceptance, a `GET`
   answered `200` or `304`, a `PUT` answered `200`, and the acceptance of a child; at most one per block
   per epoch `E`, whatever the client. A block whose last demand is less than `3 × E` old is not
-  evicted. A lost demand suspends eviction by demand for `2 × E`. A `PUT` never evicts. (ADR 0046)
+  evicted. A lost demand suspends eviction by demand for `2 × E`, as do an unclean stop, a first start
+  without demand history and a change of `demand_eviction` from off to on. A `PUT` never evicts.
+  (ADR 0046)
 - A relay that evicts by demand bounds shared caches to `E / 2` with `s-maxage` and
   `CDN-Cache-Control`, so that a block requested through a cache is revalidated, and counted, at least
   once per `E / 2`. (ADR 0046)
@@ -120,9 +122,20 @@ On the first failure, the block is rejected without allocating any persistent re
   only the sweeper evicts, by age or by demand. A full relay keeps serving reads. (ADRs 0013, 0046)
 
 ### Replication
-- A mirror copies a block by a `PUT` of the same bytes to another relay. It never re-mines, re-signs or
-  alters a block. A block below the target's `min_pow_difficulty` is skipped for that target and
-  counted; it is not an error of the source. (ADR 0045)
+- A relay MAY copy blocks from peers that its operator lists in `peers` (relay URLs, `https` only).
+  It walks each peer's `/query` with a cursor kept per peer, skips the blocks it holds and those below
+  its `min_pow_difficulty`, fetches the others with `GET`, validates each as a `PUT` body (F1 to F9,
+  P1, C1, C2, C3) and R1, and stores it as an accepted block. It never re-mines, re-signs or alters a
+  block, never follows a redirect and never adds a peer from what it receives. (ADRs 0045, 0048)
+- Replication is off by default (`peers` empty). It runs within its own bounds per profile, obeys
+  the peer's `Retry-After`, and stores nothing while the store is above the high-water mark. A
+  replicating relay does not set `min_pow_difficulty` above `D_NET`. (ADR 0048)
+- A copy is not a read: replication requests carry `Sbtp-Replication: 1`, and a source that evicts
+  by demand does not count them as demand (core spec §4, `GET /sbtp/v1/block/{block_id}`).
+  (ADR 0048)
+- A mirror outside the relay MAY copy blocks by a `PUT` of the same bytes instead. It never re-mines,
+  re-signs or alters a block. A block below the target's `min_pow_difficulty` is skipped for that
+  target and counted; it is not an error of the source. (ADR 0045)
 - When `D_NET` is raised, clients mine at the new value from its announcement and relays raise their
   floor at its effective date. Blocks mined earlier stay where they are held. (ADR 0045)
 
@@ -147,8 +160,9 @@ On the first failure, the block is rejected without allocating any persistent re
   sets `client_ip_header`, from that single-value header written by a CDN. Either source is read only
   from a peer in `trusted_proxies`. (ADR 0020, ADR 0044)
 - A `profile` setting (`small`, `standard`, `large`) gives coherent values to the resource limits. Each
-  setting overrides it. The 15 MB worst-case memory target applies to `small` with TLS off.
-  (ADR 0019, ADR 0028)
+  setting overrides it. The 15 MB worst-case memory target applies to `small` with the default
+  settings (server TLS and replication off); with replication on and TLS off, the bound of `small` is
+  16 MB. (ADR 0019, ADR 0028, ADR 0048)
 - The relay listens on one address (`listen`, default `127.0.0.1:8080`) and keeps its blocks and index
   under `data_dir`. It serves HTTP/1.1 only, over TLS when `tls_mode` is `files` (TLS 1.3, ALPN
   `http/1.1`). With TLS on, a handshake takes a per-client token and completes within
@@ -159,8 +173,8 @@ On the first failure, the block is rejected without allocating any persistent re
 
 | Tier | Runtime | Role |
 |---|---|---|
-| 1 | Zero-install PWA (WASM, OPFS, IndexedDB, WebRTC) | Universal access, P2P while the tab is open. |
-| 2 | Self-hosted micro-relays (Rust binary ~5 MB, < 15 MB RAM with the default profile `small` and TLS off) | Backbone. Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
+| 1 | Zero-install PWA (WASM, OPFS, IndexedDB, WebRTC) | Universal access. Discovery through relay lists; P2P serving while the tab is open is a later, opt-in stage (ADR 0048). |
+| 2 | Self-hosted micro-relays (one Rust image under 5 MB compressed, < 15 MB RAM with the default profile `small` and the default settings) | Backbone. Built-in TLS and replication are compiled in and off until configured (ADR 0028, ADR 0048). Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
 | 3 | Object storage / CDN (S3, R2, Pages) | Static mirrors, near-zero cost. |
 | 4 | Desktop / mobile daemon | Super-peers: 24/7 seeding, indexing; MAY run a graph gateway (`graph-access.md` §3). |
 
