@@ -1000,6 +1000,13 @@ impl RedbIndex {
         self.db.close()?;
         Ok(())
     }
+
+    /// The database, for the replication cursor table (ADR 0048 rule 8,
+    /// `crate::replication::cursor`), which no other table refers to.
+    #[cfg(feature = "replication")]
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
+    }
 }
 
 type Table<'t, K, V> = redb::Table<'t, K, V>;

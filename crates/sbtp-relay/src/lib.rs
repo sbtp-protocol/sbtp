@@ -24,8 +24,11 @@ pub mod index;
 pub mod limiter;
 pub mod log;
 pub mod metrics;
+pub mod peers;
 pub mod pool;
 pub mod query;
+#[cfg(feature = "replication")]
+pub mod replication;
 pub mod server;
 pub mod store;
 pub mod sweep;
@@ -125,6 +128,8 @@ where
     }
     log::global().configure(&LogConfig::from_settings(&settings));
     log_settings(&settings)?;
+    // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
+    let replication = prepare_replication(&settings)?;
 
     // Mode `0700` for what this creates (security review L-4); an existing directory is kept.
     store::dir_builder()
@@ -180,7 +185,7 @@ where
                 let relay = Arc::new(relay);
                 let kept = Arc::clone(&relay);
                 let app = api::app(&settings, Arc::clone(&relay));
-                let drain = serve(&settings, app, relay, shutdown, on_listen);
+                let drain = serve(&settings, app, relay, replication, shutdown, on_listen);
                 // L-1: written by the clean mark, restored at the next start.
                 let until = kept.demand().suspended_until();
                 drop(kept);
@@ -237,6 +242,39 @@ fn demand_start(index: &RedbIndex, settings: &Settings) -> Result<demand::StartS
         previous: index.record_demand_eviction(settings.demand_eviction)?,
         empty: false,
     })
+}
+
+/// What [`serve`] starts beside the accept loop when replication is on (ADR 0048 rule 3).
+#[cfg(feature = "replication")]
+type Replicator = replication::Replication;
+#[cfg(not(feature = "replication"))]
+type Replicator = std::convert::Infallible;
+
+#[cfg(feature = "replication")]
+fn prepare_replication(settings: &Settings) -> Result<Option<Replicator>, StartError> {
+    replication::Replication::prepare(settings).map_err(StartError::Config)
+}
+
+#[cfg(not(feature = "replication"))]
+#[allow(clippy::unnecessary_wraps)] // The signature of the feature build.
+fn prepare_replication(_: &Settings) -> Result<Option<Replicator>, StartError> {
+    Ok(None)
+}
+
+/// Starts replication, when prepared; the task ends at the stop, or when a worker ends.
+#[allow(clippy::needless_pass_by_value)] // Moved into the task in the feature build.
+fn spawn_replication(
+    r: Option<Replicator>,
+    relay: &Arc<Relay<RedbIndex>>,
+    stopped: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(feature = "replication")]
+    return r.map(|r| r.spawn(Arc::clone(relay), stopped.clone()));
+    #[cfg(not(feature = "replication"))]
+    {
+        let _ = (relay, stopped);
+        r.map(|never| match never {})
+    }
 }
 
 /// The start-up lines from `profile` to `config_warning` (ADR 0019 rules 22 and 36.6, ADR 0018
@@ -321,6 +359,7 @@ fn serve<S, T>(
     settings: &Settings,
     app: axum::Router,
     relay: Arc<Relay<RedbIndex>>,
+    replication: Option<Replicator>,
     shutdown: S,
     on_listen: impl FnOnce(SocketAddr),
 ) -> Result<server::Drain, StartError>
@@ -357,6 +396,9 @@ where
         on_listen(local);
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let flushed = Arc::clone(&relay);
+        // ADR 0048: replication runs beside the accept loop, like the sweeper; if it ends while
+        // the relay serves (a worker panicked), the process exits (ADR 0018 rule 37).
+        let mut replicator = spawn_replication(replication, &relay, &stopped);
         let mut sweeper = tokio::spawn(sweep::run(
             relay,
             std::time::Duration::from_millis(settings.sweep_interval_ms),
@@ -370,9 +412,24 @@ where
                 log::flush();
                 std::process::exit(pool::EXIT_THREAD_ENDED);
             }
+            () = async {
+                match replicator.as_mut() {
+                    Some(h) => {
+                        let _ = h.await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                log::emit(Event::Fatal, &[("msg", Value::Str("replication ended"))]);
+                log::flush();
+                std::process::exit(pool::EXIT_THREAD_ENDED);
+            }
         };
         let _ = stop.send(true);
         let _ = sweeper.await;
+        if let Some(h) = replicator {
+            let _ = h.await;
+        }
         // ADR 0046 rule 12: the last flush of the demand set, at a clean shutdown, after the
         // sweeper task (the only other flusher) has stopped.
         let lost = tokio::task::spawn_blocking(move || sweep::flush_demand(&flushed).lost)

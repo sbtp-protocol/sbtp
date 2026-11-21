@@ -16,6 +16,7 @@ use axum::http::HeaderValue;
 
 use crate::index;
 use crate::log::{ClientTag, Format, Level, Timestamp};
+use crate::peers::{PeerUrl, ReplicationStart};
 
 /// `max_query_limit`: default and maximum, the index clamp (ADR 0012 rule 8, ADR 0018 rule 14).
 const MAX_QUERY_LIMIT: u64 = index::MAX_QUERY_LIMIT as u64;
@@ -136,12 +137,21 @@ int_settings! {
     demand_low_water_pct: 10, 98, Some(80);
     demand_epoch_ms: 14_400_000, 2_592_000_000, Some(86_400_000);
     demand_touch_max: 1_024, 16_777_216, Some(16_384);
+    // ADR 0048 rule 15: profile rows, then policy settings.
+    replication_max_peers: 1, 256, Some(4);
+    replication_max_in_flight: 1, 64, Some(1);
+    replication_blocks_per_min: 1, 1_000_000, Some(600);
+    replication_bytes_per_hour: 1 << 20, 1 << 40, Some(256 << 20);
+    replication_poll_ms: 1_000, 3_600_000, Some(10_000);
+    replication_request_timeout_ms: 1_000, 300_000, Some(30_000);
+    replication_max_backoff_s: 1, 86_400, Some(3_600);
+    replication_resync_margin_ms: 0, 86_400_000, Some(3_600_000);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 20] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 24] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -164,6 +174,11 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 20] = [
     ("log_burst", [300, 600]),
     // ADR 0046 rule 24 (amends rule 37).
     ("demand_touch_max", [131_072, 1_048_576]),
+    // ADR 0048 rule 15 (amends rule 37).
+    ("replication_max_peers", [16, 64]),
+    ("replication_max_in_flight", [4, 16]),
+    ("replication_blocks_per_min", [3_000, 12_000]),
+    ("replication_bytes_per_hour", [2 << 30, 16 << 30]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -231,7 +246,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 12] = [
+const OTHER_KEYS: [&str; 16] = [
     "profile",
     "listen",
     "data_dir",
@@ -244,6 +259,11 @@ const OTHER_KEYS: [&str; 12] = [
     "log_client_tag",
     "client_ip_header",
     "demand_eviction",
+    // ADR 0048 rule 15.
+    "peers",
+    "replication_start",
+    "replication_allow_private",
+    "peer_ca_file",
 ];
 
 /// An address block in CIDR notation (`192.0.2.0/24`, `2001:db8::/32`). Host bits must be zero.
@@ -446,6 +466,22 @@ pub struct Settings {
     /// The demand epoch `E`.
     pub demand_epoch_ms: u64,
     pub demand_touch_max: u64,
+    // ADR 0048 rule 15.
+    /// The peers to copy blocks from, normalised; empty (the default) turns replication off.
+    pub peers: Vec<PeerUrl>,
+    pub replication_start: ReplicationStart,
+    /// Connect to loopback, private and link-local resolved addresses (rule 14); default `false`.
+    pub replication_allow_private: bool,
+    /// A PEM file of trust roots that replaces the operating system store (rule 19).
+    pub peer_ca_file: Option<PathBuf>,
+    pub replication_max_peers: u64,
+    pub replication_max_in_flight: u64,
+    pub replication_blocks_per_min: u64,
+    pub replication_bytes_per_hour: u64,
+    pub replication_poll_ms: u64,
+    pub replication_request_timeout_ms: u64,
+    pub replication_max_backoff_s: u64,
+    pub replication_resync_margin_ms: u64,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -678,6 +714,20 @@ impl Settings {
         )?;
         let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
         let demand_eviction = parse_bool(other("demand_eviction"), "demand_eviction")?;
+        let peers = parse_peers(other("peers"))?;
+        let replication_allow_private = parse_bool(
+            other("replication_allow_private"),
+            "replication_allow_private",
+        )?;
+        let peer_ca_file = other("peer_ca_file")
+            .map(|r| parse_path(&r, "peer_ca_file"))
+            .transpose()?;
+        let replication_start = parse_choice(
+            other("replication_start"),
+            "replication_start",
+            ReplicationStart::parse,
+            ReplicationStart::NAMES,
+        )?;
         // Strings of one fixed set each (ADR 0021 rule 46), parsed by the `choice!` of `log`.
         macro_rules! choice {
             ($t:ident, $k:literal) => {
@@ -747,6 +797,18 @@ impl Settings {
             demand_low_water_pct: v(ints.demand_low_water_pct),
             demand_epoch_ms: v(ints.demand_epoch_ms),
             demand_touch_max: v(ints.demand_touch_max),
+            peers,
+            replication_start: replication_start.unwrap_or(ReplicationStart::Now),
+            replication_allow_private: replication_allow_private.unwrap_or(false),
+            peer_ca_file,
+            replication_max_peers: v(ints.replication_max_peers),
+            replication_max_in_flight: v(ints.replication_max_in_flight),
+            replication_blocks_per_min: v(ints.replication_blocks_per_min),
+            replication_bytes_per_hour: v(ints.replication_bytes_per_hour),
+            replication_poll_ms: v(ints.replication_poll_ms),
+            replication_request_timeout_ms: v(ints.replication_request_timeout_ms),
+            replication_max_backoff_s: v(ints.replication_max_backoff_s),
+            replication_resync_margin_ms: v(ints.replication_resync_margin_ms),
             sources,
         };
         s.check_constraints()?;
@@ -780,6 +842,18 @@ impl Settings {
                     "log_client_tag" => Some(self.log_client_tag.name().to_owned()),
                     "client_ip_header" => Some(self.client_ip_header.clone().unwrap_or_default()),
                     "demand_eviction" => Some(self.demand_eviction.to_string()),
+                    // ADR 0048: the number of peers only; logs name a peer by its position.
+                    "peers" => Some(self.peers.len().to_string()),
+                    "replication_start" => Some(self.replication_start.name().to_owned()),
+                    "replication_allow_private" => {
+                        Some(self.replication_allow_private.to_string())
+                    }
+                    "peer_ca_file" => Some(
+                        self.peer_ca_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    ),
                     _ => None,
                 }
             };
@@ -827,7 +901,15 @@ impl Settings {
             demand_high_water_pct,
             demand_low_water_pct,
             demand_epoch_ms,
-            demand_touch_max
+            demand_touch_max,
+            replication_max_peers,
+            replication_max_in_flight,
+            replication_blocks_per_min,
+            replication_bytes_per_hour,
+            replication_poll_ms,
+            replication_request_timeout_ms,
+            replication_max_backoff_s,
+            replication_resync_margin_ms
         )
     }
 
@@ -964,6 +1046,16 @@ impl Settings {
                     .into(),
             );
         }
+        // ADR 0048 rule 14.
+        if self.replication_allow_private && !self.peers.is_empty() {
+            add(
+                "replication_private",
+                "replication_allow_private",
+                "replication_allow_private = true: peer names may resolve to loopback, private \
+                 and link-local addresses, cloud metadata included (ADR 0048 rule 14)"
+                    .into(),
+            );
+        }
         w
     }
 
@@ -1061,6 +1153,7 @@ impl Settings {
                 self.max_connections.saturating_mul(2)
             )));
         }
+        self.check_replication()?;
         // Also checked when `max_blocking_threads` is left at its derived default, which can
         // exceed 512 (range "that sum to 512").
         c(
@@ -1068,6 +1161,43 @@ impl Settings {
                 .contains(&self.max_blocking_threads),
             "max_blocking_threads must be from block_max_readers + put_max_in_flight + 2 to 512",
         )
+    }
+
+    /// ADR 0048 rules 2, 3 and 15.
+    fn check_replication(&self) -> Result<(), ConfigError> {
+        if self.peers.is_empty() {
+            return Ok(());
+        }
+        // Rule 3, item 1: a setting that needs a feature absent from the build stops the start-up.
+        if !cfg!(feature = "replication") {
+            return Err(ConfigError::Invalid {
+                setting: "peers",
+                reason: "this build has no `replication` feature; leave peers empty".into(),
+            });
+        }
+        if u64::try_from(self.peers.len()).unwrap_or(u64::MAX) > self.replication_max_peers {
+            return Err(ConfigError::Constraint(format!(
+                "peers has {} entries, more than replication_max_peers ({})",
+                self.peers.len(),
+                self.replication_max_peers
+            )));
+        }
+        // Rule 2, ADR 0045 rule 3.
+        if self.min_pow_difficulty > sbtp_core::NETWORK_POW_DIFFICULTY {
+            return Err(ConfigError::Constraint(format!(
+                "a relay that replicates (peers not empty) must not set min_pow_difficulty ({}) \
+                 above the network difficulty {} (ADR 0048 rule 2)",
+                self.min_pow_difficulty,
+                sbtp_core::NETWORK_POW_DIFFICULTY
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether replication runs: compiled in and `peers` not empty (ADR 0048 rule 3).
+    #[must_use]
+    pub fn replication_on(&self) -> bool {
+        cfg!(feature = "replication") && !self.peers.is_empty()
     }
 
     /// The open-file limit the process needs (ADR 0018 rule 22).
@@ -1122,6 +1252,15 @@ impl Settings {
             // ADR 0046 rule 25: the demand set, allocated once at start-up, and one flush chunk.
             if self.demand_eviction {
                 crate::demand::memory_bytes(self.demand_touch_max)
+            } else {
+                0
+            },
+            // ADR 0048 rule 16: only when replication runs.
+            if self.replication_on() {
+                crate::peers::memory_bytes(
+                    self.replication_max_in_flight,
+                    self.replication_max_peers,
+                )
             } else {
                 0
             },
@@ -1317,6 +1456,40 @@ fn parse_client_ip_header(r: Option<Raw>) -> Result<Option<String>, ConfigError>
     Ok(Some(s))
 }
 
+/// ADR 0048 rules 5 and 20: relay URLs, normalised, without duplicates.
+fn parse_peers(r: Option<Raw>) -> Result<Vec<PeerUrl>, ConfigError> {
+    let Some(r) = r else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<PeerUrl> = Vec::new();
+    for item in r.list("peers")? {
+        let url = PeerUrl::parse(&item).map_err(|reason| ConfigError::Invalid {
+            setting: "peers",
+            reason,
+        })?;
+        if out.contains(&url) {
+            return Err(ConfigError::Invalid {
+                setting: "peers",
+                reason: format!("`{item}` is listed twice (after normalisation)"),
+            });
+        }
+        out.push(url);
+    }
+    Ok(out)
+}
+
+/// A non-empty path.
+fn parse_path(r: &Raw, setting: &'static str) -> Result<PathBuf, ConfigError> {
+    let s = r.string(setting)?;
+    if s.is_empty() {
+        return Err(ConfigError::Invalid {
+            setting,
+            reason: "empty path".into(),
+        });
+    }
+    Ok(PathBuf::from(s))
+}
+
 fn parse_data_dir(r: Option<Raw>) -> Result<PathBuf, ConfigError> {
     let Some(r) = r else {
         return Ok(PathBuf::from("data"));
@@ -1439,9 +1612,9 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 44 integer settings plus the 12 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044
-        // and 0046.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 56);
+        // 52 integer settings plus the 16 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
+        // 0046 and 0048.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 68);
     }
 
     /// ADR 0044 rule 1: a field name of 1 to 64 token bytes, kept lowercase; the two address

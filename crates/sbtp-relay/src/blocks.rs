@@ -351,8 +351,14 @@ impl<I: IndexBackend + 'static> Relay<I> {
     }
 
     /// Steps 1 to 5 of the `PUT` pipeline (spec §4), on a blocking thread. `seen` receives the
-    /// `block_id` once C1 has computed it.
-    fn process(&self, bytes: &[u8], seen: &mut Option<BlockId>) -> Result<Accepted, Rejection> {
+    /// `block_id` once C1 has computed it. A replicated block (ADR 0048 rule 4) goes through the
+    /// same steps, with R1 for the requested `block_id` right after C1 computed it.
+    fn process(
+        &self,
+        bytes: &[u8],
+        seen: &mut Option<BlockId>,
+        origin: Origin,
+    ) -> Result<Accepted, Rejection> {
         // spec §2.2 F1 to F9.
         let block = sbtp_core::parse(bytes).map_err(Rejection::Block)?;
         // P1 (ADR 0007 rules 3 and 8): after F9, before C1; the sum saturates.
@@ -362,16 +368,56 @@ impl<I: IndexBackend + 'static> Relay<I> {
         // spec §2.2 C1; computes the `block_id`.
         let checked = block.check_pow(self.min_pow).map_err(Rejection::Block)?;
         let id = *checked.block_id();
+        // spec §2.2 R1 (ADR 0048 rule 4): a replicated block carries the requested `block_id`.
+        if let Origin::Replication(expected) = origin
+            && expected != id
+        {
+            return Err(Rejection::Block(sbtp_core::Error::BlockIdMismatch {
+                expected,
+                actual: id,
+            }));
+        }
         *seen = Some(id);
         // Held until the index insert: one `PUT` of a given block at a time.
         let _id = self.lock_id(&id);
         let result = self.decide(bytes, id, &block, checked);
         // ADR 0046 rules 10 and 14: a `PUT` answered `200` is a demand of the block. A `201`
-        // records its demand in its index insert.
-        if matches!(result, Ok(Accepted::Known)) {
+        // records its demand in its index insert. A copy is not a demand (ADR 0048 rule 18).
+        if origin == Origin::Put && matches!(result, Ok(Accepted::Known)) {
             self.put_demand(&id);
         }
         result
+    }
+
+    /// ADR 0048 rules 4 and 12: stores a block fetched by replication for `expected`, through the
+    /// steps of a `PUT` ([`Relay::process`], R1 included) and under the same `PUT` permit, which
+    /// it waits for at most `queue_timeout_ms`. No HTTP request, no per-client bound, no rate
+    /// limiter: replication is not a client.
+    #[cfg(feature = "replication")]
+    pub(crate) async fn store_replicated(
+        self: &Arc<Self>,
+        bytes: Bytes,
+        expected: BlockId,
+    ) -> Replicated {
+        let Ok(permit) = self.put.acquire().await else {
+            return Replicated::Busy;
+        };
+        let worker = Arc::clone(self);
+        let done = tokio::task::spawn_blocking(move || {
+            let _owned = permit;
+            let mut seen = None;
+            worker.process(&bytes, &mut seen, Origin::Replication(expected))
+        })
+        .await;
+        match done {
+            Ok(Ok(Accepted::New)) => Replicated::New,
+            Ok(Ok(Accepted::Known)) => Replicated::Known,
+            Ok(Err(Rejection::Block(_))) => Replicated::Invalid,
+            Ok(Err(Rejection::Future)) => Replicated::Future,
+            Ok(Err(Rejection::Full(_))) => Replicated::Full,
+            Ok(Err(Rejection::Shed(_))) => Replicated::Busy,
+            Ok(Err(Rejection::Internal)) | Err(_) => Replicated::Internal,
+        }
     }
 
     /// Steps 4 and 5 of the `PUT` pipeline, under the lock of `id`.
@@ -778,6 +824,40 @@ fn suffix(hex: &str) -> &str {
     hex.get(hex.len().saturating_sub(8)..).unwrap_or("")
 }
 
+/// Where a block entering the `PUT` pipeline comes from (ADR 0048 rule 4).
+///
+/// Hook for ADR 0049 rule 9: the ingest budgets (per network group and global) charge and refuse
+/// [`Origin::Put`] only. A replicated block is never charged to them nor refused by them; it is
+/// bounded by the replication budget (`replication_bytes_per_hour`, ADR 0048 rule 10) instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// A client's `PUT /sbtp/v1/block`.
+    Put,
+    /// A block fetched by replication for this requested `block_id`.
+    #[cfg_attr(not(feature = "replication"), allow(dead_code))]
+    Replication(BlockId),
+}
+
+/// The outcome of [`Relay::store_replicated`].
+#[cfg(feature = "replication")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replicated {
+    /// Stored: a new acceptance (`201` for a `PUT`).
+    New,
+    /// Already held (`200` for a `PUT`).
+    Known,
+    /// F1 to F9, C1, C2, C3 or R1 failed.
+    Invalid,
+    /// P1 failed.
+    Future,
+    /// No room (`507` for a `PUT`).
+    Full,
+    /// No `PUT` permit within `queue_timeout_ms`, or the index writer refused the job.
+    Busy,
+    /// A local storage or index failure.
+    Internal,
+}
+
 enum Rejection {
     Block(sbtp_core::Error),
     Future,
@@ -877,7 +957,7 @@ pub async fn put_block<I: IndexBackend + 'static>(
     let done = tokio::task::spawn_blocking(move || {
         let _owned = (permit, slot);
         let mut id = None;
-        let result = worker.process(&bytes, &mut id);
+        let result = worker.process(&bytes, &mut id, Origin::Put);
         (result, id.as_ref().map(store::hex))
     })
     .await;
