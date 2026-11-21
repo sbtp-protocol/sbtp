@@ -42,5 +42,11 @@ replication = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-native-certs"]
 # client of replication, hence `replication`.
 object-store = ["replication", "dep:sha2", "dep:hmac"]
 
+# The archive copy and replication benchmark (docs/benchmarks/2026-11-21-mirror-measurements.md).
+# It signs requests with the relay's own SigV4 code, hence the feature.
+[[example]]
+name = "mirror_bench"
+required-features = ["object-store"]
+
 [lints]
 workspace = true

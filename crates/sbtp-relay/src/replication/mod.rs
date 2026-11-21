@@ -208,8 +208,13 @@ fn read_pem(
 /// Rule 19: rustls, `ring`, TLS 1.3 only, the roots of `peer_ca_file` or of the operating
 /// system, hostname verification by the `WebPKI` verifier, no resumption, ALPN `http/1.1`.
 /// `user` names the setting that needs it in errors (`peers`, or `mirror_endpoint` for the
-/// archive copy of ADR 0050 rule 23).
-pub(crate) fn client_config(
+/// archive copy of ADR 0050 rule 23). Public so that the mirror benchmark
+/// (`examples/mirror_bench.rs`) checks a real bucket with the same TLS client as the relay.
+///
+/// # Errors
+///
+/// [`ConfigError`] when no trust root loads or the TLS client cannot be built.
+pub fn client_config(
     s: &Settings,
     user: &'static str,
 ) -> Result<rustls::ClientConfig, ConfigError> {
