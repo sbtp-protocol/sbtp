@@ -354,7 +354,8 @@ and metrics carry no `block_id` or client key.
 Decided by the project owner after the security review of the implementation
 (`docs/security/2026-11-21-demand-eviction.md`). D1 to D6 close gaps in rules 8, 13 and 22 where
 rule 13 ("MUST NOT evict by demand while a lost demand could be the one that protects a block") was
-not quite kept; they are normative. D7 replaces stale figures. D8 is a reference.
+not quite kept; they are normative. D7 replaces stale figures. D8 is a reference. D9 records the
+event vocabulary of the implementation (added 2026-11-21).
 
 - **D1. Demand never recorded is a lost demand (review M-1).** Rule 13 gains a third case. At a start
   with `demand_eviction = true`, when the index metadata does not record that the previous start ran
@@ -424,6 +425,25 @@ not quite kept; they are normative. D7 replaces stale figures. D8 is a reference
   suspension state of rule 13 is one integer.
 - **D8. Write floods (review M-2).** Rule 21 accepts that a write flood pushes cold blocks out. The
   bounds on ingest and storage per client are the subject of ADR 0049 (ingest and storage bounds).
+- **D9. Event vocabulary (from the implementation, recorded by the project owner on 2026-11-21).**
+  Rule 29 and D1 to D6 gain these names. No line names a `block_id` or a client; fields are counts,
+  durations and fixed words.
+  - Event `demand_migration` (level `info`, at start-up): the migration of implementation plan step 2
+    that fills the demand tables of an index written before this ADR. One line with `phase=start` and
+    `blocks` (the blocks to cover); lines with `phase=progress` during the run; one line with
+    `phase=end`. The `progress` and `end` lines carry `batches`, `filled` (blocks given a demand entry)
+    and `duration_ms`. An index already migrated logs nothing.
+  - Event `demand_suspended`, field `cause`: `no_history` (D1: the migration ran, or the index holds
+    blocks and records no value of `demand_eviction`); `enabled` (D1: `demand_eviction` was `false` at
+    the previous start); `restored` (D2: the suspension end written at the last clean shutdown is still
+    in the future). The implementation also uses `unclean_start` (rule 13, an unclean start; D4) and
+    `lost` (rule 13, a lost demand). A start logs one line per cause that applies.
+  - Event `demand_stuck`, field `cause`: `index` (D6: the index part alone is at or above the low-water
+    mark); `no_candidate` (rule 8: no block is a candidate).
+  - Field `orphans` on `demand_evicted` and `demand_stuck`, present only when not zero: the entries of
+    the demand order that the candidate listing skipped because they have no block row (corruption
+    only). One listing skips at most 10,000 of them and then ends with what it found, so that such
+    entries cannot fill a batch or keep a read transaction open.
 
 Tests added to the implementation plan, step 7: a first start on an index written before this ADR
 suspends for `2 × E`; an off-to-on transition suspends, an on-to-on restart does not; an empty new

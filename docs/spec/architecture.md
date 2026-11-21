@@ -86,7 +86,7 @@ On the first failure, the block is rejected without allocating any persistent re
   reconciliation indexes a block that was missing from the index, the relay draws a new index epoch, so
   that cursors issued before the crash are refused rather than skip blocks. (ADR 0024)
 - Backend: an embedded key-value store (redb) in one file next to the block files, with an explicit
-  cache size. This choice is conditional on the benchmark of ADR 0013 (binary under 5 MB, memory well
+  cache size. This choice is conditional on the benchmark of ADR 0013 (binary under 8 MB, memory well
   under 15 MB at one million blocks); if the benchmark fails, the backend is decided again. The benchmark
   runs the relay binary itself, over loopback HTTP. (ADR 0013, protocol clarified by ADR 0017)
 
@@ -139,6 +139,15 @@ On the first failure, the block is rejected without allocating any persistent re
 - When `D_NET` is raised, clients mine at the new value from its announcement and relays raise their
   floor at its effective date. Blocks mined earlier stay where they are held. (ADR 0045)
 
+### Archive copy and read-through
+- A relay MAY copy every block it stores to an object store under `sbtp/v1/block/{block_id}`, with a
+  write that never replaces an existing object, and never deletes from it. The store's public URL is a
+  read-only relay URL: `GET /block` and a static `/info` with `read_only: true`. (ADR 0050)
+- A relay MAY read a block it does not hold from operator-chosen sources (read-only or full relays),
+  within fixed bounds, validate it as any received block and serve it; it MAY then store it as an
+  accepted block. A source never replaces a local block, and a relay never forwards a fallback
+  request it received from another relay. (ADR 0050)
+
 ### Admission control
 - Every request has a cost bounded by constants and settings: time, memory and index work.
 - Every operation that reads the index, reads or writes a block file, buffers a request body or verifies
@@ -160,9 +169,13 @@ On the first failure, the block is rejected without allocating any persistent re
   sets `client_ip_header`, from that single-value header written by a CDN. Either source is read only
   from a peer in `trusted_proxies`. (ADR 0020, ADR 0044)
 - A `profile` setting (`small`, `standard`, `large`) gives coherent values to the resource limits. Each
-  setting overrides it. The 15 MB worst-case memory target applies to `small` with the default
-  settings (server TLS and replication off); with replication on and TLS off, the bound of `small` is
-  16 MB. (ADR 0019, ADR 0028, ADR 0048)
+  setting overrides it. The worst-case memory of `small` is under 15 MB with the default settings
+  (every outbound function and server TLS off) and under 20 MB with every function on. Each enabled
+  function adds its own terms to the computed bound; the block cache keeps its default. (ADR 0019,
+  ADR 0028, ADR 0048, ADR 0050)
+- `sbtp-relay` bounds stored bytes per hour per network group (/56, /48, /24), always, and for all
+  clients together once the store passes its low-water mark. It records no network origin with a
+  block. Replication has its own budget. (ADR 0049)
 - The relay listens on one address (`listen`, default `127.0.0.1:8080`) and keeps its blocks and index
   under `data_dir`. It serves HTTP/1.1 only, over TLS when `tls_mode` is `files` (TLS 1.3, ALPN
   `http/1.1`). With TLS on, a handshake takes a per-client token and completes within
@@ -174,8 +187,8 @@ On the first failure, the block is rejected without allocating any persistent re
 | Tier | Runtime | Role |
 |---|---|---|
 | 1 | Zero-install PWA (WASM, OPFS, IndexedDB, WebRTC) | Universal access. Discovery through relay lists; P2P serving while the tab is open is a later, opt-in stage (ADR 0048). |
-| 2 | Self-hosted micro-relays (one Rust image under 5 MB compressed, < 15 MB RAM with the default profile `small` and the default settings) | Backbone. Built-in TLS and replication are compiled in and off until configured (ADR 0028, ADR 0048). Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
-| 3 | Object storage / CDN (S3, R2, Pages) | Static mirrors, near-zero cost. |
+| 2 | Self-hosted micro-relays (one Rust image under 5 MB compressed, < 15 MB RAM with the default profile `small` and the default settings, < 20 MB with every function on) | Backbone. Built-in TLS, replication and the archive copy are compiled in and off until configured (ADR 0028, ADR 0048, ADR 0050). Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
+| 3 | Object storage / CDN (S3, R2, Pages) | Static mirrors, near-zero cost: read-only relay URLs written by a relay's archive copy (ADR 0050). |
 | 4 | Desktop / mobile daemon | Super-peers: 24/7 seeding, indexing; MAY run a graph gateway (`graph-access.md` §3). |
 
 Browser extensions are not a primary target (installation friction, Manifest V3, not available on mobile).

@@ -5,13 +5,23 @@
   for archive relays (rule 9); the signed bootstrap list in a later ADR (rule 23); one published image
   with every network feature compiled in and off by default at run time, no code downloaded at run
   time (rule 3); server TLS of ADR 0028 off by default at run time (Q-70)
+- Amended by: owner decision of 2026-11-21 on the size and memory budget, recorded with ADR 0050
+  (rule 3, item 2: binary under 8 MB, image under 5 MB compressed, `small` under 15 MB with the default
+  settings and under 20 MB with every function on, core `.wasm` under 200 KB gzip with MLS code in a
+  separate module; replaces the 16 MB bound of `small` with replication on; the ADR 0013 binary gate
+  becomes 8 MB and an image gate of 5 MB compressed is added; resolves Q-70 and Q-72; "Decisions of the
+  project owner", item 7); 0050 (rule 18: a relay makes no fallback fetch for a request that carries
+  `Sbtp-Replication: 1`)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)
-- Amends: ADR 0018 rule 35 (one term in the memory bound); ADR 0019 rules 37 and 38 (profile rows and
-  policy settings) and rule 39 (memory target of `small` with replication on); ADR 0021 rule 41
+- Amends: ADR 0013 pass criteria and ADR 0017 (by the owner decision of item 7: binary gate 8 MB, image
+  gate 5 MB compressed); ADR 0018 rule 35 (one term in the memory bound); ADR 0019 rules 37 and 38
+  (profile rows and policy settings) and rule 39 (memory targets of `small`: 15 MB with the default
+  settings, 20 MB with every function on); ADR 0021 rule 41
   (counters); ADR 0028 rule 1 (the published artefact also compiles in `replication`; server TLS
-  stays off at run time unless its certificate settings are given) and rule 36 (memory target);
+  stays off at run time unless its certificate settings are given) and rule 36 (memory target: with TLS
+  on, `small` is under the 20 MB bound with every function on);
   ADR 0046 rules 10 and 15 (a request carrying `Sbtp-Replication: 1` is not demand and is answered
   `no-store`; rules 17 and 18 below). Nothing else in these ADRs changes
 - Depends on: ADR 0024 (cursors and epochs), ADR 0028 (rustls, ring, OS roots), ADR 0029 (client
@@ -67,33 +77,36 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
       (`--no-default-features`, then the features wanted); such a build is not published, and CI
       builds and tests it (ADR 0028 rule 1). A setting that needs a feature absent from the build stops
       the start-up with `config_error` (it is never ignored).
-   2. **Budget.** CI checks a budget on every pull request, on the one published image. A pull request
-      that exceeds a limit fails.
+   2. **Budget** (owner decision of 2026-11-21, item 7, replacing the 16 MB bound of `small` with
+      replication on and the WASM limit of 100,000 bytes). CI checks a budget on every pull request, on
+      the one published image. A pull request that exceeds a limit fails.
 
       | Measure | Limit | How CI measures it |
       |---|---|---|
       | Relay image, compressed, every feature compiled in | < 5,000,000 bytes | Build with `deploy/Dockerfile` (`docker buildx build --output type=oci,dest=…`, gzip layers); sum of the layer `size` fields of the image manifest, base layers included. This is what a registry stores and a host pulls. |
       | Relay binary | < 8,000,000 bytes | `stat` of `/out/sbtp-relay` from the `export` stage of the same build (release profile, static, stripped). |
       | Relay memory, `small`, default settings | < 15,000,000 bytes | (a) A test asserts `memory_bound_bytes()` of the `small` profile with the default settings (`peers` empty, TLS off). (b) A Linux job starts the relay with `small` and the default settings, runs a fixed load of `PUT`, `GET` and `/query` for 60 seconds, and reads `VmHWM` from `/proc/<pid>/status`. |
-      | Relay memory, `small`, replication on | < 16,000,000 bytes | (a) The same test with `peers` not empty and TLS off; the bound counts `replication_max_peers` peers (rule 16). (b) The same job with one peer (a second relay in the job), the load running while replication runs. |
-      | Relay memory, `small`, server TLS on | reported, no limit | The test of (a) only, with `tls_mode = "files"`. ADR 0028 rule 36: with TLS on, `small` has no fixed target and the relay logs its computed bound. |
-      | WASM module | < 100,000 bytes gzip | The `sbtp-wasm` release pipeline of `crates/sbtp-wasm/README.md` (wasm-bindgen, then `wasm-opt`), then `gzip -9 -c sbtp_wasm_bg.wasm | wc -c`. |
+      | Relay memory, `small`, every function on | < 20,000,000 bytes | (a) The same test with every function the build can run turned on: server TLS (`tls_mode = "files"`), replication (`peers` not empty; the bound counts `replication_max_peers` peers, rule 16), the archive copy and read-through of ADR 0050 (`mirror_endpoint` set, `fallback_sources` not empty), and each later function as its ADR adds it (sync, streaming, chunks, OHTTP). (b) The same job with TLS on, one peer (a second relay in the job) and a local S3-compatible server as mirror and fallback source, the load running while replication and the uploader run. |
+      | Core WASM module | < 200,000 bytes gzip | The `sbtp-wasm` release pipeline of `crates/sbtp-wasm/README.md` (wasm-bindgen, then `wasm-opt`), then `gzip -9 -c sbtp_wasm_bg.wasm | wc -c`. Any MLS (group encryption) code is in a separate module, loaded on demand, with its own budget set by the ADR that adds it; it is not counted here. |
 
       The job writes the figures and their change against `main` to the job summary.
 
-      **Memory with replication on.** The terms of rule 16 are 723,077 bytes on `small`. With the
-      ADR 0046 bound as built (14,747,092 bytes) the total is 15,470,169 bytes, above 15,000,000. The
-      `small` rows cannot shrink enough: `replication_max_in_flight` is already 1, and the root store
-      term does not depend on a setting. Therefore the 15 MB target of ADR 0019 rule 39 applies to
-      `small` with the default settings (replication and server TLS off), and `small` with replication
-      on and TLS off has its own bound of 16,000,000 bytes, 529,831 bytes above the computed total.
-      That margin covers the estimates of rule 16 only; the measure of Q-70 replaces them. The
-      packaged unit keeps `MemoryMax=128M` for `small` (ADR 0019 rule 37).
+      **Memory with the functions on.** The owner accepts about 1 MB of memory per enabled outbound
+      function rather than a smaller block cache or smaller `small` rows. Each function's terms are added
+      to the bound of ADR 0018 rule 35 only when the function is on. With the default settings every
+      function of this ADR and of ADR 0050 is off, and the 15 MB target of ADR 0019 rule 39 applies:
+      14,910,996 bytes computed with ADR 0049. With every function on, the computed `small` bound is
+      18,188,451 bytes: the default bound, plus server TLS (ADR 0028 rule 36, 2,228,224), replication
+      (rule 16, 723,077) and ADR 0050 rule 27 (326,154, the root store counted once). The 1,811,549 bytes
+      under 20,000,000 are what later functions have; each later ADR states its terms and the new total.
+      The 60-second `VmHWM` runs replace the estimates. The packaged unit keeps `MemoryMax=128M` for
+      `small` (ADR 0019 rule 37).
 
       The ADR 0013 benchmark (one million blocks) stays the release gate; the 60-second runs are the
-      per-PR check. The ADR 0013 binary limit (5,000,000 bytes on the binary that ships, ADR 0017) is
-      stricter than the per-PR limit above, and the binary that ships now has every feature compiled
-      in; whether the 5,000,000-byte gate still holds is part of Q-70.
+      per-PR check. Its binary threshold becomes 8,000,000 bytes, the same as the per-PR limit, and it
+      gains an image threshold of 5,000,000 bytes compressed, measured as above (owner decision of
+      2026-11-21, item 7, Q-70; set before the gate has run, so the pre-registration rule of ADR 0013
+      holds). The binary that ships has every feature compiled in.
    3. Every function has bounds per profile (`small`, `standard`, `large`, ADR 0019 rule 37) and its
       memory is a term of the bound of ADR 0018 rule 35.
    4. The relay never embeds a TURN server or any media relay. Help with WebRTC signalling is a later
@@ -191,9 +204,10 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
 
     `small`: 318,981 + 400,000 + 4,096 = 723,077 bytes. On top of the ADR 0046 bound as built
     (14,747,092 bytes, ADR 0046 clarification D7) it gives 15,470,169 bytes: above the 15 MB target of
-    the default settings, under the 16,000,000-byte bound of `small` with replication on (rule 3,
-    item 2). The terms count only when the feature is compiled and `peers` is not empty. With server
-    TLS on as well, ADR 0028 rule 36 applies: no fixed target, the relay logs its computed bound.
+    the default settings, which does not apply with replication on. The terms count only when the
+    feature is compiled and `peers` is not empty. With replication on, `small` is held to the 20 MB
+    bound with every function on (rule 3, item 2, as amended by the owner on 2026-11-21; the proposed
+    16 MB bound is replaced).
 
 ### What a replicated block counts as
 
@@ -280,7 +294,8 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
   of 1 MB of binary (estimate). None of it runs while the settings leave it off. The CI job of rule 3
   gives the real figure.
 - **Memory.** `small` keeps its 15 MB target with the default settings. An operator who turns
-  replication on in `small` accepts a bound of 16 MB (rule 3, item 2).
+  functions on in `small` accepts about 1 MB per outbound function, within 20 MB with every function on
+  (rule 3, item 2, owner decision of 2026-11-21).
 - **Privacy.** A replica's address is seen by its peers, like any client's. Replication copies public
   and sealed blocks alike; it does not change what a relay already sees. `/info` `relays` reveals only
   the operator's choices.
@@ -293,7 +308,7 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
 
 | Stage | Work | Owner | Effort (rough) | Security review |
 |---|---|---|---|---|
-| 0 | CI budget job of rule 3 (image, binary, memory bound tests with the defaults, with replication on and with TLS on, 60 s `VmHWM` runs with the defaults and with one peer, WASM gzip); one image, built with every feature compiled in | relay-engineer | 1 day | No |
+| 0 | CI budget job of rule 3 (image, binary, memory bound tests with the defaults and with every function on, 60 s `VmHWM` runs with the defaults and with every function on, core WASM gzip); one image, built with every feature compiled in | relay-engineer | 1 day | No |
 | 1 | Feature `replication` (a default feature): settings and checks (rules 5, 14, 15), outbound client (rule 19), walker with held check, PoW pre-check and skips (rules 6, 7), cursor table (rules 8, 9), bounds and back-off (rules 10 to 13), memory terms (rule 16), metrics and events; tests with two in-process relays: loop, restart mid-page, peer `InvalidCursor`, `429` with `Retry-After`, `3xx`, oversize body, invalid blocks, high-water pause, private address refused | relay-engineer | 4 to 6 days | **Yes**, before merge |
 | 2 | `/info` `relays` and `announce_relays` (rule 21); web client and `cli-demo` read `/info` `relays` and `/.well-known/sbtp` into their relay list (rules 20, 22) | relay-engineer, wasm-engineer | 1 day | No |
 | 3 | `Sbtp-Replication` on the source (rule 18): not demand, `no-store` in every mode | relay-engineer | 0.5 day | With ADR 0046 |
@@ -325,11 +340,25 @@ bounded and the URL is not repeated): `replication_blocks_stored_total`, `replic
    configuration. Cargo features remain for minimal builds. The node role is configuration (rules 1
    and 3).
 5. **Memory with replication on.** `small` with replication on gets its own bound, 16,000,000 bytes;
-   the `small` replication rows do not shrink (rule 3, item 2).
+   the `small` replication rows do not shrink (rule 3, item 2). *Replaced by item 7.*
 6. **Q-70, server TLS.** ADR 0028 is amended: `tls` is compiled into the published image and server
    TLS is inactive unless its certificate settings are given (rule 3, item 1). This was already the
    run-time default of ADR 0028 rules 2 and 4 (`tls_mode = "off"`); the feature stays a default
    feature.
+
+7. **Size and memory budget (2026-11-21, with ADR 0050; replaces item 5 and the 16 MB bound of
+   rule 3).** About 1 MB per enabled outbound function is accepted rather than a smaller block cache.
+   The budgets, checked in CI (rule 3, item 2):
+   - relay binary under 8 MB;
+   - published image under 5 MB compressed (the single image, every feature compiled in);
+   - `small` worst case under 15 MB with the default settings;
+   - `small` worst case under 20 MB with every function on (replication, object store, server TLS, and
+     later sync, streaming, chunks, OHTTP);
+   - core `.wasm` under 200 KB gzip; any MLS (group encryption) code in a separate module loaded on
+     demand, budgeted on its own.
+
+   The ADR 0013 binary gate (ADR 0017) becomes 8 MB, and the gate gains the 5 MB compressed image
+   threshold. This resolves Q-70 (with item 6) and Q-72.
 
 ## Spec change on acceptance
 
@@ -359,7 +388,8 @@ ADR 0045 is replaced in place by the text below.
 `architecture.md` §2, "Admission control", the bullet on `profile`, last sentence replaced by: "The
 15 MB worst-case memory target applies to `small` with the default settings (server TLS and
 replication off); with replication on and TLS off, the bound of `small` is 16 MB. (ADR 0019, ADR 0028,
-ADR 0048)"
+ADR 0048)" *Replaced by item 7 (2026-11-21): "The worst-case memory of `small` is under 15 MB with the
+default settings and under 20 MB with every function on. (ADR 0019, ADR 0028, ADR 0048, ADR 0050)"*
 
 `architecture.md` §3, tier 1 row, role column: "Universal access. Discovery through relay lists; P2P
 serving while the tab is open is a later, opt-in stage (ADR 0048)."

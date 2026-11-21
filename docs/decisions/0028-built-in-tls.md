@@ -8,7 +8,8 @@
   deployments documented
 - Amended by: 0048 (rule 1: the one published image also compiles in `replication`; server TLS stays
   off at run time unless its certificate settings are given, owner decision on Q-70 of 2026-11-21;
-  rule 36: the 15 MB target of `small` applies with the default settings, TLS and replication off)
+  rule 36: the 15 MB target of `small` applies with the default settings, TLS and replication off;
+  with TLS on, `small` is under the 20 MB bound with every function on, owner decision of 2026-11-21)
 - Date: 2026-11-19
 - Questions: Q-30 (single-binary deployment with built-in TLS). Opens Q-34 (built-in ACME client) and
   Q-35 (TLS for a desktop super-peer without a public name)
