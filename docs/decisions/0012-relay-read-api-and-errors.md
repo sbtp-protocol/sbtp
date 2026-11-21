@@ -6,7 +6,10 @@
   proxy-neutral); 0024 (rule 9: a cursor does not survive a restart after which the epoch changed); 0028
   (rule 2: `sbtp-relay` terminates TLS when configured to); 0029 (rules 10, 14, 16 and 20: response body
   ceilings, added members included; rule 30: a `Retry-After` not in seconds, a client's maximum wait); 0040
-  (rule 20: one more optional `/info` member, `graph_gateway`)
+  (rule 20: one more optional `/info` member, `graph_gateway`); 0051 (rules 5, 6, 9, 10 and 12: `order`,
+  `fields`, repeated `parent` with per-parent cursors, a cursor as a gap valid in both orders, `head`,
+  grouped response; rule 20: `/info` member `read_api`; rule 27: preflight methods `GET, PUT, POST`;
+  new route `POST /sbtp/v1/blocks`)
 - Clarifications: 2026-11-19, after relay milestone 1c-a (K1, K2), and after `cli-demo query` (K3: `502`
   and `504` retried like `503`), accepted by the project owner, 2026-11-19
 - Date: 2026-11-18

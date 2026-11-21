@@ -194,13 +194,18 @@ A view is one JSON object (RFC 8259):
   lowercase hexadecimal characters. A parameter that is unknown, repeated or malformed gets `400`
   (`InvalidParameter`). A numeric parameter above its maximum is lowered to it.
 - **CORS methods.** One difference from the relay CORS rules: a preflight from an allowed origin gets
-  `Access-Control-Allow-Methods: GET`, not `GET, PUT`. The other CORS headers are those of core spec §4.
+  `Access-Control-Allow-Methods: GET`, not `GET, PUT, POST`. The other CORS headers are those of core
+  spec §4.
 - **Cursors.** Same syntax and semantics as `/query` cursors (core spec §4): opaque, 1 to 128
   characters of `A-Z a-z 0-9 - _`, valid only on the gateway that issued them, refused with
   `InvalidCursor` after a rebuild of its index. A client then walks again and deduplicates by
   `block_id`.
-- **Order.** Lists are in the gateway's ingestion order. It differs between gateways and between a
-  gateway and a relay. A client MUST NOT derive application state from it.
+- **Order.** Lists are in the gateway's ingestion order. `order=asc` (default on `/children` and
+  `/feed`) lists oldest ingested first, `order=desc` newest ingested first. A cursor names a gap in that
+  order and is valid in both orders, as on the relay (core spec §4, `/query`). The `Timestamp` field is
+  chosen by the author and is not an order the gateway offers. The order differs between gateways and
+  between a gateway and a relay. A client MUST NOT derive application state from it. (ADR 0051
+  rule 32)
 - **Cost.** Each route is served with work bounded by its parameters and the gateway's settings, given
   per route below. A gateway charges a request in its per-client allowance by the number of blocks it
   reads to build the response, not by request count.
@@ -246,17 +251,18 @@ The JSON view of the block (§2), at most 1,048,576 bytes; `404` when not held.
 `Cache-Control: public, max-age=86400`. The view MAY carry
 `"x_canonical": "<gateway URL>/sbtp-graph/v1/block/<block_id>"`. Cost: one block read. (ADR 0041 rule 16)
 
-### 3.6 `GET /sbtp-graph/v1/children/{target}?rel={verb}&limit={n}&cursor={cursor}`
+### 3.6 `GET /sbtp-graph/v1/children/{target}?rel={verb}&limit={n}&cursor={cursor}&order={order}`
 The blocks that name `{target}` (a `block_id`, or a tag when `sealed_indexed` is `true`), by a header
 parent or by a non-causal `block` edge.
 
 - `rel` (optional): only edges with this exact `rel` value (registry, extension or unknown verb, 1 to 64
   bytes, percent-encoded). Without `rel`, every child is listed, opaque payloads included.
-- `limit`: 1 to `max_limit`, default 100. `cursor`: as in §3.2.
+- `limit`: 1 to `max_limit`, default 100. `cursor`, `order`: as in §3.2.
 - Response: `200`, `application/json`, `Cache-Control: no-store`, at most 262,144 bytes:
 
   ```json
   {
+    "count": 3,
     "children": [
       {"block_id": "9e02…", "rel": "replies_to", "p": 1, "kind": "example.note",
        "pubkey": "d75a98…", "timestamp": "1763596800000"},
@@ -274,16 +280,20 @@ parent or by a non-causal `block` edge.
   parent and a `block` edge cannot both name it, `l2-grammar.md` §2.1). `p` is present for a causal
   edge only. `rel` and `kind` are `null` when the child's payload is opaque. An unknown target gets
   `200` and an empty list.
+- `count`: the number of entries for `(target, rel)` the gateway holds, from a counter kept at
+  ingestion (`O(1)`). It is a claim of this gateway (§3.10).
 - Cost: `O(log n + limit)` index work, no block read.
 
-(ADR 0041 rule 17)
+(ADR 0041 rule 17, ADR 0051 rule 33)
 
 ### 3.7 `GET /sbtp-graph/v1/subgraph/{block_id}?dir={dir}&depth={d}&max_nodes={m}&rel={verb}&form={form}`
 A breadth-first walk from the root.
 
 - `dir`: `out` (default), `in` or `both`. `out` follows the causal edges of a node (except `tagged`) and
   its `block` edges; a node with an opaque payload follows its header parents. `in` follows the node's
-  children, as in §3.6, at most `max_children_per_node` per node, oldest first.
+  children, as in §3.6, at most `max_children_per_node` per node.
+- `order`: `desc` (default) or `asc`; chooses which children `dir=in` follows under
+  `max_children_per_node`: the newest or the oldest ingested.
 - `depth`: 0 to `max_depth`, default 1. `max_nodes`: 1 to `max_nodes` of `/info`, default 64.
 - `rel` (optional): only edges with this `rel` are followed, in either direction.
 - `form`: `view` (default: each node is its view, §2) or `summary` (each node is
@@ -298,6 +308,7 @@ A breadth-first walk from the root.
     "nodes": [{"sbtp_view": 1, "block_id": "0000a3…"}, {"sbtp_view": 1, "block_id": "4c1f…"}],
     "edges": [{"from": "0000a3…", "to": "4c1f…", "rel": "in", "p": 0}],
     "missing": ["9e02…"],
+    "incomplete": [],
     "truncated": false
   }
   ```
@@ -305,20 +316,21 @@ A breadth-first walk from the root.
   `nodes` (views abridged above) starts with the root and holds each block at most once, in visit order.
   `edges` holds every followed edge between two listed nodes, and from a listed node to a `missing`
   target. `missing` lists followed targets the gateway does not hold (at most `max_nodes`); they are not
-  walked. `truncated` is `true` when the walk stopped at `max_nodes`, at the per-node children cap or at
-  the body ceiling, before it reached `depth`. A client continues from a frontier node with another
-  request.
+  walked. `incomplete` lists the nodes whose children were cut by `max_children_per_node`; a client
+  completes such a node with `/children` (§3.6). `truncated` is `true` when the walk stopped at
+  `max_nodes`, at the per-node children cap or at the body ceiling, before it reached `depth`. A client
+  continues from a frontier node with another request.
 - Cost: at most `max_nodes` block reads and `max_nodes × (log n + max_children_per_node)` index work.
 
-(ADR 0041 rule 18)
+(ADR 0041 rule 18, ADR 0051 rule 34)
 
-### 3.8 `GET /sbtp-graph/v1/feed?since={ms}&kind={kind}&pubkey={key}&limit={n}&cursor={cursor}`
+### 3.8 `GET /sbtp-graph/v1/feed?since={ms}&kind={kind}&pubkey={key}&limit={n}&cursor={cursor}&order={order}`
 The blocks the gateway ingested, in ingestion order.
 
 - `since`: decimal u64, gateway ingestion time in Unix milliseconds (not the Timestamp field).
 - `kind` or `pubkey` (optional, at most one of the two, only if listed in `feed_filters`; otherwise
   `400` `InvalidParameter`): exact kind; 64-hex public key.
-- `limit`, `cursor`: as in §3.6.
+- `limit`, `cursor`, `order`: as in §3.6. With `order=desc`, `since` ends the walk.
 - Response: `200`, `application/json`, `Cache-Control: no-store`, at most 262,144 bytes:
   `{"items": [{"block_id", "kind", "pubkey", "timestamp"}], "cursor", "more"}`, with the meaning of
   `/query` (core spec §4): the same request with the returned cursor gives the blocks ingested since.
@@ -326,7 +338,42 @@ The blocks the gateway ingested, in ingestion order.
 - This is a pull feed. Push delivery `[Q-65]` follows the relay's WebSocket design once it exists
   `[Q-23]`.
 
-(ADR 0041 rule 19)
+(ADR 0041 rule 19, ADR 0051 rule 32)
+
+### 3.9 `GET /sbtp-graph/v1/children?target={t}[.{cursor}]&…&rel={verb}&limit={n}&order={order}`
+The form of §3.6 for several targets.
+
+- `target`: 1 to 32 distinct values, each a target of §3.6 or `<target>.<cursor>`, a per-target cursor
+  that overrides `cursor`. A 33rd or a repeated value gets `400` (`InvalidParameter`).
+- `limit` applies per target, lowered to `max(1, ⌊max_limit / N⌋)` for `N` targets.
+- Response: `200`, `application/json`, `Cache-Control: no-store`, at most 262,144 bytes:
+  the grouped shape of `/query` (core spec §4), `{"parents": [{"parent", "count", "children", "cursor",
+  "more"}], "head"}`, with `children` in place of `block_ids` and `parent` holding the target. One entry
+  per requested target in request order, each with the meaning of a §3.6 response. `head` is a cursor
+  for the gap after the newest ingestion position when the response was built.
+- Cost: the work of `N` requests of §3.6, in one index read; no block read.
+
+(ADR 0051 rule 33)
+
+### 3.10 Several gateways and omission
+- **Federation.** Several gateways MAY read the same relays. A client MAY use one, or merge several: it
+  takes the union of their listings, deduplicates by `block_id`, verifies every block (core spec §3.4)
+  and keeps one cursor per gateway. Counts are claims of one gateway; a client does not add them.
+- **Omission.** A gateway cannot forge a block, but it can omit one. No cheap standard construction
+  proves to a client that a gateway's listing is complete; the answer is cross-checking against a
+  second source.
+- **Spot check.** A client that derives state from the absence of a block (core spec §4, `/query`,
+  complete listings) from gateway data SHOULD, on each view, list the shown targets on one relay it
+  chose independently of the gateway, `desc`, grouped, with a small per-parent limit (for example 8):
+  one request per 32 targets. A block the relay lists and the gateway still omits on a repeated request
+  after a delay (its ingestion lag) is an omission. The client then stops using that gateway for
+  absence-derived state, falls back to relays, and MAY report the evidence (the two responses and the
+  block). This catches recent omissions; an old one is found only by a full walk, which a client MAY
+  run in the background at a low rate.
+- **Later.** Range fingerprints for set reconciliation `[Q-11]` and signed gateway answers `[Q-64]`
+  may revisit this.
+
+(ADR 0051 rules 35 to 38)
 
 ## 4. What graph access does and does not show
 
