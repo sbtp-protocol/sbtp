@@ -373,9 +373,9 @@ fn repeated_put_goes_through_the_reader_pool() {
 /// JSON body and the CORS headers. Other classes are not affected.
 #[test]
 fn query_bucket_gives_429_with_retry_after() {
-    let relay = start(&[("RATE_QUERY_BURST", "2"), ("RATE_QUERY_PER_MIN", "1")]);
+    let relay = start(&[("RATE_QUERY_BURST", "4"), ("RATE_QUERY_PER_MIN", "1")]);
     let mut c = relay.connect();
-    for _ in 0..2 {
+    for _ in 0..4 {
         page(&mut c, "");
     }
     let r = http_get(&mut c, "/sbtp/v1/query", "");

@@ -48,6 +48,26 @@ pub struct Batch {
     pub truncated: bool,
 }
 
+/// A failed `POST /sbtp/v1/blocks`.
+#[derive(Debug)]
+pub enum BatchError {
+    /// The batch route does not work on this relay, or something in front of it (a refusal of the
+    /// request form: `400`, `404`, `405`, `411`, `413`; a body over 1 MiB; a malformed body). The
+    /// caller falls back to single `GET`s for this relay (security review 2026-11-21, I-1).
+    Route(Fail),
+    /// Any other failure (network, `429`, `5xx`): this relay is left for the operation.
+    Other(Fail),
+}
+
+impl BatchError {
+    /// The message for the user.
+    pub fn fail(&self) -> &Fail {
+        match self {
+            Self::Route(f) | Self::Other(f) => f,
+        }
+    }
+}
+
 /// A relay at a base URL such as `http://127.0.0.1:8080`.
 pub struct Relay {
     base: String,
@@ -203,14 +223,15 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// A network failure, the relay's error status, a body over 1 MiB, or a failed request by
-    /// [`parse_records`].
-    pub fn post_blocks(&self, ids: &[BlockId]) -> Result<Batch, Fail> {
+    /// [`BatchError::Route`] for a refusal of the request form, a body over 1 MiB or a failed
+    /// request by [`parse_records`]; [`BatchError::Other`] for a network failure or any other
+    /// error status.
+    pub fn post_blocks(&self, ids: &[BlockId]) -> Result<Batch, BatchError> {
         if ids.is_empty() || ids.len() > MAX_BATCH_IDS {
-            return Err(Fail::failed(format!(
+            return Err(BatchError::Other(Fail::failed(format!(
                 "internal error: a batch of {} identifiers",
                 ids.len()
-            )));
+            ))));
         }
         let body: Vec<u8> = ids.iter().flat_map(|id| *id.as_bytes()).collect();
         let url = format!("{}/sbtp/v1/blocks", self.base);
@@ -219,22 +240,28 @@ impl Relay {
             .post(&url)
             .content_type("application/octet-stream")
             .send(&body[..])
-            .map_err(|e| self.network(&e))?;
-        if response.status() != StatusCode::OK {
-            return Err(self.refusal("POST /sbtp/v1/blocks", &mut response));
+            .map_err(|e| BatchError::Other(self.network(&e)))?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let fail = self.refusal("POST /sbtp/v1/blocks", &mut response);
+            return Err(if matches!(status.as_u16(), 400 | 404 | 405 | 411 | 413) {
+                BatchError::Route(fail)
+            } else {
+                BatchError::Other(fail)
+            });
         }
         let bytes = read_limited(&mut response, MAX_BATCH_BODY).map_err(|e| match e {
-            ureq::Error::BodyExceedsLimit(_) => Fail::failed(format!(
+            ureq::Error::BodyExceedsLimit(_) => BatchError::Route(Fail::failed(format!(
                 "relay {} sent a POST /sbtp/v1/blocks body above 1 MiB (ADR 0051 rule 4)",
                 self.base
-            )),
-            e => self.network(&e),
+            ))),
+            e => BatchError::Other(self.network(&e)),
         })?;
         parse_records(&bytes, ids.len()).map_err(|why| {
-            Fail::failed(format!(
+            BatchError::Route(Fail::failed(format!(
                 "relay {} sent an invalid POST /sbtp/v1/blocks body: {why}",
                 self.base
-            ))
+            )))
         })
     }
 

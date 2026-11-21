@@ -29,6 +29,12 @@ const TOML_MAX: u64 = (1 << 63) - 1;
 const MIN_BLOCK_TTL_MS: u64 = 60_000;
 /// `stats_interval_ms`: 0 (off) or this value to the maximum (ADR 0021 rule 46).
 const MIN_STATS_INTERVAL_MS: u64 = 10_000;
+/// The smallest `rate_block_burst`: the largest weight of ADR 0051 rule 21 (a batch of 256
+/// identifiers, `⌈256/4⌉`). Rule 21 caps a weight at the burst, so a smaller burst would serve
+/// more than 4 blocks per token (security review 2026-11-21, L-1).
+const MIN_BLOCK_BURST: u64 = (crate::batch::MAX_IDS as u64).div_ceil(4);
+/// The smallest `rate_query_burst`: the weight of a grouped query of 32 parents, `⌈32/8⌉`.
+const MIN_QUERY_BURST: u64 = (crate::query::MAX_PARENTS as u64).div_ceil(8);
 /// The default of `min_pow_difficulty`: the network difficulty `D_NET` (ADR 0045 rules 1 and 2).
 const NETWORK_POW: u64 = sbtp_core::NETWORK_POW_DIFFICULTY as u64;
 
@@ -1201,6 +1207,28 @@ impl Settings {
                 self.ingest_bytes_per_hour
             )));
         }
+        // ADR 0051 rule 21 (security review 2026-11-21, L-1).
+        for (name, value, min, what) in [
+            (
+                "rate_block_burst",
+                self.rate_block_burst,
+                MIN_BLOCK_BURST,
+                "a batch of 256 identifiers",
+            ),
+            (
+                "rate_query_burst",
+                self.rate_query_burst,
+                MIN_QUERY_BURST,
+                "a grouped query of 32 parents",
+            ),
+        ] {
+            if value < min {
+                return Err(ConfigError::Constraint(format!(
+                    "{name} ({value}) must be at least {min}, the weight of {what} (ADR 0051 \
+                     rule 21): a smaller burst would cap that weight and serve more per token"
+                )));
+            }
+        }
         if self.ingest_group56_share_pct > self.ingest_group_share_pct {
             return Err(ConfigError::Constraint(format!(
                 "ingest_group56_share_pct ({}) must not exceed ingest_group_share_pct ({})",
@@ -1542,10 +1570,12 @@ fn parse_peers(r: Option<Raw>) -> Result<Vec<PeerUrl>, ConfigError> {
         return Ok(Vec::new());
     };
     let mut out: Vec<PeerUrl> = Vec::new();
-    for item in r.list("peers")? {
+    for (n, item) in r.list("peers")?.into_iter().enumerate() {
+        // The reason shows the URL without its userinfo (security review 2026-11-21 I-2); the
+        // position finds it in the list.
         let url = PeerUrl::parse(&item).map_err(|reason| ConfigError::Invalid {
             setting: "peers",
-            reason,
+            reason: format!("item {}: {reason}", n + 1),
         })?;
         if out.contains(&url) {
             return Err(ConfigError::Invalid {

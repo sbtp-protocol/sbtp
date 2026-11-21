@@ -80,7 +80,7 @@ export class RelaySet {
   constructor(bases, { makeRelay = (b) => new Relay(b), now = Date.now, random = Math.random, limits = LIMITS } = {}) {
     if (bases.length > limits.maxRelays) throw new RangeError(`at most ${limits.maxRelays} relays`);
     this.entries = bases.map((base) => ({
-      base, relay: makeRelay(base), failures: 0, until: 0, lastError: null, readApi: null,
+      base, relay: makeRelay(base), failures: 0, until: 0, lastError: null, readApi: null, batchBroken: false,
     }));
     this.now = now;
     this.random = random;
@@ -166,6 +166,15 @@ export class RelaySet {
    */
   forgetReadApi(e) {
     e.readApi = null;
+  }
+
+  /**
+   * Remembers, for the session (in memory), that `POST /blocks` does not work on relay `e`
+   * (refused, or a broken answer, for example a proxy that forwards the body chunked): its blocks
+   * are fetched with single GETs from now on (security review 2026-11-21, I-1).
+   */
+  dropBatch(e) {
+    e.batchBroken = true;
   }
 
   /** One line per relay for the page. */
@@ -458,18 +467,32 @@ const refusesReadApi = (error) => error instanceof RelayStatus &&
   (error.status === 404 || error.status === 405 || (error.status === 400 && error.errorName === "InvalidParameter"));
 
 /**
+ * Whether a failed `POST /blocks` shows that the batch route itself does not work on that relay
+ * (or behind what is in front of it): a refusal of the request form (400, for example
+ * `InvalidParameter` or the `NoLength` of a proxy that forwards the body chunked; 404; 405; 411;
+ * 413) or a broken answer (a body over 1 MiB, a record above MAX_BLOCK_LEN, extra records, an
+ * empty 200). Not a network failure, a 429 or a 5xx: those say nothing about the route.
+ */
+const breaksBatch = (error) => error instanceof InvalidResponse ||
+  (error instanceof RelayRequestError && error.kind === "body-too-large") ||
+  (error instanceof RelayStatus && [400, 404, 405, 411, 413].includes(error.status));
+
+/**
  * Asks relay `e` (`read_api >= 2`) for `ids` with `POST /blocks`, at most `batchConcurrency`
  * batches in flight. Each record is checked against the id at its position (R1 and full
  * validation by `validate`, ADR 0051 rule 6). `length = 0`: not served by this relay. A prefix
  * (rule 3): the rest is requested again. A failed request (an error status, a network failure, a
- * body over 1 MiB, a record above MAX_BLOCK_LEN, a body ending inside a record) ends this relay
- * for the operation: the ids not answered go to the next relay; the complete records before a
- * truncation are used. Resolves with `{ out, bound }`: `out` maps each id to its outcome.
+ * body over 1 MiB, a record above MAX_BLOCK_LEN, a body ending inside a record) ends batches on
+ * this relay for the operation; the complete records before a truncation are used. When the
+ * route itself failed (`breaksBatch`, or a truncated body), the relay is marked for single GETs
+ * for the session and the ids not answered come back as `{ fallback: true }`; otherwise they go
+ * to the next relay. Resolves with `{ out, bound }`: `out` maps each id to its outcome.
  */
 async function batchFrom(set, e, ids, validate, { budget, hints, limits, signal }) {
   const out = new Map();
   const chunks = packBatches(ids, hints);
   let stopped = null;
+  let broken = false;
   let bound = false;
   let next = 0;
   async function worker() {
@@ -479,7 +502,7 @@ async function batchFrom(set, e, ids, validate, { budget, hints, limits, signal 
       let leftover = null;
       while (chunk.length > 0 && leftover === null) {
         if (signal?.aborted) leftover = { unasked: true };
-        else if (stopped) leftover = { error: stopped };
+        else if (stopped) leftover = broken ? { fallback: true, error: stopped } : { error: stopped };
         else if (set.waitMs(e) > 0) leftover = { backingOff: true };
         else if (budget.left <= 0) {
           bound = true;
@@ -494,7 +517,10 @@ async function batchFrom(set, e, ids, validate, { budget, hints, limits, signal 
         } catch (error) {
           if (isAborted(error)) throw error;
           set.fail(e, error);
-          if (refusesReadApi(error)) set.forgetReadApi(e);
+          if (breaksBatch(error)) {
+            broken = true;
+            set.dropBatch(e);
+          }
           stopped = error;
           continue;
         }
@@ -508,6 +534,8 @@ async function batchFrom(set, e, ids, validate, { budget, hints, limits, signal 
         if (res.truncated) {
           stopped = new InvalidResponse(`${e.base}: the POST /blocks body ends inside a record`);
           set.fail(e, stopped);
+          broken = true;
+          set.dropBatch(e);
         } else if (clean) {
           set.ok(e);
         }
@@ -581,9 +609,17 @@ async function fetchRelayByRelay(set, todo, validate, result, { budget, concurre
     }
     let r;
     try {
-      r = (await set.hasReadApi(e, { signal }))
+      r = !e.batchBroken && (await set.hasReadApi(e, { signal }))
         ? await batchFrom(set, e, pending, validate, { budget, hints, limits, signal })
         : await getsFrom(set, e, pending, validate, { budget, concurrency, signal });
+      // A batch route that failed: the ids it did not answer get single GETs on the same relay
+      // (security review 2026-11-21, I-1), so that one relay is enough.
+      const again = pending.filter((id) => r.out.get(id)?.fallback);
+      if (again.length > 0) {
+        const g = await getsFrom(set, e, again, validate, { budget, concurrency, signal });
+        for (const [id, o] of g.out) r.out.set(id, o);
+        r.bound ||= g.bound;
+      }
     } catch (error) {
       if (!isAborted(error)) throw error;
       break;
@@ -692,8 +728,22 @@ export async function walkAll(set, filter = {}, {
   const cut = dropped.size > 0;
   const partial = cut || backingOff.length > 0 || runs.some((r) => r.stop !== "done");
   const heads = new Map(runs.filter((r) => r.head).map((r) => [r.base, r.head]));
+  // Per id, the union of the parents every relay claims and the largest claimed length (security
+  // review 2026-11-21, M-1): with first-wins hints, a hostile relay listed first could give a
+  // block `parents: []` and hide it although an honest relay lists it. A hint only causes a fetch
+  // (the fetched header decides what is shown); a larger length only makes batches smaller.
   const hints = new Map();
-  for (const run of runs) for (const [id, h] of run.hints ?? []) if (!hints.has(id)) hints.set(id, h);
+  for (const run of runs) {
+    for (const [id, h] of run.hints ?? []) {
+      const m = hints.get(id);
+      if (!m) {
+        hints.set(id, { parents: [...h.parents], len: h.len });
+        continue;
+      }
+      for (const p of h.parents) if (!m.parents.includes(p)) m.parents.push(p);
+      m.len = Math.max(m.len, h.len);
+    }
+  }
   return { ids, runs, cursors: out, partial, backingOff, heads, hints };
 }
 
@@ -701,13 +751,15 @@ export async function walkAll(set, filter = {}, {
  * Lists the children of `parents` on every available relay of `set` in parallel (ADR 0051 rules
  * 21 to 29). A relay with `read_api >= 2` gets grouped requests (`walkGroup`, 32 parents per
  * request, a cursor per parent from `cursors`: Map base → Map parent → cursor). Any other relay
- * gets one plain walk per parent when `compat` is "walk", or is not asked when it is "skip".
+ * gets one plain walk per parent when `compat` is "walk", or is not asked when it is "skip" (it
+ * is then in every parent's `incompleteOn`).
  * `filter` gives `limit`, `since` and, for the grouped form only, `order`.
  *
  * Resolves with `{ parents, cursors, heads, runs, backingOff }`. `parents` maps each parent to
  * `{ ids, complete, completeOn, incompleteOn }`: the union of the ids of every relay asked, and
  * the relays whose listing of it was complete or not. `complete` holds only when every relay asked
- * gave a complete listing and none was skipped for backing off (rule 29: a client derives absence
+ * gave a complete listing and none was skipped, for backing off or for lacking `read_api >= 2`
+ * with "skip" (rule 29: a client derives absence
  * only from complete listings). `cursors` maps each relay to its per-parent cursors to resume from;
  * `heads` maps each grouped relay to its `head`.
  */
@@ -723,7 +775,7 @@ export async function walkGroupAll(set, parents, {
       grouped = await set.hasReadApi(e, { signal });
     } catch (error) {
       if (!isAborted(error)) throw error;
-      return { base: e.base, stop: "aborted", groups: [], head: null };
+      return { base: e.base, stop: "aborted", assigned: parents, groups: [], head: null };
     }
     if (grouped) {
       const g = await walkGroup(e.relay, parents, { filter, cursors: start, limits, sleep, random, signal });
@@ -735,7 +787,9 @@ export async function walkGroupAll(set, parents, {
       }
       return { base: e.base, grouped: true, assigned: parents, ...g };
     }
-    if (compat !== "walk") return null;
+    // "skip": this relay is not asked, so no parent's listing is complete on it (rule 29;
+    // security review 2026-11-21, L-2): it may hold a child the others lack.
+    if (compat !== "walk") return { base: e.base, grouped: false, skipped: true, assigned: parents, groups: [], head: null, stop: "skipped" };
     // A relay before ADR 0051: one ascending walk per parent, exactly as before.
     const plain = { limit: filter.limit, since: filter.since };
     const groups = [];

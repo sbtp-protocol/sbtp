@@ -1377,6 +1377,9 @@ struct Fake {
     over_length: bool,
     /// The body ends inside the second record.
     truncate: bool,
+    /// `POST /blocks` is refused with this status line and error name, `/info` still saying
+    /// `read_api` (a proxy in front of the relay, or a broken route).
+    refuse_batch: Option<(&'static str, &'static str)>,
 }
 
 /// A fake relay on loopback: store order is insertion order, a cursor `p<N>` is the gap before
@@ -1468,6 +1471,9 @@ fn fake_answer(
                 "405 Method Not Allowed",
                 r#"{"error":"MethodNotAllowed"}"#.into(),
             );
+        }
+        if let Some((status, name)) = fake.refuse_batch {
+            return json(status, format!(r#"{{"error":"{name}"}}"#));
         }
         if body.is_empty() || !body.len().is_multiple_of(32) {
             return bad("InvalidParameter");
@@ -1704,71 +1710,91 @@ fn get_several_ids_batches_with_failover_and_prefixes() {
 }
 
 /// ADR 0051 rules 2 and 6: a length above `MAX_BLOCK_LEN` fails the whole answer; a body that ends
-/// inside a record keeps the complete records before it; the rest comes from the next relay. With
-/// no other relay, the command fails and says why.
+/// inside a record keeps the complete records before it. A broken batch route, or one refused with
+/// `400`, `404` or `405`, falls back to single GETs on the same relay, so that one relay is enough
+/// (security review 2026-11-21, I-1); the next relay is not asked.
 #[test]
-fn get_several_ids_over_length_and_truncated_batches() {
+fn get_several_ids_falls_back_to_gets_when_the_batch_route_fails() {
     let blocks: Vec<Held> = (0..3).map(|i| held(42, 200 + i, &[])).collect();
     let ids: Vec<String> = blocks.iter().map(|b| b.id.clone()).collect();
-    for (fake, from_broken) in [
+    let v2 = Fake {
+        read_api: Some(2),
+        ..Fake::default()
+    };
+    let refused = |status, name| Fake {
+        refuse_batch: Some((status, name)),
+        ..v2.clone()
+    };
+    for (fake, from_batch) in [
         (
             Fake {
-                read_api: Some(2),
                 over_length: true,
-                ..Fake::default()
+                ..v2.clone()
             },
             0,
         ),
         (
             Fake {
-                read_api: Some(2),
                 truncate: true,
-                ..Fake::default()
+                ..v2.clone()
             },
             1,
         ),
+        (refused("405 Method Not Allowed", "MethodNotAllowed"), 0),
+        (refused("404 Not Found", "NotFound"), 0),
+        (refused("400 Bad Request", "InvalidParameter"), 0),
+        (refused("400 Bad Request", "NoLength"), 0),
     ] {
-        let (broken, _, hb) = fake_v2(blocks.clone(), fake.clone());
-        let (good, _, hg) = fake_v2(
-            blocks.clone(),
-            Fake {
-                read_api: Some(2),
-                ..Fake::default()
-            },
+        // One relay only: the command succeeds through single GETs.
+        let (alone, _, ha) = fake_v2(blocks.clone(), fake.clone());
+        let mut args = vec!["get", "--relay", &alone];
+        args.extend(ids.iter().map(String::as_str));
+        let o = cli(&args);
+        assert_ok(&o);
+        assert_eq!(stdout(&o).matches("block_id:").count(), 3);
+        assert!(stderr(&o).contains("using single GETs"), "{}", stderr(&o));
+        let mut want = vec![
+            "GET /sbtp/v1/info".to_owned(),
+            "POST /sbtp/v1/blocks n=3".to_owned(),
+        ];
+        want.extend(
+            ids[from_batch..]
+                .iter()
+                .map(|i| format!("GET /sbtp/v1/block/{i}")),
         );
+        assert_eq!(hits_of(&ha), want);
+
+        // Two relays: the broken one still serves everything; the next one is not asked.
+        let (broken, _, _) = fake_v2(blocks.clone(), fake);
+        let (good, _, hg) = fake_v2(blocks.clone(), v2.clone());
         let list = format!("{broken},{good}");
         let mut args = vec!["get", "--relay", &list];
         args.extend(ids.iter().map(String::as_str));
         let o = cli(&args);
         assert_ok(&o);
         assert_eq!(stdout(&o).matches("block_id:").count(), 3);
-        assert_eq!(
-            hits_of(&hb)
-                .iter()
-                .filter(|x| x.starts_with("POST"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            hits_of(&hg)
-                .into_iter()
-                .filter(|x| x.starts_with("POST"))
-                .collect::<Vec<_>>(),
-            [format!("POST /sbtp/v1/blocks n={}", 3 - from_broken)]
-        );
-
-        let (alone, _, _) = fake_v2(blocks.clone(), fake);
-        let mut args = vec!["get", "--relay", &alone];
-        args.extend(ids.iter().map(String::as_str));
-        let o = cli(&args);
-        assert_code(&o, 1);
-        let err = stderr(&o);
-        assert!(err.contains("not fetched"), "{err}");
-        assert!(
-            err.contains("above the largest block") || err.contains("ends inside a record"),
-            "{err}"
-        );
+        assert!(hits_of(&hg).is_empty(), "{:?}", hits_of(&hg));
     }
+
+    // A server error is not a broken route: the rest goes to the next relay, no GET fallback.
+    let (busy, _, hb) = fake_v2(blocks.clone(), refused("503 Service Unavailable", "Busy"));
+    let (good, _, hg) = fake_v2(blocks, v2.clone());
+    let list = format!("{busy},{good}");
+    let mut args = vec!["get", "--relay", &list];
+    args.extend(ids.iter().map(String::as_str));
+    assert_ok(&cli(&args));
+    assert!(
+        !hits_of(&hb)
+            .iter()
+            .any(|x| x.starts_with("GET /sbtp/v1/block/"))
+    );
+    assert_eq!(
+        hits_of(&hg)
+            .into_iter()
+            .filter(|x| x.starts_with("POST"))
+            .collect::<Vec<_>>(),
+        ["POST /sbtp/v1/blocks n=3"]
+    );
 }
 
 /// ADR 0051 rule 31: without `read_api` in /info, `get` with several ids sends single GETs, and

@@ -219,6 +219,20 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- Security review 2026-11-21 of the relay read API (`docs/security/2026-11-21-read-api-0051.md`):
+  - web client cold start: the `fields=parents` hints of several relays are merged as a union of the
+    claimed parents (and the largest claimed length) per block, so a hostile relay listed first can no
+    longer hide a block that another relay lists by claiming `parents: []` (M-1);
+  - web client view: a relay skipped for lacking `read_api: 2` counts as incomplete for every item, so
+    "replies N (complete)" is no longer shown when an older relay was never asked (L-2);
+  - `sbtp-relay`: `rate_block_burst` below 64 and `rate_query_burst` below 4 are refused at start-up
+    with a constraint error, so the capped weights of ADR 0051 rule 21 cannot serve more than 4 blocks
+    (or 8 parents) per token (L-1);
+  - web client and `cli-demo get`: a `POST /sbtp/v1/blocks` refused with `400`, `404`, `405`, `411`
+    or `413`, or answered with a broken body, falls back to single `GET`s on the same relay instead of
+    failing the ids; the web client remembers it per relay for the session (I-1);
+  - `sbtp-relay`: a refused `peers` URL is shown with everything from `//` to its last `@` hidden, so a
+    password holding `/`, `?` or `#` is hidden too, and with its position in the list (I-2).
 - Pre-push security review 2026-11-21 of replication and ingest bounds
   (`docs/security/2026-11-21-replication-ingest-pre-push.md`), `sbtp-relay`:
   - the byte budget of a network group (ADR 0049) is checked once the `PUT` permit is held, still

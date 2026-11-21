@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn preflight_and_unknown_path_cost_a_block_token() {
         let env = [
-            ("SBTP_RELAY_RATE_BLOCK_BURST", "3"),
+            ("SBTP_RELAY_RATE_BLOCK_BURST", "64"),
             ("SBTP_RELAY_RATE_BLOCK_PER_MIN", "1"),
             ("SBTP_RELAY_RATE_PUT_BURST", "1"),
             ("SBTP_RELAY_RATE_PUT_PER_MIN", "2"),
@@ -1277,10 +1277,14 @@ mod tests {
             assert!(slot.is_none(), "a direct peer is counted at accept");
             refusal(&r)
         };
-        // Three `block` tokens: a preflight, an unknown path, then `/info` finds the bucket empty.
+        // 64 `block` tokens (the smallest burst): a preflight, an unknown path, a refused method
+        // and 61 `/info`, then `/info` finds the bucket empty.
         assert_eq!(request(Method::OPTIONS, "/sbtp/v1/block"), None);
         assert_eq!(request(Method::GET, "/no/such/path"), None);
         assert_eq!(request(Method::DELETE, "/sbtp/v1/info"), None);
+        for _ in 0..61 {
+            assert_eq!(request(Method::GET, "/sbtp/v1/info"), None);
+        }
         let block_empty = Some(Refusal::EmptyBucket {
             class: RequestClass::Block,
             retry_after_s: 60,
@@ -1329,14 +1333,14 @@ mod tests {
     #[test]
     fn in_flight_client_exhausts_its_bucket() {
         let clients = proxy_policy();
-        let limiter = query_limiter("3");
+        let limiter = query_limiter("4");
         let counts = Counts::new(1);
         let proxied = Admission::Proxied(Arc::clone(&counts));
         let proxy: IpAddr = [10, 0, 0, 1].into();
         let mut first = proxied_query("198.51.100.7");
         let held = admit(&clients, &limiter, proxy, &proxied, &mut first);
         assert!(held.is_some() && refusal(&first).is_none());
-        for _ in 0..2 {
+        for _ in 0..3 {
             let mut r = proxied_query("198.51.100.7");
             assert!(admit(&clients, &limiter, proxy, &proxied, &mut r).is_none());
             assert_eq!(refusal(&r), Some(Refusal::InFlight));
@@ -1362,7 +1366,7 @@ mod tests {
     #[test]
     fn overflow_requests_share_one_in_flight_count() {
         let clients = proxy_policy();
-        let limiter = query_limiter("2");
+        let limiter = query_limiter("4");
         for k in 0..64u8 {
             let key = clients.key([192, 0, 2, k].into());
             assert!(

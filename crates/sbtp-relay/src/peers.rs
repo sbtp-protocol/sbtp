@@ -230,13 +230,14 @@ fn is_loopback_host(h: &Host) -> bool {
     }
 }
 
-/// `s` with the userinfo of its authority, if any, replaced by `***` (security review 2026-11-21
-/// I-2): an error names the URL without its credentials.
+/// `s` with everything from the scheme's `//` to its last `@`, if any, replaced by `***`
+/// (security review 2026-11-21 I-2): an error names the URL without its credentials. The authority
+/// is not delimited first, because a password may hold `/`, `?` or `#`; a peer URL never needs an
+/// `@`, so hiding a path that holds one costs only a less precise error.
 fn redact_userinfo(s: &str) -> String {
     let start = s.find("://").map_or(0, |i| i + 3);
     let rest = s.get(start..).unwrap_or_default();
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest.get(..end).and_then(|auth| auth.rfind('@')) {
+    match rest.rfind('@') {
         Some(at) => format!(
             "{}***{}",
             s.get(..start).unwrap_or_default(),
@@ -475,14 +476,31 @@ mod tests {
             "http://user:hunter2@127.0.0.1:8080",
             "ftp://user:hunter2@relay.example",
             "https://a@b:hunter2@relay.example",
+            // A password holding `/`, `?` or `#` (a base64 token can hold `/`).
+            "https://user:hun/ter2@relay.example",
+            "https://user:hun?ter2@relay.example/sbtp",
+            "https://user:hun#ter2@relay.example",
+            "https://user:hunter2/x?y#z@relay.example/p@q",
         ] {
             let e = PeerUrl::parse(s).unwrap_err();
-            assert!(!e.contains("hunter2") && !e.contains("user:"), "{e}");
+            assert!(
+                !e.contains("hun") && !e.contains("ter2") && !e.contains("user:"),
+                "{e}"
+            );
             assert!(e.contains("***@"), "{e}");
         }
         assert_eq!(
+            redact_userinfo("https://user:hun/ter2@relay.example"),
+            "https://***@relay.example"
+        );
+        assert_eq!(
+            redact_userinfo("https://relay.example/sbtp"),
+            "https://relay.example/sbtp"
+        );
+        // An `@` in the path hides what comes before it: less precise, never a leak.
+        assert_eq!(
             redact_userinfo("https://relay.example/a@b"),
-            "https://relay.example/a@b"
+            "https://***@b"
         );
     }
 
