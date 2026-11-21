@@ -1,9 +1,10 @@
 //! The operator deny list (ADR 0052; core spec §4, "Denied blocks"; `architecture.md` §2).
 //!
 //! The list names blocks by `block_id` and keys by the header's public key. It is local
-//! configuration: read from `deny_file` at start-up, on `SIGHUP` and when the file's
-//! modification time or size changes (checked every `deny_reload_ms`), never derived from
-//! anything the relay receives (rule 2). An invalid file at start-up stops the start-up; an
+//! configuration: read from `deny_file` at start-up, on `SIGHUP` and when the file changes
+//! (device, inode, modification or change time, size; checked every `deny_reload_ms`), never
+//! derived from anything the relay receives (rule 2). A file that changes while it is read is
+//! discarded and read again (deny review L-1). An invalid file at start-up stops the start-up; an
 //! invalid or missing file on reload keeps the previous list whole (rule 4).
 //!
 //! **Parser input bounds** (rule 3, for the security review). The file is read as a stream
@@ -311,8 +312,26 @@ pub fn pubkey_of(bytes: &[u8]) -> Option<[u8; 32]> {
         .and_then(|k| <[u8; 32]>::try_from(k).ok())
 }
 
-/// The modification time and size of the file, or `None` when it cannot be read.
-type Stamp = Option<(Option<SystemTime>, u64)>;
+/// What tells one state of the file from another: the device and inode (an `mv` into place),
+/// the modification and change times (a time-preserving copy changes `ctime`) and the size
+/// (deny review L-1). `None` when the file cannot be read, or when the last read must be done
+/// again.
+type Stamp = Option<FileStamp>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mtime: Option<SystemTime>,
+    /// `ctime` in seconds and nanoseconds; `(0, 0)` where it does not exist.
+    ctime: (i64, i64),
+    len: u64,
+}
+
+/// How many times the start-up load reads a file that changes while it is read, before giving
+/// up, and the pause between two reads.
+const SETTLE_TRIES: u32 = 5;
+const SETTLE_PAUSE: Duration = Duration::from_millis(50);
 
 /// The deny list of a relay: off, or the list loaded from `deny_file`.
 #[derive(Debug, Default)]
@@ -337,6 +356,9 @@ pub enum Reload {
     Loaded,
     /// The file is invalid or missing: the previous list stays in force.
     Invalid(Invalid),
+    /// The file changed while it was read (deny review L-1): the result is discarded, the
+    /// previous list stays in force, and the next poll reads the file again.
+    Changed,
     /// The deny list is off.
     Off,
 }
@@ -364,13 +386,22 @@ impl Deny {
             reload_every: Duration::from_millis(s.deny_reload_ms),
             ..Self::default()
         };
-        match deny.reload() {
-            Reload::Loaded | Reload::Off => Ok(deny),
-            Reload::Invalid(e) => Err(ConfigError::Invalid {
-                setting: "deny_file",
-                reason: format!("invalid at line {}: {}", e.line, e.reason.name()),
-            }),
+        for _ in 0..SETTLE_TRIES {
+            match deny.reload() {
+                Reload::Loaded | Reload::Off => return Ok(deny),
+                Reload::Invalid(e) => {
+                    return Err(ConfigError::Invalid {
+                        setting: "deny_file",
+                        reason: format!("invalid at line {}: {}", e.line, e.reason.name()),
+                    });
+                }
+                Reload::Changed => std::thread::sleep(SETTLE_PAUSE),
+            }
         }
+        Err(ConfigError::Invalid {
+            setting: "deny_file",
+            reason: "the file kept changing while it was read".into(),
+        })
     }
 
     /// Whether a deny list is applied (`deny_file` is set; `/info` `deny_list`, rule 11).
@@ -407,7 +438,7 @@ impl Deny {
         self.pass_wanted.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether the file's modification time or size differs from the last read attempt.
+    /// Whether the file's stamp ([`FileStamp`]) differs from the last read attempt.
     #[must_use]
     pub fn changed(&self) -> bool {
         let Some(path) = &self.path else {
@@ -428,7 +459,10 @@ impl Deny {
         let (read, stamp) = read_file(path, self.max_entries);
         *self.stamp.lock().unwrap_or_else(PoisonError::into_inner) = stamp;
         let new = match read {
-            Ok(list) => Arc::new(list),
+            Ok(Some(list)) => Arc::new(list),
+            // Deny review L-1: half a rewrite is never applied; `stamp` is unset, so that the
+            // next poll reads the file again.
+            Ok(None) => return Reload::Changed,
             Err(e) => {
                 log::throttled(
                     &INVALID_LOG,
@@ -465,12 +499,38 @@ impl Deny {
 }
 
 fn stamp_of(m: Option<&std::fs::Metadata>) -> Stamp {
-    m.map(|m| (m.modified().ok(), m.len()))
+    m.map(|m| {
+        #[cfg(unix)]
+        let (dev, ino, ctime) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (m.dev(), m.ino(), (m.ctime(), m.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let (dev, ino, ctime) = (0, 0, (0, 0));
+        FileStamp {
+            dev,
+            ino,
+            mtime: m.modified().ok(),
+            ctime,
+            len: m.len(),
+        }
+    })
 }
 
 /// Opens `path` without blocking on a FIFO or a device, refuses anything but a regular file,
-/// and parses it. Returns the stamp of the opened file.
-fn read_file(path: &Path, max_entries: usize) -> (Result<List, Invalid>, Stamp) {
+/// and parses it. Returns the stamp of the opened file. `Ok(None)` when the open file changed
+/// while it was parsed (deny review L-1): an in-place rewrite caught half-way, whose stamp is
+/// then `None`.
+fn read_file(path: &Path, max_entries: usize) -> (Result<Option<List>, Invalid>, Stamp) {
+    read_file_then(path, max_entries, || {})
+}
+
+/// [`read_file`], with `between` called between the parse and the second `fstat` (tests).
+fn read_file_then(
+    path: &Path,
+    max_entries: usize,
+    between: impl FnOnce(),
+) -> (Result<Option<List>, Invalid>, Stamp) {
     let whole = |reason| Invalid { line: 0, reason };
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -491,7 +551,17 @@ fn read_file(path: &Path, max_entries: usize) -> (Result<List, Invalid>, Stamp) 
     if !meta.is_some_and(|m| m.is_file()) {
         return (Err(whole(Reason::Unreadable)), stamp);
     }
-    (List::parse(file, max_entries), stamp)
+    let parsed = match List::parse(&file, max_entries) {
+        Ok(list) => list,
+        Err(e) => return (Err(e), stamp),
+    };
+    between();
+    // A rewrite in place that started or ended during the parse changes the size, the
+    // modification or the change time of the open file.
+    if stamp_of(file.metadata().ok().as_ref()) != stamp {
+        return (Ok(None), None);
+    }
+    (Ok(Some(parsed)), stamp)
 }
 
 /// Where the marking pass is.
@@ -791,6 +861,64 @@ mod tests {
         );
         assert!(l(format!("key {B} purge\n")).needs_pass(Some(&keys)));
         assert!(l(format!("key {A}\n")).needs_pass(Some(&keys)));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "sbtp-deny-{name}-{}-{}",
+            std::process::id(),
+            log::unix_ms()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("deny.txt")
+    }
+
+    /// Deny review L-1: a file rewritten in place while it is parsed is discarded, with no
+    /// stamp, so that the next poll reads it again.
+    #[test]
+    fn a_file_changed_during_the_parse_is_discarded() {
+        let path = scratch("rewrite");
+        std::fs::write(&path, format!("block {A}\n")).unwrap();
+        let (read, stamp) = read_file_then(&path, 16, || {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(format!("block {B}\n").as_bytes()).unwrap();
+        });
+        assert_eq!((read, stamp), (Ok(None), None));
+        let (read, stamp) = read_file(&path, 16);
+        assert_eq!(read.unwrap().unwrap().counts(), (2, 0, 0));
+        assert!(stamp.is_some());
+    }
+
+    /// Deny review L-1: a replacement with the same size and modification time, moved into
+    /// place, is seen by the poll (the inode and `ctime` differ).
+    #[test]
+    fn a_same_size_same_time_replacement_is_seen() {
+        let path = scratch("swap");
+        std::fs::write(&path, format!("block {A}\n")).unwrap();
+        let deny = Deny {
+            path: Some(path.clone()),
+            max_entries: 16,
+            ..Deny::default()
+        };
+        assert_eq!(deny.reload(), Reload::Loaded);
+        assert!(!deny.changed());
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let next = path.with_extension("new");
+        std::fs::write(&next, format!("block {B}\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert!(deny.changed());
+        assert_eq!(deny.reload(), Reload::Loaded);
+        assert!(deny.check(&id(B), None).is_some());
     }
 
     /// The public key of a block is read from its header.
