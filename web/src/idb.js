@@ -1,7 +1,8 @@
 // Minimal promise wrapper over IndexedDB. One database per origin for this client:
 //   keys       { name, privateKey: CryptoKey (non-extractable), publicKey: Uint8Array, created }
-//   blockMeta  { id, size, own, acked, accessed, failedOn? }   (index "accessed"; failedOn: relay
-//              bases an own block still has to be sent to; absent in records from before it)
+//   blockMeta  { id, size, own, accessed, delivery? }   (index "accessed"; delivery: own blocks only,
+//              the per-relay state of ADR 0047, see delivery.js. Records from before ADR 0047 carry
+//              `acked` and `failedOn` instead; BlockStore.setRelays rewrites them, no version change)
 //   blockBytes { id, bytes }
 //   stats      { name: "totals", count, bytes, pending }   (running totals of blockMeta; v2)
 

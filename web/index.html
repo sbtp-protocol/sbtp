@@ -46,6 +46,15 @@
 </section>
 
 <section>
+  <h2>Undeliverable own blocks</h2>
+  <p class="muted">Own blocks that no relay of the list holds, and that every relay refused for good or
+    was given up on after repeated failures. They stay stored, but nothing automatic will deliver them.</p>
+  <button id="stranded-check">Check again</button>
+  <pre id="stranded-out"></pre>
+  <div id="stranded"></div>
+</section>
+
+<section>
   <h2>Browse</h2>
   <input id="parent-filter" type="text" placeholder="Only children of this block id (optional)" aria-label="Parent filter">
   <button id="list">List (/query) and fetch</button>

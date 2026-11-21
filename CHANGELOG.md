@@ -115,6 +115,21 @@ Initial public version. Pre-release software: no version is supported for produc
   gauges and the `demand_evicted`, `demand_stuck` and `demand_suspended` events. An archive relay
   is `demand_eviction = false` with `block_ttl_ms = 0`. `deploy/README.md`: retention modes and the
   Cloudflare cache rules. The `small` profile's computed memory bound is 14,747,092 bytes.
+- Web client: an own block stays protected in the local store until every relay of the list
+  acknowledges it, within a bound (ADR 0047). Each own block keeps a delivery state per relay
+  (pending, acknowledged, refused, given up) with its attempt count, first attempt and first
+  acknowledgement, replacing `acked` and the truncated `failedOn`. A `PUT` answer is transient (the
+  relay stays pending: no response, timeout, `408`, `429`, `5xx` including `507`, `400
+  TimestampTooFarInFuture`) or final (refused: any other `400` including `InsufficientPow`, `413`,
+  `422`, a `3xx`, any other `4xx`); a request not sent because of a back-off is not an attempt.
+  A pending relay is given up after 5 attempts and 24 hours since the first, and in any case 7 days
+  after the block's first acknowledgement (`bounds.js`); a block no relay acknowledged keeps its
+  protection. Removing a relay deletes its states (a block only it held is protected again and sent
+  to the others); an added relay is pending only for the blocks protected then. Eviction: fetched
+  blocks, then unprotected own blocks, then, only for a new own block, partly delivered ones (oldest
+  first acknowledgement first). A new "Undeliverable own blocks" section lists the blocks no relay
+  holds or is pending for, with add a relay, export and delete. Stored records are rewritten on the
+  first start, with no IndexedDB version change.
 
 ### Fixed
 

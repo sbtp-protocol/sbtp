@@ -96,17 +96,18 @@ test("relay URL: https anywhere, http on loopback only, no credentials/query/fra
   }
 });
 
-test("eviction: fetched first (LRU), then acknowledged own, never pending own", () => {
+test("eviction: fetched first (LRU), then acknowledged own, never pending own (records from before ADR 0047)", () => {
   const m = (id, own, acked, accessed, size = 10) => ({ id, own, acked, accessed, size });
   const metas = [m("f-old", false, false, 1), m("f-new", false, false, 5), m("own-acked", true, true, 0), m("own-pending", true, false, 0)];
-  const plan = (incoming, maxBlocks) => planEviction(metas, incoming, { maxBlocks, maxBytes: 1e9 });
+  const ctx = { bases: ["https://a.example.org"], now: 1 };
+  const plan = (incoming, maxBlocks) => planEviction(metas, incoming, { maxBlocks, maxBytes: 1e9 }, ctx);
   assert.deepEqual(plan({ size: 10, own: false }, 4), { drop: ["f-old"], accept: true });
   assert.deepEqual(plan({ size: 10, own: false }, 2), { drop: ["f-old", "f-new", "own-acked"], accept: true });
   assert.deepEqual(plan({ size: 10, own: false }, 1), { drop: [], accept: false });
   const own = plan({ size: 10, own: true }, 1); // own blocks are always kept and accepted
   assert.equal(own.accept, true);
   assert.ok(!own.drop.includes("own-pending"));
-  assert.deepEqual(planEviction(metas, { size: 25, own: false }, { maxBlocks: 99, maxBytes: 50 }).drop, ["f-old", "f-new"]);
+  assert.deepEqual(planEviction(metas, { size: 25, own: false }, { maxBlocks: 99, maxBytes: 50 }, ctx).drop, ["f-old", "f-new"]);
 });
 
 test("statistics: nearest-rank percentiles", () => {
