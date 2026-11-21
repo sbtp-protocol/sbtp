@@ -9,6 +9,7 @@
 // Exit code 0 when every check passes, 1 otherwise.
 
 import assert from "node:assert/strict";
+import { createPrivateKey, createPublicKey, sign as ed25519Sign } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -306,6 +307,98 @@ await check("seal: arguments, buckets and named errors", () => {
   assert.equal(env.signed, false);
   env.signBlock(env.unsignedBlock(0n));
   env.free(); key.free(); sender.free();
+});
+
+// An identity key outside WASM, as a non-extractable Web Crypto key would be: node:crypto
+// Ed25519 from a public test seed (PKCS#8 prefix of RFC 8410 + the 32-byte seed).
+function externalIdentity(seedByte) {
+  const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"),
+    Buffer.from(fill(32, seedByte))]);
+  const privateKey = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const jwk = createPublicKey(privateKey).export({ format: "jwk" });
+  const publicKey = new Uint8Array(Buffer.from(jwk.x, "base64url"));
+  const sign = (message) => new Uint8Array(ed25519Sign(null, message, privateKey));
+  // The same seed as a non-extractable Web Crypto key, the web client's identity.
+  const webCryptoKey = () => crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false,
+    ["sign"]);
+  return { publicKey, sign, webCryptoKey };
+}
+
+await check("sealPrepare, external Ed25519 signature, finish: round trip", async () => {
+  const identity = externalIdentity(0x5e);
+  // Same key as the in-WASM derivation of the same seed.
+  const demo = sbtp.DemoSigningKey.fromSeed(fill(32, 0x5e));
+  assert.deepEqual(identity.publicKey, demo.publicKey);
+  demo.free();
+  const recipient = sbtp.EncKeyPair.fromSecret(fill(32, 0x22));
+  const id = fill(32, 0x33);
+  const tag = sbtp.applicationTag("app 2026-11-21 test inbox", id);
+  const pending = sbtp.sealPrepare(identity.publicKey, recipient.publicKey, id, tag, NOTE);
+  const message = pending.message;
+  // spec §5.3: SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖ recipient_x25519 ‖ msg.
+  assert.equal(new TextDecoder().decode(message.subarray(0, 18)), "SBTP-v1-sealed-sig");
+  assert.deepEqual(message.subarray(50, 82), id);
+  assert.deepEqual(message.subarray(82, 114), recipient.publicKey);
+  assert.deepEqual(message.subarray(114), NOTE);
+  assert.equal(pending.used, false);
+  const webKey = await identity.webCryptoKey();
+  assert.equal(webKey.extractable, false);
+  const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", webKey, message));
+  assert.deepEqual(signature, identity.sign(message)); // Ed25519 is deterministic
+  const env = pending.finish(signature);
+  assert.equal(pending.used, true);
+  throwsNamed(() => pending.finish(signature), "PendingSealUsed"); // single use
+  throwsNamed(() => pending.message, "PendingSealUsed");
+  assert.deepEqual(env.publicKey, message.subarray(18, 50)); // the outer PubKey is bound
+  assert.equal(env.bucket, 512);
+  const block = env.unsignedBlock(BigInt(Date.now()));
+  while (sbtp.mineSlice(block, 4, 1 << 12) === undefined) { /* next slice */ }
+  const info = sbtp.validateSubmitted(env.signBlock(block), 4);
+  const opened = sbtp.openSealed(recipient, info.publicKey, info.parent(0), info.payload, id,
+    "app.note");
+  assert.deepEqual(opened.from, identity.publicKey);
+  assert.deepEqual(opened.msg, NOTE);
+  opened.free(); info.free(); env.free(); pending.free(); recipient.free();
+});
+
+await check("sealPrepare and finish: named errors", () => {
+  const identity = externalIdentity(0x5e);
+  const other = externalIdentity(0x5f);
+  const key = sbtp.EncKeyPair.generate();
+  const id = fill(32, 1);
+  const tag = fill(32, 2);
+  const prepare = () => sbtp.sealPrepare(identity.publicKey, key.publicKey, id, tag, NOTE);
+  // A signature by another key, then a tampered one: never sealed, the state is consumed.
+  let pending = prepare();
+  throwsNamed(() => pending.finish(other.sign(pending.message)), "InvalidSignature");
+  throwsNamed(() => pending.finish(new Uint8Array(64)), "PendingSealUsed");
+  pending.free();
+  pending = prepare();
+  const bad = identity.sign(pending.message); bad[5] ^= 1;
+  throwsNamed(() => pending.finish(bad), "InvalidSignature");
+  pending.free();
+  // Argument shapes do not consume the state.
+  pending = prepare();
+  throwsNamed(() => pending.finish(new Uint8Array(63)), "InvalidLength");
+  throwsNamed(() => pending.finish("sig"), "InvalidArgument");
+  assert.equal(pending.used, false);
+  pending.finish(identity.sign(pending.message)).free();
+  pending.free();
+  // `from` not a usable key (the identity point, small order).
+  const point = new Uint8Array(32); point[0] = 1;
+  pending = sbtp.sealPrepare(point, key.publicKey, id, tag, NOTE);
+  throwsNamed(() => pending.finish(identity.sign(pending.message)), "InvalidPublicKey");
+  pending.free();
+  // Prepare-side errors.
+  throwsNamed(() => sbtp.sealPrepare(new Uint8Array(31), key.publicKey, id, tag, NOTE),
+    "InvalidLength");
+  throwsNamed(() => sbtp.sealPrepare(identity.publicKey, key.publicKey, id, tag,
+    new Uint8Array([0xa0])), "InvalidPayload");
+  throwsNamed(() => sbtp.sealPrepare(identity.publicKey, key.publicKey, id, tag, NOTE, 1000),
+    "InvalidArgument");
+  pending = sbtp.sealPrepare(identity.publicKey, new Uint8Array(32), id, tag, NOTE);
+  throwsNamed(() => pending.finish(identity.sign(pending.message)), "InvalidRecipientKey");
+  pending.free(); key.free();
 });
 
 await check("EncKeyPair and tags", () => {

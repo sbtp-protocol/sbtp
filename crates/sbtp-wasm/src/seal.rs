@@ -5,8 +5,8 @@
 //! # Secrets
 //!
 //! - X25519 private keys live in [`EncKeyPair`], the ephemeral Ed25519 key of an outer block in
-//!   [`SealedEnvelope`], an opened `msg` in [`OpenedMessage`]. All three are wiped when the object
-//!   is freed (`x25519-dalek` and `ed25519-dalek` wipe on drop, `msg` is `Zeroizing`); call
+//!   [`SealPending`] then [`SealedEnvelope`], an opened `msg` in [`OpenedMessage`]. All are wiped
+//!   when the object is freed (`x25519-dalek` and `ed25519-dalek` wipe on drop, `msg` is `Zeroizing`); call
 //!   `free()` as soon as possible, garbage collection is neither prompt nor guaranteed.
 //! - The ephemeral key never leaves WASM: [`SealedEnvelope::sign_block_js`] signs the outer block
 //!   once and wipes it at once (spec §5.2: it signs that block only).
@@ -37,13 +37,13 @@ use core::convert::Infallible;
 use core::fmt;
 
 use js_sys::Uint8Array;
-use sbtp_core::layout::{HASH_LEN, MAX_BLOCK_LEN};
+use sbtp_core::layout::{HASH_LEN, MAX_BLOCK_LEN, PUBKEY_LEN, SIGNATURE_LEN};
 use sbtp_core::{BlockId, SigningKey, parse, sign_block};
 use sbtp_l2::{Body, validate_l2_invariants};
 use sbtp_seal::rand_core::{TryCryptoRng, TryRng};
 use sbtp_seal::{
-    Bucket, OpenRequest, RecipientKey, SealError, SealRequest, TagError, application_tag,
-    directory_tag, is_directory_tag,
+    Bucket, OpenRequest, PendingSeal, PrepareRequest, RecipientKey, SealError, SealRequest, Sealed,
+    TagError, application_tag, directory_tag, is_directory_tag,
 };
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -481,14 +481,146 @@ pub fn seal_message(
 fn seal_with(mut rng: OsRng, request: &SealRequest<'_>) -> Result<SealedEnvelope, BindError> {
     let result = sbtp_seal::seal(request, &mut rng);
     // On an entropy failure the result (if any) is dropped, ephemeral key included.
-    let sealed = rng.check(result)??;
+    Ok(envelope(rng.check(result)??))
+}
+
+fn envelope(sealed: Sealed) -> SealedEnvelope {
     let public_key = sealed.ephemeral.verifying_key().to_bytes();
-    Ok(SealedEnvelope {
+    SealedEnvelope {
         payload: sealed.payload,
         tag: sealed.tag,
         bucket: sealed.bucket,
         public_key,
         ephemeral: Some(sealed.ephemeral),
+    }
+}
+
+/// A seal waiting for its inner signature (spec §5.3), for an identity key that signs outside WASM
+/// (a non-extractable Web Crypto key). Sign [`SealPending::message_bytes`] with the identity key,
+/// then call [`SealPending::finish`]: once, whatever its result. Holds the ephemeral key of the
+/// outer block and the encoded plaintext, wiped on `finish` or `free()`.
+#[wasm_bindgen]
+pub struct SealPending {
+    inner: Option<PendingSeal>,
+}
+
+impl fmt::Debug for SealPending {
+    /// The inner state's `Debug`: the length of `msg` and the bucket only.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealPending")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+fn pending_used() -> BindError {
+    BindError::new(
+        names::PENDING_SEAL_USED,
+        "this pending seal was already finished",
+    )
+}
+
+impl SealPending {
+    /// The exact message to sign (spec §5.3), or `None` once finished.
+    #[must_use]
+    pub fn message_bytes(&self) -> Option<&[u8]> {
+        self.inner.as_ref().map(PendingSeal::message)
+    }
+
+    /// Verifies `signature` by `from` (strict, V1 to V6) and seals. The pending state is consumed
+    /// on success and on error.
+    ///
+    /// # Errors
+    ///
+    /// `PendingSealUsed` on a second call; `InvalidPublicKey`, `InvalidSignature`,
+    /// `InvalidRecipientKey`, `EntropyUnavailable`, `Internal`.
+    pub fn finish(&mut self, signature: &[u8; SIGNATURE_LEN]) -> Result<SealedEnvelope, BindError> {
+        self.finish_with(OsRng::new(), signature)
+    }
+
+    fn finish_with(
+        &mut self,
+        mut rng: OsRng,
+        signature: &[u8; SIGNATURE_LEN],
+    ) -> Result<SealedEnvelope, BindError> {
+        let pending = self.inner.take().ok_or_else(pending_used)?;
+        let result = pending.finish(signature, &mut rng);
+        Ok(envelope(rng.check(result)??))
+    }
+}
+
+#[wasm_bindgen]
+impl SealPending {
+    /// A copy of the exact bytes to sign with the sender's identity key (Web Crypto
+    /// `sign("Ed25519", key, message)`): `SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖
+    /// recipient_x25519 ‖ msg` (spec §5.3). Sign nothing else for this seal.
+    ///
+    /// # Errors
+    ///
+    /// `PendingSealUsed` once finished.
+    #[wasm_bindgen(getter)]
+    pub fn message(&self) -> Result<Vec<u8>, JsValue> {
+        Ok(self.message_bytes().ok_or_else(pending_used)?.to_vec())
+    }
+
+    /// Whether `finish` was already called (the state is gone).
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn used(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    /// Checks the 64-byte `signature` of `message` by `from` (strict, as the recipient will), then
+    /// seals and returns the `SealedEnvelope`. Once only: the state is consumed even on error; after
+    /// an error, call `sealPrepare` again.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument`, `InvalidLength`, `PendingSealUsed`, `InvalidPublicKey`,
+    /// `InvalidSignature`, `InvalidRecipientKey`, `EntropyUnavailable`, `Internal`.
+    #[wasm_bindgen(js_name = finish)]
+    pub fn finish_js(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "Uint8Array")] signature: &JsValue,
+    ) -> Result<SealedEnvelope, JsValue> {
+        let mut sig = [0u8; SIGNATURE_LEN];
+        exact_into("signature", signature, &mut sig)?;
+        Ok(self.finish(&sig)?)
+    }
+}
+
+/// First phase of a seal whose inner signature is made outside WASM (spec §5.3): `from` is the
+/// sender's 32-byte identity public key. `bucket`: `None` picks the smallest that fits.
+///
+/// # Errors
+///
+/// `InvalidPayload`, `SealTooLong`, `EntropyUnavailable`, `Internal`.
+pub fn prepare_seal(
+    from: &[u8; PUBKEY_LEN],
+    recipient_x25519: &[u8; 32],
+    recipient_id: &[u8; 32],
+    tag: &[u8; 32],
+    msg: &[u8],
+    bucket: Option<Bucket>,
+) -> Result<SealPending, BindError> {
+    prepare_with(
+        OsRng::new(),
+        &PrepareRequest {
+            recipient_x25519,
+            recipient_id,
+            tag,
+            from,
+            msg,
+            bucket,
+        },
+    )
+}
+
+fn prepare_with(mut rng: OsRng, request: &PrepareRequest<'_>) -> Result<SealPending, BindError> {
+    let result = sbtp_seal::seal_prepare(request, &mut rng);
+    // On an entropy failure the pending state (if any) is dropped, ephemeral key included.
+    Ok(SealPending {
+        inner: Some(rng.check(result)??),
     })
 }
 
@@ -586,8 +718,8 @@ fn kinds_in(value: &JsValue) -> Result<String, BindError> {
 
 /// Seals `msg` for one recipient (`l2-grammar.md` §5.3).
 ///
-/// - `sender`: the identity that signs the inner `sig` (a `DemoSigningKey`: the identity seed must be
-///   in WASM memory for now).
+/// - `sender`: the identity that signs the inner `sig`, a `DemoSigningKey` (its seed in WASM memory).
+///   For an identity key that cannot enter WASM, use `sealPrepare` then `SealPending.finish`.
 /// - `recipientX25519`: the recipient's X25519 key (`x25519` of its current `sbtp.enc_key`).
 /// - `recipientId`: the 32-byte `recipient_id` the application that defines the tag fixes.
 /// - `tag`: the 32-byte delivery tag (`directoryTag`, `applicationTag`).
@@ -620,6 +752,50 @@ pub fn seal_js(
     })?);
     Ok(seal_message(
         sender.signing_key(),
+        &x25519,
+        &id,
+        &tag_bytes,
+        &msg,
+        bucket,
+    )?)
+}
+
+/// First phase of a seal signed outside WASM (`l2-grammar.md` §5.3), for a sender whose identity
+/// is a non-extractable key (Web Crypto). Returns a `SealPending`: sign `pending.message` with the
+/// identity key, then `pending.finish(signature)` returns the `SealedEnvelope`.
+///
+/// - `from`: the sender's 32-byte Ed25519 identity public key, the key that will sign.
+/// - the other arguments as for `seal`.
+///
+/// # Errors
+///
+/// `InvalidArgument`, `InvalidLength`, `InvalidPayload`, `SealTooLong`, `EntropyUnavailable`,
+/// `Internal`. A recipient key that cannot be sealed to (`InvalidRecipientKey`) and a `from` that is
+/// not a valid key (`InvalidPublicKey`) are found by `finish`.
+#[wasm_bindgen(js_name = sealPrepare)]
+pub fn seal_prepare_js(
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] from: &JsValue,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] recipient_x25519: &JsValue,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] recipient_id: &JsValue,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] tag: &JsValue,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] msg: &JsValue,
+    #[wasm_bindgen(unchecked_param_type = "number | undefined")] bucket: &JsValue,
+) -> Result<SealPending, JsValue> {
+    let mut from_bytes = [0u8; PUBKEY_LEN];
+    exact_into("from", from, &mut from_bytes)?;
+    let mut x25519 = [0u8; 32];
+    exact_into("recipient X25519 key", recipient_x25519, &mut x25519)?;
+    let mut id = [0u8; 32];
+    exact_into("recipient id", recipient_id, &mut id)?;
+    let mut tag_bytes = [0u8; HASH_LEN];
+    exact_into("tag", tag, &mut tag_bytes)?;
+    let bucket = bucket_in(bucket)?;
+    // One allocation of the checked length, wiped on drop.
+    let msg = Zeroizing::new(bytes_in("msg", msg, MAX_BLOCK_LEN, |_| {
+        SealError::TooLong.into()
+    })?);
+    Ok(prepare_seal(
+        &from_bytes,
         &x25519,
         &id,
         &tag_bytes,
@@ -949,6 +1125,137 @@ mod tests {
         assert_eq!(err.name(), "EntropyUnavailable");
         let err = EncKeyPair::generate_with(failing_rng()).unwrap_err();
         assert_eq!(err.name(), "EntropyUnavailable");
+    }
+
+    /// An external signer: sees only `message`, signs it through the typed builder of `sbtp-core`.
+    fn external_sign(key: &SigningKey, message: &[u8]) -> [u8; 64] {
+        let f = sbtp_core::SEALED_SIG_PREFIX.len();
+        let field =
+            |i: usize| -> [u8; 32] { message[f + 32 * i..f + 32 * (i + 1)].try_into().unwrap() };
+        let mut buf = vec![0u8; message.len()];
+        let typed = sbtp_core::sealed_sig_message(
+            &field(0),
+            &field(1),
+            &field(2),
+            &message[f + 96..],
+            &mut buf,
+        )
+        .unwrap();
+        sbtp_core::sign_sealed(key, &typed).unwrap()
+    }
+
+    fn pending(from: &[u8; 32]) -> (SealPending, [u8; 32], [u8; 32]) {
+        let key = recipient();
+        let id = [0x33; 32];
+        let tag = application_tag("app 2026-11-21 test inbox", &[&id]).unwrap();
+        let p = prepare_seal(
+            from,
+            &key.public_key_bytes(),
+            &id,
+            &tag,
+            &msg("hello"),
+            None,
+        )
+        .unwrap();
+        (p, id, tag)
+    }
+
+    #[test]
+    fn two_phase_seal_opens_and_is_single_use() {
+        let from = sender().verifying_key().to_bytes();
+        let (mut p, id, tag) = pending(&from);
+        assert!(!p.used());
+        let sig = external_sign(&sender(), p.message_bytes().unwrap());
+        let mut env = p.finish(&sig).unwrap();
+        assert!(p.used());
+        assert!(p.message_bytes().is_none());
+        assert_eq!(p.finish(&sig).unwrap_err().name(), "PendingSealUsed");
+        let block = env.unsigned_block(1).unwrap();
+        env.sign(block).unwrap();
+        let opened = open_sealed(
+            recipient().recipient_key(),
+            env.public_key_bytes(),
+            &tag,
+            env.payload_bytes(),
+            &id,
+            ALLOWED,
+        )
+        .unwrap();
+        assert_eq!(opened.from_bytes(), &from);
+        assert_eq!(opened.msg_bytes(), msg("hello").as_slice());
+    }
+
+    #[test]
+    fn two_phase_errors_are_named_and_consume_the_state() {
+        let from = sender().verifying_key().to_bytes();
+        let (mut p, _, _) = pending(&from);
+        let mut sig = external_sign(&sender(), p.message_bytes().unwrap());
+        sig[0] ^= 1;
+        assert_eq!(p.finish(&sig).unwrap_err().name(), "InvalidSignature");
+        assert!(p.used());
+        // The identity point: small order, V2.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let (mut p, _, _) = pending(&identity);
+        let sig = external_sign(&sender(), p.message_bytes().unwrap());
+        assert_eq!(p.finish(&sig).unwrap_err().name(), "InvalidPublicKey");
+        // Prepare-side errors.
+        let key = recipient();
+        let err = prepare_seal(
+            &from,
+            &key.public_key_bytes(),
+            &[2; 32],
+            &[1; 32],
+            b"\xa0",
+            None,
+        );
+        assert_eq!(err.unwrap_err().name(), "InvalidPayload");
+        let big = msg(&"x".repeat(600));
+        let err = prepare_seal(
+            &from,
+            &key.public_key_bytes(),
+            &[2; 32],
+            &[1; 32],
+            &big,
+            Some(Bucket::B512),
+        );
+        assert_eq!(err.unwrap_err().name(), "SealTooLong");
+        // The all-zero recipient key is found by `finish`.
+        let mut p = prepare_seal(&from, &[0; 32], &[2; 32], &[1; 32], &msg("x"), None).unwrap();
+        let sig = external_sign(&sender(), p.message_bytes().unwrap());
+        assert_eq!(p.finish(&sig).unwrap_err().name(), "InvalidRecipientKey");
+    }
+
+    #[test]
+    fn two_phase_entropy_failure_is_an_error() {
+        let from = sender().verifying_key().to_bytes();
+        let key = recipient();
+        let m = msg("x");
+        let request = PrepareRequest {
+            recipient_x25519: &key.public_key_bytes(),
+            recipient_id: &[2; 32],
+            tag: &[1; 32],
+            from: &from,
+            msg: &m,
+            bucket: None,
+        };
+        assert_eq!(
+            prepare_with(failing_rng(), &request).unwrap_err().name(),
+            "EntropyUnavailable"
+        );
+        let (mut p, _, _) = pending(&from);
+        let sig = external_sign(&sender(), p.message_bytes().unwrap());
+        let err = p.finish_with(failing_rng(), &sig).unwrap_err();
+        assert_eq!(err.name(), "EntropyUnavailable");
+        assert!(p.used());
+        let text = format!("{p:?}");
+        assert!(text.contains("None"), "{text}");
+        let (p, _, _) = pending(&from);
+        let text = format!("{p:?}");
+        assert!(
+            text.contains("msg_len") && !text.contains("hello"),
+            "{text}"
+        );
     }
 
     #[test]

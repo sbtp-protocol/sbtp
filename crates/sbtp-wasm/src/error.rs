@@ -59,6 +59,9 @@ pub mod names {
     /// The ephemeral key of a sealed envelope already signed its outer block (`l2-grammar.md`
     /// §5.2: it signs that block only), or the block is not that envelope's outer block.
     pub const EPHEMERAL_KEY_USED: &str = "EphemeralKeyUsed";
+    /// `SealPending.finish` (or its `message`) was called after a first `finish`: the pending
+    /// seal is single use (`l2-grammar.md` §5.2, one ephemeral key per sealed block).
+    pub const PENDING_SEAL_USED: &str = "PendingSealUsed";
     /// The block given to `SealedEnvelope.signBlock` is not the envelope's outer block (other
     /// parents or other payload).
     pub const NOT_OUTER_BLOCK: &str = "NotOuterBlock";

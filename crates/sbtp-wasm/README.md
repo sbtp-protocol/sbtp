@@ -29,10 +29,10 @@ release profile does not set `strip` (it would drop that section).
 |---|---|---|---|
 | `--no-default-features` (layer 0 only) | 139,170 | 78,512 | 23,315 / 5,530 |
 | `--no-default-features --features l2` | 165,304 | 89,918 | 27,029 / 6,133 |
-| default (`seal`, which includes `l2`) | 237,091 | 119,069 | 43,069 / 8,860 |
+| default (`seal`, which includes `l2`) | 244,078 | 122,212 | 46,876 / 9,581 |
 
 Bytes, measured 2026-11-21 after `wasm-opt -Os --strip-debug --strip-producers --strip-target-features`
-(binaryen 133, wasm-bindgen 0.2.130). The full module uses 60 % of the 200,000-byte gzip budget of
+(binaryen 133, wasm-bindgen 0.2.130). The full module uses 61 % of the 200,000-byte gzip budget of
 ADR 0048, so the layer 2 grammar and the sealed envelope ship **in the core module**, behind the
 features `l2` and `seal`, both on by default; there is no second module. An application that needs
 layer 0 only builds with `--no-default-features`. CI checks the default build against the budget
@@ -55,11 +55,12 @@ never coerced: `undefined`, `NaN`, a fraction, a plain `Array` or a negative `bi
 `InvalidArgument`.
 
 Every failure throws an `Error` whose `name` is stable: the spec §2.2 rule (`TooShort`, ...,
-`InvalidSignature`, as in `docs/test-vectors/`) for a validation failure, otherwise `InvalidArgument`,
+`InvalidSignature`, as in `docs/test-vectors/`) for a validation failure (also used by
+`SealPending.finish` for the inner signature: `InvalidPublicKey`, `InvalidSignature`), otherwise `InvalidArgument`,
 `InvalidLength`, `TooManyParents`, `DuplicateParent`, `PayloadTooLong`, `DifficultyTooHigh`,
 `NonceSpaceExhausted`, `KeyMismatch`, `Signing`, `EntropyUnavailable` or `SelfTestFailed`; for layer 2 and
 sealing, `InvalidPayload`, `OpenFailed`, `SealTooLong`, `InvalidRecipientKey`, `ReservedContext`,
-`NotOuterBlock` or `EphemeralKeyUsed`.
+`NotOuterBlock`, `EphemeralKeyUsed` or `PendingSealUsed`.
 
 ```js
 import init, * as sbtp from "./pkg/sbtp_wasm.js";
@@ -126,13 +127,20 @@ outer `sbtp.enc` block is signed by a fresh ephemeral key that never leaves WASM
 const encKey = sbtp.EncKeyPair.generate();     // crypto.getRandomValues
 encKey.publicKey;                              // the x25519 field of sbtp.enc_key
 
-// Sender. `sender` is a DemoSigningKey (see "Remaining limits"); `tag` comes from the application
+// Sender with a DemoSigningKey `sender` (seed in WASM memory); `tag` comes from the application
 // (applicationTag), and `recipientId` is the one the application fixes for that tag.
 const env = sbtp.seal(sender, recipientX25519, recipientId, tag, msg /*, bucket */);
 const block = env.unsignedBlock(BigInt(Date.now()));  // PubKey: the ephemeral key; parent: the tag
 while (sbtp.mineSlice(block, difficulty, 1 << 16) === undefined) { /* in a Worker */ }
 const signed = env.signBlock(block);  // once: the ephemeral key is wiped right after
 env.free();
+
+// Sender whose identity is a non-extractable Web Crypto key: two phases, the signature made outside.
+const pending = sbtp.sealPrepare(identityPublicKey, recipientX25519, recipientId, tag, msg);
+const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, pending.message));
+const env2 = pending.finish(sig);  // verifies sig (strict) before sealing; once only
+pending.free();
+// ...then unsignedBlock, mine, signBlock as above.
 
 // Recipient, on a block that passed validateRequested:
 try {
@@ -153,6 +161,15 @@ try {
 - `allowedKinds` is one string, kinds separated by spaces or commas (a kind never contains either). It
   is not an array on purpose: reading an array runs JS getters while the key is borrowed, and in the
   glue an array-like with a huge `length` can overwrite the instance's memory.
+- `sealPrepare(from, ...)` draws the ephemeral key and returns a `SealPending`; `pending.message` is
+  the exact sealed signature message of `l2-grammar.md` §5.3 (`SBTP-v1-sealed-sig ‖ outer_pubkey ‖
+  recipient_id ‖ recipient_x25519 ‖ msg`), built in WASM by the typed builder. Sign it, and nothing else,
+  with the key of `from`. `pending.finish(signature)` verifies the signature with criteria V1 to V6
+  (`InvalidPublicKey`, `InvalidSignature`) and only then seals. It runs once: the state is consumed even
+  on error (`PendingSealUsed` afterwards; call `sealPrepare` again), except for an argument of the wrong
+  shape. `sealPrepare` returns a class rather than a `{ message, pending }` object on purpose: building a
+  JS object from WASM sets properties, which can run setters of a polluted `Object.prototype`, and a
+  throw there would unwind through WASM frames without wiping the ephemeral key.
 - `signBlock` refuses a block that does not carry the envelope's tag as its only parent and its payload
   (`NotOuterBlock`), so the ephemeral key cannot be made to sign anything else.
 - Tags: `directoryTag(identityPublicKey)`, `isDirectoryTag(publicKey, tag)` (spec §5.5: ignore a key
@@ -172,26 +189,24 @@ computed is discarded and the call throws `EntropyUnavailable`; it never panics.
 ### Secrets: what is wiped, what cannot be
 
 Wiped when the object is freed (call `free()`: garbage collection is neither prompt nor guaranteed):
-the X25519 private key of an `EncKeyPair`, the ephemeral Ed25519 key of a `SealedEnvelope` (also wiped
+the X25519 private key of an `EncKeyPair`, the ephemeral Ed25519 key and the encoded plaintext of a
+`SealPending` (also wiped by `finish`), the ephemeral Ed25519 key of a `SealedEnvelope` (also wiped
 right after its one `signBlock`), and the `msg` and `kind` an `OpenedMessage` holds. The binding's own
-copy of the `msg` argument of `seal` is wiped when `seal` returns. No secret, no `from` and no `msg` appears in a `Debug` output or in
+copy of the `msg` argument of `seal` and `sealPrepare` is wiped when the call returns. No secret, no `from` and no `msg` appears in a `Debug` output or in
 an error message.
 
 Cannot be wiped from WASM:
-- the caller's arguments: `msg` given to `seal`, `secret` given to `EncKeyPair.fromSecret`;
-- every value a getter returns, which is a fresh JS copy: `OpenedMessage.msg`, `.from`, `.kind`, and
+- the caller's arguments: `msg` given to `seal` or `sealPrepare`, `secret` given to `EncKeyPair.fromSecret`;
+- every value a getter returns, which is a fresh JS copy: `SealPending.message` (it contains `msg`),
+  `OpenedMessage.msg`, `.from`, `.kind`, and
   `EncKeyPair.exportSecret()`. `fill(0)` the typed arrays once done; a JS string (`kind`) cannot be
   wiped at all;
 - transient copies inside WASM: moves of the key values into the objects wasm-bindgen allocates, the
   internal temporaries of the HPKE and Ed25519 code, freed heap buffers (best effort, as for
-  `DemoSigningKey`). On the seal side, `sbtp-seal` grows its plaintext buffer while it encodes and pads
-  the item, which leaves copies of `msg` in freed heap memory (review L-1, to be fixed in `sbtp-seal`).
+  `DemoSigningKey`). `sbtp-seal` writes the item into one buffer of the bucket's plaintext length and
+  never resizes it (review L-1, fixed), so no freed buffer of its own holds `msg`.
 
 ### Remaining limits
 
-- The sender's identity key must be a `DemoSigningKey` (its seed in WASM memory): `sbtp_seal::seal`
-  makes the inner signature itself, so a non-extractable Web Crypto identity cannot seal yet. That needs
-  a split of the seal step in `sbtp-seal` (signing bytes out, signature in), as `signingMessage` and
-  `attachSignature` do for blocks.
 - The threat model is unchanged: WASM linear memory is readable by any script of the page. An XSS or a
   malicious dependency can read the X25519 keys and an opened message while they are in memory.
