@@ -48,5 +48,6 @@ cargo run -p sbtp-core --features vector-gen --example gen_vectors -- --check   
 - Everything in the repository is in English; RFC 2119 keywords (MUST, SHOULD, MAY).
 - **Supply chain:** dependencies only through `[workspace.dependencies]` with explicit versions and the
   committed `Cargo.lock`; no `git` dependency, no `path` outside the repository, no crate published less
-  than two weeks ago, no `build.rs` that downloads or executes anything. Only test keys derived from public
+  than two weeks ago (the only exception: the organisation's own npm packages, under ADR 0053 rules 36 to
+  45), no `build.rs` that downloads or executes anything. Only test keys derived from public
   seeds; no key or token in the repository or in logs.

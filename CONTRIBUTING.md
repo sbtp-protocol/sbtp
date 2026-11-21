@@ -56,6 +56,9 @@ Reviews are done per milestone branch (ideally under about 1,500 lines of diff),
 - **Two-week rule:** no crate version published less than 14 days ago, transitive dependencies included
   (`cargo update -p <name> --precise <older>` to pin back). A new cryptography crate requires a security
   review.
+  The only exception is the organisation's own npm packages (`@sbtp/*`), under the bounded conditions of
+  ADR 0053 rules 36 to 45 (CI-only publication, verified provenance, exact pin, reviewed bump, 48-hour
+  cooling delay); every third-party dependency still follows the two-week rule.
 - No `build.rs` that downloads or executes anything.
 - JavaScript tooling (`interop/`, later `web/`): pnpm, exact versions, committed lockfile, the same two-week
   rule, and install scripts disabled next to every `package.json` (`ignoreScripts: true` in
