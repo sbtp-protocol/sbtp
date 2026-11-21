@@ -142,7 +142,7 @@ int_settings! {
     // ADR 0046 rule 24. The low-water bound below the high-water mark is a constraint.
     demand_high_water_pct: 50, 99, Some(90);
     demand_low_water_pct: 10, 98, Some(80);
-    demand_epoch_ms: 14_400_000, 2_592_000_000, Some(86_400_000);
+    demand_epoch_ms: 14_400_000, 2_592_000_000, Some(28_800_000);
     demand_touch_max: 1_024, 16_777_216, Some(16_384);
     // ADR 0049 rule 14. `ingest_bytes_per_hour` is 0 (off) or at least 1 MiB, and
     // `ingest_group56_share_pct` at most `ingest_group_share_pct`: constraints.

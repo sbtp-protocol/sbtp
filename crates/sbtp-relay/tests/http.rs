@@ -797,7 +797,7 @@ fn turning_demand_eviction_on_suspends_across_clean_restarts() {
     let reopened = RedbIndex::open(&index, 1 << 20).unwrap();
     assert!(!reopened.unclean_start());
     let until = reopened.suspended_until();
-    let two_epochs = 2 * 86_400_000;
+    let two_epochs = 2 * 28_800_000;
     assert!(until >= started + two_epochs, "{until} {started}");
     assert!(until <= sbtp_relay::log::unix_ms() + two_epochs);
     assert_eq!(reopened.record_demand_eviction(true).unwrap(), Some(true));
