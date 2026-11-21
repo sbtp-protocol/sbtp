@@ -389,8 +389,10 @@ impl Demand {
         } else if s.previous == Some(false) {
             causes.push((two, "enabled"));
         }
+        // Security review 2026-11-21 pre-push, I-1: a stored end written while the wall clock was
+        // far ahead is capped at two epochs from now; no single cause suspends for longer (D2).
         if s.suspended_until > now {
-            causes.push((s.suspended_until, "restored"));
+            causes.push((s.suspended_until.min(two), "restored"));
         }
         for (until, cause) in causes {
             // Once per start and cause: not throttled, so that every cause is seen.
@@ -678,15 +680,28 @@ mod tests {
         ] {
             assert_eq!(at(s).0, two, "{s:?}");
         }
-        // Restored: kept when later than the others, ignored once ended.
+        // Restored: kept within two epochs of the start, ignored once ended.
         assert_eq!(
             at(StartState {
-                suspended_until: 13 * e,
+                suspended_until: 11 * e,
                 ..base
             })
             .0,
-            13 * e
+            11 * e
         );
+        // Pre-push review I-1: an end written under a wall clock far ahead (here, years) is
+        // capped at two epochs from the start.
+        for far in [13 * e, 10 * e + 1_000 * e, u64::MAX] {
+            assert_eq!(
+                at(StartState {
+                    suspended_until: far,
+                    ..base
+                })
+                .0,
+                two,
+                "{far}"
+            );
+        }
         assert_eq!(
             at(StartState {
                 unclean: true,

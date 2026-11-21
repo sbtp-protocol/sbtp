@@ -8,7 +8,10 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::format_push_string,
+    clippy::maybe_infinite_iter
 )]
 
 mod common;
@@ -16,7 +19,7 @@ mod common;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,7 +40,6 @@ fn serial() -> MutexGuard<'static, ()> {
 /// A relay started by `sbtp_relay::run` on its own thread, stopped (cleanly) on drop.
 struct Node {
     addr: SocketAddr,
-    data: PathBuf,
     stop: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     thread: Option<JoinHandle<Result<(), StartError>>>,
 }
@@ -81,7 +83,6 @@ impl Node {
         match addr_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(addr) => Ok(Self {
                 addr,
-                data: data.to_path_buf(),
                 stop: Some(stop),
                 thread: Some(thread),
             }),
@@ -576,7 +577,7 @@ fn replication_stops_above_the_high_water_mark() {
     let b = Node::start(&data, "127.0.0.1:0", &pairs);
     assert!(wait_until(Duration::from_secs(5), metrics::paused));
     std::thread::sleep(Duration::from_secs(2));
-    assert!(peer.seen().is_empty(), "{:?}", peer.seen());
+    assert_eq!(peer.seen().len(), 0, "{:?}", peer.seen());
     assert!(!b.holds(&id));
     drop(b);
 }
@@ -596,7 +597,7 @@ fn private_addresses_and_redirects_are_refused() {
         || metrics::failed_total(0, Failed::Address) > refused
     ));
     std::thread::sleep(Duration::from_millis(500));
-    assert!(target.seen().is_empty());
+    assert_eq!(target.seen().len(), 0);
     drop(b);
     let b = Node::start(
         &tmp_dir("repl-ssrf-allowed"),
@@ -626,7 +627,7 @@ fn private_addresses_and_redirects_are_refused() {
         || metrics::failed_total(0, Failed::Redirect) > redirects
     ));
     std::thread::sleep(Duration::from_millis(1_500));
-    assert!(elsewhere.seen().is_empty());
+    assert_eq!(elsewhere.seen().len(), 0);
     drop(b);
 }
 

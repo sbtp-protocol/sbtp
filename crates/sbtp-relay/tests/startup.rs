@@ -496,16 +496,17 @@ fn block_ttl_zero_disables_eviction() {
 /// `/metrics` off" of ADR 0027 clarification T1 (limiter entry 192 bytes; per-client tables and
 /// pins 4 × `max_connections` × 64 bytes; log queue 262,144 bytes, ADR 0021 rule 45), plus the
 /// demand set of ADR 0046 rule 25 as laid out (`2 × demand_touch_max` slots of 32 bytes, rounded
-/// up to a power of two, and one flush chunk of 32,768 bytes): 1,081,344 bytes on `small`. The
-/// `small` bound stays under 15 MB. The log bound is the figure of ADR 0021 rule 23.
+/// up to a power of two, and one flush chunk of 32,768 bytes): 1,081,344 bytes on `small`, plus
+/// the network group table of ADR 0049 rule 15 (`ingest_group_max × 160 + 64`): 163,904 bytes on
+/// `small`, 2,621,504 on `standard`, 20,971,584 on `large`. The `small` bound stays under 15 MB. The log bound is the figure of ADR 0021 rule 23.
 #[test]
 fn profiles_set_exactly_the_adr_values() {
     for (name, profile, memory, files, blocking, log_bound) in [
-        ("small", Profile::Small, 14_747_092, 72, 10, 90_071_040),
+        ("small", Profile::Small, 14_910_996, 72, 10, 90_071_040),
         (
             "standard",
             Profile::Standard,
-            109_393_744,
+            112_015_248,
             312,
             26,
             444_149_760,
@@ -513,7 +514,7 @@ fn profiles_set_exactly_the_adr_values() {
         (
             "large",
             Profile::Large,
-            1_291_374_240,
+            1_312_345_824,
             4_176,
             50,
             1_771_560_960,
@@ -788,7 +789,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 56, "one line per setting");
+    assert_eq!(lines.len(), 72, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1163,8 +1164,9 @@ fn difficulty_above_the_network_value_warns() {
     );
 }
 
-/// The memory target of the `small` profile, as a CI gate: the computed worst case of the default
-/// settings stays under 15 MB (ADR 0018 rule 35, ADR 0046 rule 25).
+/// The memory targets of the `small` profile, as CI gates (ADR 0048 budgets; ADR 0018 rule 35):
+/// the computed worst case of the default settings stays under 15,000,000 bytes, and with every
+/// optional function enabled under 20,000,000 bytes.
 #[test]
 fn small_profile_memory_bound_is_under_15_mb() {
     let s = Settings::load(Vec::<OsString>::new(), Vec::new()).unwrap();
@@ -1176,9 +1178,28 @@ fn small_profile_memory_bound_is_under_15_mb() {
     );
 }
 
+/// ADR 0048 rule 3, item 1: a build without the feature refuses `peers` at start-up.
+#[cfg(not(feature = "replication"))]
+#[test]
+fn peers_need_the_replication_feature() {
+    let e = err(&[], &[("PEERS", "https://relay.example")]);
+    assert!(
+        matches!(
+            e,
+            ConfigError::Invalid {
+                setting: "peers",
+                ..
+            }
+        ),
+        "{e}"
+    );
+    assert!(load(&[], &[("PEERS", "")]).is_ok());
+}
+
 /// ADR 0048 rule 3, item 2, and rule 16: `small` with replication on (TLS off) has its own bound,
 /// 16,000,000 bytes (under the owner's 20 MB budget with every function on); the terms count
 /// `replication_max_peers` peers and only when `peers` is not empty.
+#[cfg(feature = "replication")]
 #[test]
 fn small_profile_memory_bound_with_replication_is_under_16_mb() {
     let off = Settings::load(Vec::<OsString>::new(), Vec::new()).unwrap();
@@ -1190,14 +1211,7 @@ fn small_profile_memory_bound_with_replication_is_under_16_mb() {
     assert_eq!(on.profile, Profile::Small);
     assert!(on.replication_on());
     assert!(!off.replication_on());
-    assert_eq!(
-        on.memory_bound_bytes() - off.memory_bound_bytes(),
-        if cfg!(feature = "replication") {
-            723_077
-        } else {
-            0
-        }
-    );
+    assert_eq!(on.memory_bound_bytes() - off.memory_bound_bytes(), 723_077);
     assert!(
         on.memory_bound_bytes() < 16_000_000,
         "{}",
@@ -1206,10 +1220,11 @@ fn small_profile_memory_bound_with_replication_is_under_16_mb() {
 }
 
 /// ADR 0048 rule 15: the profile rows and the policy defaults.
+#[cfg(feature = "replication")]
 #[test]
 fn replication_settings_defaults_and_profiles() {
     let s = load(&[], &[]).unwrap();
-    assert!(s.peers.is_empty());
+    assert_eq!(s.peers.len(), 0);
     assert_eq!(
         s.replication_start,
         sbtp_relay::peers::ReplicationStart::Now
@@ -1271,4 +1286,128 @@ fn replication_settings_defaults_and_profiles() {
     assert!(load(&[], &[("REPLICATION_START", "later")]).is_err());
     assert!(load(&[], &[("REPLICATION_MAX_PEERS", "257")]).is_err());
     assert!(load(&[], &[("REPLICATION_BYTES_PER_HOUR", "1000")]).is_err());
+}
+
+/// Environment pairs (`SBTP_RELAY_` left out).
+type Pairs = &'static [(&'static str, &'static str)];
+
+/// The settings that turn on each optional function of the relay at its `small` defaults, and
+/// the share of the memory bound each one adds over the same settings with it off. A new function
+/// (replication of ADR 0048, the object storage mirror of ADR 0050...) adds its row here; the sum
+/// of all of them stays under the "every function enabled" budget of ADR 0048.
+const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
+    // ADR 0046 rule 25: the demand set and one flush chunk.
+    (
+        "demand eviction",
+        &[("DEMAND_EVICTION", "true")],
+        &[("DEMAND_EVICTION", "false")],
+        1_081_344,
+    ),
+    // ADR 0049 rule 15: the network group table and the global bucket.
+    (
+        "ingest bounds",
+        &[],
+        &[("INGEST_BYTES_PER_HOUR", "0")],
+        163_904,
+    ),
+    // ADR 0048 rule 16: requests in flight, the root store and the peer state, when `peers` is
+    // not empty (TLS client included; server TLS stays off).
+    (
+        "replication",
+        &[("PEERS", "https://relay.example")],
+        &[("PEERS", "")],
+        723_077,
+    ),
+];
+
+/// ADR 0048 budget: `small` with every function of [`FUNCTIONS`] on stays under 20,000,000 bytes,
+/// and each function adds exactly its stated share.
+#[test]
+fn small_profile_with_every_function_is_under_20_mb() {
+    // A build without the `replication` feature refuses `peers` (ADR 0048 rule 3, item 1).
+    let functions: Vec<_> = FUNCTIONS
+        .iter()
+        .filter(|(name, ..)| cfg!(feature = "replication") || *name != "replication")
+        .collect();
+    let on: Vec<(&str, &str)> = functions
+        .iter()
+        .flat_map(|(_, on, _, _)| on.iter().copied())
+        .collect();
+    let all = load(&[], &on).unwrap().memory_bound_bytes();
+    assert!(all < 20_000_000, "{all}");
+    for (name, _, off, share) in functions {
+        let mut without = on.clone();
+        without.extend_from_slice(off);
+        let without = load(&[], &without).unwrap().memory_bound_bytes();
+        assert_eq!(all - without, *share, "{name}");
+    }
+}
+
+/// ADR 0049 rule 14: the ingest settings, their profile rows, ranges from both sources, the
+/// "0 or at least 1 MiB" rule of `ingest_bytes_per_hour` and the `/56 ≤ /48` share constraint.
+#[test]
+fn ingest_settings() {
+    for (name, r, groups) in [
+        ("small", 209_715_200, 1_024),
+        ("standard", 2_147_483_648, 16_384),
+        ("large", 17_179_869_184, 131_072),
+    ] {
+        let s = load(&[], &[("PROFILE", name)]).unwrap();
+        assert_eq!(
+            (s.ingest_bytes_per_hour, s.ingest_group_max),
+            (r, groups),
+            "{name}"
+        );
+        // Policy settings: the same in every profile, not set by it.
+        assert_eq!(
+            (s.ingest_group_share_pct, s.ingest_group56_share_pct),
+            (25, 10)
+        );
+        assert_eq!(s.source("ingest_group_share_pct"), Some(Source::Default));
+    }
+    for (key, refused, accepted) in [
+        (
+            "ingest_bytes_per_hour",
+            &["1", "1048575", "1099511627777"][..],
+            &["0", "1048576", "1099511627776"][..],
+        ),
+        (
+            "ingest_group_max",
+            &["63", "16777217"][..],
+            &["64", "16777216"][..],
+        ),
+        (
+            "ingest_group_share_pct",
+            &["0", "101"][..],
+            &["10", "100"][..],
+        ),
+        (
+            "ingest_group56_share_pct",
+            &["0", "26"][..],
+            &["1", "25"][..],
+        ),
+    ] {
+        for v in refused {
+            for r in both(key, v) {
+                assert!(r.is_err(), "{key} = {v} accepted");
+            }
+        }
+        for v in accepted {
+            for r in both(key, v) {
+                assert!(r.is_ok(), "{key} = {v}: {}", r.unwrap_err());
+            }
+        }
+    }
+    let e = err(
+        &[],
+        &[
+            ("INGEST_GROUP_SHARE_PCT", "20"),
+            ("INGEST_GROUP56_SHARE_PCT", "21"),
+        ],
+    );
+    assert!(
+        matches!(&e, ConfigError::Constraint(m)
+            if m.contains("ingest_group56_share_pct") && m.contains("ingest_group_share_pct")),
+        "{e}"
+    );
 }

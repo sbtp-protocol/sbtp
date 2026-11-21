@@ -1,6 +1,9 @@
 # 0017: Clarifications of the ADR 0013 benchmark protocol
 
 - Status: accepted (by the project owner, 2026-11-18)
+- Amended by: 0048 (owner decision of 2026-11-21 on the size budget, Q-70: the binary threshold of
+  ADR 0013 becomes 8,000,000 bytes and the gate gains an image threshold of 5,000,000 bytes compressed;
+  the memory thresholds are unchanged; set before the gate has run)
 - Date: 2026-11-18
 - Questions: Q-12 (the benchmark verdict is still pending; this ADR does not give it)
 - Amends, if accepted: ADR 0013, section "Benchmark protocol" only (subject, procedure steps 2 to 5,

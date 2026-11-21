@@ -196,6 +196,10 @@ events! {
     ReplicationPeerBackoff => "replication_peer_backoff", Warn, Bounded;
     ReplicationPaused => "replication_paused", Warn, Bounded;
     ReplicationCursorReset => "replication_cursor_reset", Info, Bounded;
+    // ADR 0049 rule 16 (adds two rows to rule 7; the ADR names them without a table, the levels
+    // are this implementation's).
+    IngestCapped => "ingest_capped", Warn, Bounded;
+    IngestCapEnded => "ingest_cap_ended", Info, Bounded;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1173,6 +1177,14 @@ mod tests {
             assert!(adr0048.contains(&format!("`{name}`")), "{name}");
         }
         table.extend_from_slice(&replication);
+        // ADR 0049 rule 16 names two events without a level table: each must appear there.
+        let adr0049 =
+            include_str!("../../../docs/decisions/0049-ingest-bounds-against-disk-filling.md");
+        let ingest = [("ingest_capped", "warn"), ("ingest_cap_ended", "info")];
+        for (name, _) in ingest {
+            assert!(adr0049.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&ingest);
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))

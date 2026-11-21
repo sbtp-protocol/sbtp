@@ -126,9 +126,11 @@ otherwise without `Retry-After`, so that clients try another relay.
   - `unclean_start`: the last stop was not clean: `SIGKILL`, a crash, a power loss, or a drain
     cut by a second signal or by its deadline (requests were still running). Stop with one
     `SIGTERM` and let the drain finish.
-  - `no_history`: the first start after the upgrade that added demand tracking, or an index
-    rebuilt from the block files: the index knows when blocks were accepted, not when they were
-    last read. A new, empty data directory is not suspended.
+  - `no_history`: the first start after an upgrade that added demand tracking or the record of
+    the `demand_eviction` setting (a relay already running the previous build gets this one-off
+    `2 × demand_epoch_ms` suspension once), or an index rebuilt from the block files: the index
+    knows when blocks were accepted, not when they were last read. A new, empty data directory
+    is not suspended.
   - `enabled`: `demand_eviction` was `false` at the previous start, when reads were not recorded.
   - `restored`: a suspension was running at the last clean stop; it keeps its end.
   - `lost` (while running, rate-capped): the demand set was full or a flush failed.
@@ -145,12 +147,114 @@ otherwise without `Retry-After`, so that clients try another relay.
   values; nothing is configured for them. With demand eviction off, the one-year
   `Cache-Control` alone, as before.
 
+## Ingest bounds against disk filling
+
+Valid blocks within the per-client rates can still fill a store and, with demand eviction, push
+out cold legitimate blocks (ADR 0049). The relay bounds the **bytes it stores per hour**, counted
+as quota cost (a block file rounded up to 4 KiB plus its entry charge), with two kinds of token
+bucket. Nothing is recorded about a writer: group buckets live in memory only, and no network,
+address or client key is stored with a block, logged or put in a metric label.
+
+- **Per network group, always on.** Each `PUT` belongs to the IPv6 /56 and /48, or the IPv4 /24,
+  of its client address (the same address as the client key, so `trusted_proxies` and
+  `client_ip_header` must be right). A /48 or a /24 may store `ingest_group_share_pct` (25 %) of
+  `ingest_bytes_per_hour` per hour, a /56 `ingest_group56_share_pct` (10 %), with five minutes of
+  burst. Over its budget a group gets `429 RateLimited` with `Retry-After`, before its body is
+  read; only that group is refused. At most `ingest_group_max` groups are tracked (1,024 on
+  `small`); when the table is full of active groups, a new group passes unchecked
+  (`ingest_group_unchecked_total`) rather than sharing a bucket with a flooder.
+- **Global cap, only under disk pressure.** All `PUT`s together may store
+  `ingest_bytes_per_hour` (200 MiB on `small`, 2 GiB on `standard`, 16 GiB on `large`) per hour,
+  with five minutes of burst. The cap is checked only while the store is at or above
+  `demand_low_water_pct` (80 %) of `max_store_bytes`; a new block over it gets `503 Unavailable`
+  with `Retry-After` of at most 300 s, and nothing is stored. A block the relay already holds
+  still gets `200`; reads and replication are not affected. A re-sent expired or evicted block is
+  a new block.
+- **No latch.** Every refusal ends as the buckets refill with time; nothing is persisted and no
+  restart or operator action is needed. Addresses in `rate_limit_exempt` are neither charged nor
+  refused. `ingest_bytes_per_hour = 0` turns both bounds off.
+
+Normal traffic does not meet these bounds: a relay with 1,000 writers at five times their average
+rate stores about 21 MB/h, a tenth of the `small` budget. Behind a carrier NAT or a shared host,
+one /24 or /48 carries many users; if `ingest_group_limited_total` grows for such a network,
+raise `ingest_group_share_pct`. Behind a proxy that hides client addresses (no
+`client_ip_header`, proxy outside `trusted_proxies`) every client is one group and the whole relay
+is held to one group's share.
+
+**At the CDN edge.** Behind a CDN, also rate-limit `PUT /sbtp/v1/block` at the edge, per client
+address and, where the CDN offers it, per network prefix, so that a flood stops before it reaches
+the origin; the relay's own bounds remain the guarantee (ADR 0049 rule 11). For example, a
+Cloudflare rate limiting rule on `http.request.method eq "PUT" and http.request.uri.path eq
+"/sbtp/v1/block"`, counted per IP, of a few hundred requests per ten minutes, with the action
+"Block" for the rest of the period.
+
+## Replication
+
+A relay can copy blocks from other relays its operator chooses (ADR 0048, pull replication). It
+is compiled into the published binary and image, and **off** until `peers` is set: with the
+default settings nothing is contacted.
+
+```toml
+# Relays to copy from: absolute https URLs, without userinfo, query or fragment, at most
+# replication_max_peers (4 on small, 16 on standard, 64 on large). A peer is never added from
+# anything the relay receives.
+peers = ["https://relay-a.example", "https://relay-b.example/sbtp"]
+# `now` (default): copy what a peer stores from the first time it is seen (minus
+# replication_resync_margin_ms). `all`: its full history, for an archive relay.
+replication_start = "now"
+```
+
+Two operators who list each other hold the same blocks within one poll interval
+(`replication_poll_ms`, 10 s). A loop between relays is harmless: a block the relay holds is
+never fetched again. For each peer the relay walks `/query` with a cursor kept in its index,
+skips the blocks it holds and those below its `min_pow_difficulty` without fetching them,
+fetches the others with `GET` and `Sbtp-Replication: 1`, validates each as a `PUT` body (format,
+timestamp, proof of work, signature, and that it is the requested block) and stores it as a new
+block. A copy is not a read: the source does not count it as demand.
+
+- **Archive relay.** `block_ttl_ms = 0`, `demand_eviction = false` and
+  `replication_start = "all"`; size `max_store_bytes` for the history of every peer.
+- **Bounds** (profile rows): `replication_max_in_flight` requests at a time (1 on `small`),
+  `replication_blocks_per_min` (600) and `replication_bytes_per_hour` (256 MiB) for all peers
+  together, shared round robin. Every request has the body ceilings of ADR 0029 and a total time
+  limit (`replication_request_timeout_ms`, 30 s). The peer's `Retry-After` is obeyed; without it
+  the relay backs off exponentially up to `replication_max_backoff_s` (1 hour) and never gives a
+  peer up. These defaults stay well under a `small` peer's own allowances.
+- **Disk.** Replication stores nothing while the store is above `demand_high_water_pct` (90 %)
+  of `max_store_bytes` (`replication_paused`); the room above the mark stays for clients.
+  Replicated blocks are not charged to the ingest bounds of ADR 0049: replication has its own
+  budget.
+- **Minimum difficulty.** A relay with `peers` set refuses to start with `min_pow_difficulty`
+  above the network difficulty (16).
+- **Memory.** With replication on, the computed bound of `small` grows by 723,077 bytes (bound
+  under 16 MB); it is logged at start-up (`memory_bound`).
+- **Trust roots.** `https` peers are verified with TLS 1.3 against the operating system bundle
+  (`/etc/ssl/certs/ca-certificates.crt` in the image; the first of the usual Debian, RHEL, SUSE
+  and Alpine or macOS paths elsewhere) or, when set, `peer_ca_file` (a PEM file of at most
+  4 MiB). A relay with an `https` peer and no root refuses to start. No redirect is followed.
+- **Private addresses.** A peer name that resolves to a loopback, private, shared (RFC 6598),
+  link-local (cloud metadata), unspecified, multicast or reserved address is not contacted,
+  unless the peer URL is that literal address or `replication_allow_private = true`. Names are
+  resolved for each connection and the checked address is the one connected to. `http` is
+  accepted for a loopback host only (tests).
+- **Logs and metrics** name a peer by its position in `peers`, never by its URL; the `peers`
+  setting line logs the number of peers. Counters: `replication_blocks_stored_total`,
+  `replication_bytes_total`, `replication_skipped_total{reason}` (`held`, `pow`, `invalid`,
+  `not_found`, `future`), `replication_requests_failed_total{status}`,
+  `replication_cursor_resets_total`, gauge `replication_paused`. Events:
+  `replication_peer_backoff`, `replication_paused`, `replication_cursor_reset`, rate-capped.
+
+**Firewall egress.** With `peers` set the relay makes outbound connections: allow TCP 443 (and
+any other port named in `peers`) to the peers' addresses, and DNS. Without `peers` it needs no
+egress at all; keep egress closed then. A host or Kubernetes network policy that allows egress
+only to the listed peers also covers the private-address rule above.
+
 ## Alerts
 
 The counters and gauges worth an alert on a public relay, with plain starting thresholds. They are
-named as in ADR 0046 rule 29 (prefix `sbtp_relay_` once `/metrics` is served); until then, read
-them from the periodic `stats` log line (field in parentheses) and the `demand_stuck` and
-`demand_suspended` events.
+named as in ADR 0046 rule 29 and ADR 0049 rule 16 (prefix `sbtp_relay_` once `/metrics` is
+served); until then, read them from the periodic `stats` log line (field in parentheses) and the
+`demand_stuck`, `demand_suspended` and `ingest_capped` events.
 
 | Signal | Alert when | What it means |
 |---|---|---|
@@ -158,6 +262,10 @@ them from the periodic `stats` log line (field in parentheses) and the `demand_s
 | `demand_evicted_blocks_total` (`demand_evicted`) | grows by more than 10 % of the held blocks in a day | Blocks are pushed out faster than usual: a write flood (security review 2026-11-21, M-2) or a store sized too small. Consider a larger `max_store_bytes` or a `block_ttl_ms` as an outer bound. |
 | `demand_suspended` (`demand_suspended`) | is `1` for longer than `2 × demand_epoch_ms` | A suspension should end after two epochs; one that keeps renewing means demands keep being lost (see `demand_lost_total`) or the relay keeps stopping uncleanly. |
 | `demand_stuck_total` (`demand_stuck` events) | increases on two sweeper runs in a row | Above the high-water mark with nothing to evict: every block is protected (requested or accepted within three epochs), or `cause=index`, the index file alone reaches the low-water mark. Grow `max_store_bytes`. |
+| `ingest_capped_total` (`ingest_capped`; `ingest_capped` and `ingest_cap_ended` events) | increases for 15 minutes | Ingest capped: the store is above the low-water mark and writers use the whole hourly budget, a flood or real growth. Check `ingest_group_limited_total` and the disk. |
+| `ingest_group_limited_total` (`ingest_group_limited`) | increases by more than 100 in 15 minutes | Group limited: one network takes more than its share. Usually a flood; with a carrier NAT, raise `ingest_group_share_pct`. |
+| `ingest_group_unchecked_total` (`ingest_group_unchecked`) | increases | Group table full: many networks write at once and new groups pass unchecked (ADR 0049 rule 5), possibly a many-network flood (Q-71). |
+| `demand_evicted_blocks_total` while `demand_coldest_ms` is less than 7 days old | increases | Eviction of recent blocks: blocks requested within the week are evicted; the store is too small for its traffic, or a flood. |
 | `demand_lost_total` (`demand_lost`) | increases at all | A demand could not be recorded (set full, or an index write failed); each loss suspends demand eviction for two epochs. Repeated losses point at index write errors (`index_write_errors_total`) or at `demand_touch_max` too small for the read rate. |
 
 ## Pulling the CI image

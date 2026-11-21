@@ -45,6 +45,14 @@ const EST_READ_WORKING_SET: u64 = 100 * 1024;
 /// buckets per key, each with its control byte) and two elements of the order of full times
 /// (B-tree nodes about half full). Guarded by a `size_of` test in `limiter.rs`.
 pub(crate) const EST_LIMITER_ENTRY: u64 = 192;
+/// ADR 0049 rule 15: one entry of the network group table (`ingest.rs`), with the formula of ADR
+/// 0027 clarification T1 (map element of 40 bytes in a map at most half full, two order elements
+/// of 32 bytes): at most 146 bytes. Guarded by a `size_of` test in `ingest.rs`.
+pub(crate) const EST_GROUP_ENTRY: u64 = 160;
+/// ADR 0049 rule 15: the global bucket and the two counters of rule 6.
+const EST_INGEST_FIXED: u64 = 64;
+/// ADR 0049 rule 14: the smallest `ingest_bytes_per_hour` other than 0 (off).
+const MIN_INGEST_BYTES_PER_HOUR: u64 = 1_048_576;
 /// One key of a per-client count table (`client::Counts`): a `(ClientKey, u32)` bucket of 24
 /// bytes, its control byte, and a table at most half full after growth. Not measured.
 const EST_CLIENT_COUNT_ENTRY: u64 = 64;
@@ -146,12 +154,18 @@ int_settings! {
     replication_request_timeout_ms: 1_000, 300_000, Some(30_000);
     replication_max_backoff_s: 1, 86_400, Some(3_600);
     replication_resync_margin_ms: 0, 86_400_000, Some(3_600_000);
+    // ADR 0049 rule 14. `ingest_bytes_per_hour` is 0 (off) or at least 1 MiB, and
+    // `ingest_group56_share_pct` at most `ingest_group_share_pct`: constraints.
+    ingest_bytes_per_hour: 0, 1_099_511_627_776, Some(209_715_200);
+    ingest_group_max: 64, 16_777_216, Some(1_024);
+    ingest_group_share_pct: 1, 100, Some(25);
+    ingest_group56_share_pct: 1, 100, Some(10);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 24] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 26] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -179,6 +193,9 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 24] = [
     ("replication_max_in_flight", [4, 16]),
     ("replication_blocks_per_min", [3_000, 12_000]),
     ("replication_bytes_per_hour", [2 << 30, 16 << 30]),
+    // ADR 0049 rule 14 (amends rule 37).
+    ("ingest_bytes_per_hour", [2_147_483_648, 17_179_869_184]),
+    ("ingest_group_max", [16_384, 131_072]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -482,6 +499,14 @@ pub struct Settings {
     pub replication_request_timeout_ms: u64,
     pub replication_max_backoff_s: u64,
     pub replication_resync_margin_ms: u64,
+    // ADR 0049 rule 14.
+    /// `R`, the stored bytes per hour of the global cap; 0 turns ADR 0049 rules 2 to 7 off.
+    pub ingest_bytes_per_hour: u64,
+    pub ingest_group_max: u64,
+    /// The share of `R` of an IPv6 /48 or an IPv4 /24, in percent.
+    pub ingest_group_share_pct: u64,
+    /// The share of `R` of an IPv6 /56, in percent.
+    pub ingest_group56_share_pct: u64,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -809,6 +834,10 @@ impl Settings {
             replication_request_timeout_ms: v(ints.replication_request_timeout_ms),
             replication_max_backoff_s: v(ints.replication_max_backoff_s),
             replication_resync_margin_ms: v(ints.replication_resync_margin_ms),
+            ingest_bytes_per_hour: v(ints.ingest_bytes_per_hour),
+            ingest_group_max: v(ints.ingest_group_max),
+            ingest_group_share_pct: v(ints.ingest_group_share_pct),
+            ingest_group56_share_pct: v(ints.ingest_group56_share_pct),
             sources,
         };
         s.check_constraints()?;
@@ -909,7 +938,11 @@ impl Settings {
             replication_poll_ms,
             replication_request_timeout_ms,
             replication_max_backoff_s,
-            replication_resync_margin_ms
+            replication_resync_margin_ms,
+            ingest_bytes_per_hour,
+            ingest_group_max,
+            ingest_group_share_pct,
+            ingest_group56_share_pct
         )
     }
 
@@ -1142,6 +1175,20 @@ impl Settings {
                 self.demand_low_water_pct, self.demand_high_water_pct
             )));
         }
+        // ADR 0049 rule 14.
+        if self.ingest_bytes_per_hour != 0 && self.ingest_bytes_per_hour < MIN_INGEST_BYTES_PER_HOUR
+        {
+            return Err(ConfigError::Constraint(format!(
+                "ingest_bytes_per_hour ({}) must be 0 (off) or at least {MIN_INGEST_BYTES_PER_HOUR}",
+                self.ingest_bytes_per_hour
+            )));
+        }
+        if self.ingest_group56_share_pct > self.ingest_group_share_pct {
+            return Err(ConfigError::Constraint(format!(
+                "ingest_group56_share_pct ({}) must not exceed ingest_group_share_pct ({})",
+                self.ingest_group56_share_pct, self.ingest_group_share_pct
+            )));
+        }
         // ADR 0018 clarification M5 (ADR 0027 rule 4): at most `max_connections` keys are pinned,
         // so at least half of the limiter table can always be dropped once full. The message
         // names both settings and their effective values.
@@ -1263,6 +1310,15 @@ impl Settings {
                 )
             } else {
                 0
+            },
+            // ADR 0049 rule 15: the network group table, allocated once at start-up, and the
+            // global bucket; nothing when `ingest_bytes_per_hour` is 0.
+            if self.ingest_bytes_per_hour == 0 {
+                0
+            } else {
+                self.ingest_group_max
+                    .saturating_mul(EST_GROUP_ENTRY)
+                    .saturating_add(EST_INGEST_FIXED)
             },
         ]
         .into_iter()
@@ -1612,9 +1668,9 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 52 integer settings plus the 16 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
-        // 0046 and 0048.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 68);
+        // 56 integer settings plus the 16 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
+        // 0046, 0048 and 0049.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 72);
     }
 
     /// ADR 0044 rule 1: a field name of 1 to 64 token bytes, kept lowercase; the two address

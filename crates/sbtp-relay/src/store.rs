@@ -649,8 +649,8 @@ impl Store {
     }
 
     /// The sweeper's deletion of the file of `id` (ADR 0013 rule 15): `unlink` of the final name,
-    /// then its quota cost is released. Returns whether a file was there; a missing file is not an
-    /// error (the step is idempotent). A symbolic link or another non-regular entry under the
+    /// then its quota cost is released. Returns the quota bytes released, or `None` when no file
+    /// was there; a missing file is not an error (the step is idempotent). A symbolic link or another non-regular entry under the
     /// final name is unlinked without being followed and releases nothing: only regular files are
     /// counted (`reconcile`). The shard directory is not `fsync`ed: a deletion lost in a crash
     /// leaves the file, which the start-up walk re-indexes from its modification time and the next
@@ -660,23 +660,22 @@ impl Store {
     ///
     /// Operating-system errors; a shard directory that is missing or not a real directory (ADR
     /// 0025 rule 6, [`is_shard_error`]).
-    pub fn evict(&self, id: &BlockId) -> io::Result<bool> {
+    pub fn evict(&self, id: &BlockId) -> io::Result<Option<u64>> {
         check_shard(self.shard_dir(id))?;
         let path = self.path(id);
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
         match fs::remove_file(&path) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         }
-        if meta.is_file() {
-            self.release(cost(meta.len()));
-        }
-        Ok(true)
+        let freed = if meta.is_file() { cost(meta.len()) } else { 0 };
+        self.release(freed);
+        Ok(Some(freed))
     }
 
     /// The stored bytes of `id`, or `None` if no file is held. At most `MAX_BLOCK_LEN + 1` bytes

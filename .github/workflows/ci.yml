@@ -69,6 +69,66 @@ jobs:
       - name: Frozen test vectors intact
         run: cargo run -p sbtp-core --features vector-gen --example gen_vectors --locked -- --check
 
+  # The budgets of ADR 0048 ("Budgets"). Each step prints its measure, so a growth is visible
+  # before it fails. No new tool is installed: the binary and the image are built by
+  # deploy/Dockerfile (base images pinned by digest) on the runner's Docker daemon, the image size
+  # is computed from `docker save` with python3, and the WASM figure is an upper bound computed
+  # from the cargo output (web/wasm-budget.py), so neither the wasm-bindgen CLI nor binaryen is
+  # downloaded here.
+  budgets:
+    name: budgets (binary, image, memory, wasm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MAX_RELAY_BINARY_BYTES: "8000000"
+      MAX_RELAY_IMAGE_BYTES: "5000000"
+      MAX_CORE_WASM_GZIP_BYTES: "200000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+
+      # The shipped binary: static x86_64 musl, release profile, built by the `export` stage of
+      # deploy/Dockerfile exactly as the image builds it.
+      - name: Relay binary under 8,000,000 bytes
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -f deploy/Dockerfile --target export \
+            --output type=local,dest=dist .
+          size="$(stat -c %s dist/sbtp-relay)"
+          echo "sbtp-relay (x86_64 musl, release): $size bytes (budget: below $MAX_RELAY_BINARY_BYTES)"
+          if [ "$size" -ge "$MAX_RELAY_BINARY_BYTES" ]; then
+            echo "::error::relay binary is $size bytes, budget is below $MAX_RELAY_BINARY_BYTES"
+            exit 1
+          fi
+
+      # The same image as relay-image.yml; its build stage is reused from the step above.
+      - name: Relay image under 5,000,000 bytes compressed
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -f deploy/Dockerfile -t sbtp-relay:budget .
+          sh deploy/image-size.sh sbtp-relay:budget "$MAX_RELAY_IMAGE_BYTES"
+
+      # The computed memory bound of ADR 0018 rule 35 on `small`: below 15,000,000 bytes with the
+      # defaults, below 20,000,000 with every function enabled (crates/sbtp-relay/tests/startup.rs).
+      - name: Memory bound of the small profile
+        run: cargo test -p sbtp-relay --test startup --locked -- small_profile_ --nocapture
+
+      # Upper bound of web/pkg/sbtp_wasm_bg.wasm (web/build.sh): the cargo output without its
+      # custom sections, before wasm-bindgen and wasm-opt, which only shrink it.
+      - name: Core wasm under 200,000 bytes gzip
+        run: |
+          set -euo pipefail
+          cargo build -p sbtp-wasm --target wasm32-unknown-unknown --release --locked
+          python3 -I web/wasm-budget.py \
+            target/wasm32-unknown-unknown/release/sbtp_wasm.wasm "$MAX_CORE_WASM_GZIP_BYTES"
+
   deny:
     name: cargo deny (workspace and fuzz)
     runs-on: ubuntu-24.04

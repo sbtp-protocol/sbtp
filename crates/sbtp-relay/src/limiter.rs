@@ -101,16 +101,19 @@ impl Entry {
 ///
 /// Keys are hashed with the standard `RandomState` (`SipHash` with a random key), so a client
 /// cannot choose keys that collide.
+///
+/// `V` is the entry of a key: the three buckets of a client key here, one byte bucket of a network
+/// group in the second limiter table of ADR 0049 rule 5 ([`crate::ingest`]).
 #[derive(Debug)]
-struct KeyTable {
-    slots: Vec<Option<(ClientKey, Entry)>>,
+pub(crate) struct KeyTable<V> {
+    slots: Vec<Option<(ClientKey, V)>>,
     len: usize,
     hasher: RandomState,
 }
 
-impl KeyTable {
+impl<V: Copy> KeyTable<V> {
     /// Room for `max` keys: `2 × max` slots, allocated now.
-    fn with_room(max: usize) -> Result<Self, TryReserveError> {
+    pub(crate) fn with_room(max: usize) -> Result<Self, TryReserveError> {
         let n = max.saturating_mul(2).max(2);
         let mut slots = Vec::new();
         slots.try_reserve_exact(n)?;
@@ -122,7 +125,7 @@ impl KeyTable {
         })
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
@@ -157,12 +160,12 @@ impl KeyTable {
         }
     }
 
-    fn get(&self, key: &ClientKey) -> Option<&Entry> {
+    pub(crate) fn get(&self, key: &ClientKey) -> Option<&V> {
         let i = self.find(key)?;
         self.slots.get(i)?.as_ref().map(|(_, e)| e)
     }
 
-    fn get_mut(&mut self, key: &ClientKey) -> Option<&mut Entry> {
+    pub(crate) fn get_mut(&mut self, key: &ClientKey) -> Option<&mut V> {
         let i = self.find(key)?;
         self.slots.get_mut(i)?.as_mut().map(|(_, e)| e)
     }
@@ -172,7 +175,7 @@ impl KeyTable {
     /// table already holding `max` keys (never reached, security review of 1c-limits, I-4) it
     /// stores nothing and returns `false`.
     #[must_use]
-    fn insert(&mut self, key: ClientKey, e: Entry) -> bool {
+    pub(crate) fn insert(&mut self, key: ClientKey, e: V) -> bool {
         if self.len >= self.slots.len() / 2 {
             return false;
         }
@@ -192,7 +195,7 @@ impl KeyTable {
 
     /// Removes `key`, then moves back the keys of its cluster that the hole would make
     /// unreachable (backward shift), so that every key stays reachable from its home slot.
-    fn remove(&mut self, key: &ClientKey) -> Option<Entry> {
+    pub(crate) fn remove(&mut self, key: &ClientKey) -> Option<V> {
         let mut hole = self.find(key)?;
         let (_, removed) = self.slots.get_mut(hole)?.take()?;
         self.len -= 1;
@@ -212,20 +215,20 @@ impl KeyTable {
 
     /// Every key and entry (tests).
     #[cfg(test)]
-    fn iter(&self) -> impl Iterator<Item = (&ClientKey, &Entry)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ClientKey, &V)> {
         self.slots.iter().flatten().map(|(k, e)| (k, e))
     }
 
     /// The number of slots (tests): it never changes after [`KeyTable::with_room`].
     #[cfg(test)]
-    fn slots(&self) -> usize {
+    pub(crate) fn slots(&self) -> usize {
         self.slots.len()
     }
 }
 
 #[derive(Debug)]
 struct Table {
-    map: KeyTable,
+    map: KeyTable<Entry>,
     /// ADR 0027 rule 2: `(full time, key)` of every key of `map` that has no unit in flight.
     order: BTreeSet<(u64, ClientKey)>,
     /// ADR 0019 rule 31, ADR 0027 rule 4: units in flight per key (connections of a direct peer,

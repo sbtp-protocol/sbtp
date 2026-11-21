@@ -59,6 +59,43 @@ Initial public version. Pre-release software: no version is supported for produc
 - CI (`.github/workflows/`, `docs/ci.md`): the `CONTRIBUTING.md` checks on every push and pull request
   to `main`; a relay image built by CI and pushed to `ghcr.io/sbtp-protocol/sbtp-relay` on `relay-v*`
   tags, deployed by digest. Actions pinned by commit SHA, read-only token outside the image job.
+- CI job `budgets` (ADR 0048 budgets): the static musl relay binary under 8,000,000 bytes, the relay
+  image under 5,000,000 bytes compressed (also checked in `relay-image.yml` before the push), the
+  computed `small` memory bound under 15,000,000 bytes with the defaults and 20,000,000 with every
+  function on, and the core WASM under 200,000 bytes gzip (an upper bound from the cargo output,
+  `web/wasm-budget.py`). No new tool is installed.
+- `sbtp-relay`: ingest bounds against disk filling (ADR 0049). Stored bytes per hour are bounded per
+  network group, always: an IPv6 /56 (10 % of `ingest_bytes_per_hour`), an IPv6 /48 or an IPv4 /24
+  (25 %); a group over its budget gets `429` with `Retry-After` before its body is read, and only that
+  group is refused. Group buckets live in a second limiter table of `ingest_group_max` entries (ADR
+  0027 design, fail open when full, no shared overflow group). Above the low-water mark, a global
+  cap of `ingest_bytes_per_hour` (200 MiB on `small`) answers `503` with `Retry-After` of at most
+  300 s to new blocks; held blocks still get `200`. Nothing latches and no network origin is stored
+  with a block. New settings `ingest_bytes_per_hour`, `ingest_group_max` (profile rows),
+  `ingest_group_share_pct`, `ingest_group56_share_pct`; new counters and gauges `ingest_*`, events
+  `ingest_capped` and `ingest_cap_ended`; `deploy/README.md` gains the ingest section, a CDN edge
+  rule and the alerts of ADR 0049 rule 12. Computed `small` memory bound: 14,910,996 bytes.
+- `sbtp-relay`: pull replication built into the relay (ADR 0048 stage 1), default Cargo feature
+  `replication`, off at run time unless `peers` is set. Per peer the relay walks `/query` with a
+  cursor kept in a new index table (`replication_peers`), skips held blocks and identifiers below
+  `min_pow_difficulty` without fetching them, fetches the others with `Sbtp-Replication: 1`,
+  validates each as a `PUT` body plus R1 and stores it through the `PUT` storage step (never charged
+  to the ADR 0049 ingest bounds). `InvalidCursor` restarts the walk from the last complete page
+  minus `replication_resync_margin_ms`. Bounds: `replication_max_in_flight`,
+  `replication_blocks_per_min`, `replication_bytes_per_hour` (profile rows), round robin turns,
+  ADR 0029 body ceilings, a total time limit, the peer's `Retry-After`, exponential back-off, a
+  pause above the high-water mark. Outbound TLS 1.3 with rustls and `ring` against the operating
+  system bundle or `peer_ca_file`; no redirect followed; resolved private, loopback and link-local
+  addresses refused unless `replication_allow_private`. New settings `peers`, `replication_start`,
+  `replication_allow_private`, `peer_ca_file`, `replication_max_peers`,
+  `replication_max_in_flight`, `replication_blocks_per_min`, `replication_bytes_per_hour`,
+  `replication_poll_ms`, `replication_request_timeout_ms`, `replication_max_backoff_s`,
+  `replication_resync_margin_ms`; counters `replication_*`; events `replication`,
+  `replication_peer_backoff`, `replication_paused`, `replication_cursor_reset`. New dependencies:
+  `rustls` 0.23.46, `tokio-rustls` 0.26.6 (and through them `ring` 0.17.14, `rustls-webpki`
+  0.103.16, `rustls-pki-types` 1.15.1, `untrusted` 0.9.0); `httparse` becomes a direct dependency.
+  Computed `small` memory bound with replication on: 15,634,073 bytes. `deploy/README.md` gains a
+  "Replication" section.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
 
@@ -133,6 +170,16 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- Pre-push security review 2026-11-21 (`docs/security/2026-11-21-pre-push-eviction-fixes-web-0047.md`):
+  - `sbtp-relay`: a demand pass no longer ends after one deletion when `PUT`s or index growth move
+    the admission total during it; a deletion ends the pass only when it released no quota bytes
+    (L-1);
+  - `sbtp-relay`: a suspension restored at start-up is capped at `2 × E` from the start, so that an
+    end written under a wall clock far ahead cannot suspend demand eviction for years (I-1);
+  - web client: a relay-supplied error name keeps only `[A-Za-z0-9_-]` before it is stored or
+    shown (I-2);
+  - `deploy/README.md`: the `no_history` cause also covers the one-off suspension of a relay
+    upgraded from the previous build (I-5).
 - `sbtp-relay`, demand eviction (security review 2026-11-21, ADR 0046 clarifications D1 to D6):
   - a start with no demand history (first start after the upgrade, an index rebuilt from the block
     files) and every change of `demand_eviction` from off to on now suspend demand eviction for

@@ -290,6 +290,15 @@ static DEMAND_TOUCH_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static DEMAND_COLDEST_MS: AtomicU64 = AtomicU64::new(0);
 /// `block_not_modified_total`: `304` answers of `/block`.
 static BLOCK_NOT_MODIFIED: AtomicU64 = AtomicU64::new(0);
+
+// ADR 0049 rule 16.
+static INGEST_BYTES: AtomicU64 = AtomicU64::new(0);
+static INGEST_CAPPED: AtomicU64 = AtomicU64::new(0);
+static INGEST_GROUP_LIMITED: [AtomicU64; 3] = zeros();
+static INGEST_GROUP_UNCHECKED: AtomicU64 = AtomicU64::new(0);
+static INGEST_CAP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static INGEST_BUCKET_BYTES: AtomicU64 = AtomicU64::new(0);
+static INGEST_GROUP_ENTRIES: AtomicU64 = AtomicU64::new(0);
 // HOOK(1c-b): `storage_full_total` reasons `disk`, `inodes`, `read_only`; `store_max_bytes`,
 // `disk_free_bytes`, `disk_state`, `build_info`; `log_lines_total{level}` and
 // `log_lines_dropped_total{event, cause}` (kept by the logger, `log::Logger::dropped`).
@@ -631,6 +640,76 @@ pub fn demand_snapshot() -> [(&'static str, u64); 11] {
     ]
 }
 
+/// Counts `bytes` charged to the global bucket of ADR 0049 rule 6, and sets the
+/// `ingest_bucket_bytes` gauge to `level` (0 at or below zero).
+pub fn ingest_bytes(bytes: u64, level: u64) {
+    INGEST_BYTES.fetch_add(bytes, Relaxed);
+    INGEST_BUCKET_BYTES.store(level, Relaxed);
+}
+
+/// Counts a `503` of the global cap (ADR 0049 rule 6).
+pub fn ingest_capped() {
+    INGEST_CAPPED.fetch_add(1, Relaxed);
+}
+
+/// Counts a `429` of a group budget (ADR 0049 rule 4).
+pub fn ingest_group_limited(level: crate::ingest::GroupLevel) {
+    let i = crate::ingest::GroupLevel::ALL
+        .iter()
+        .position(|l| *l == level)
+        .unwrap_or(0);
+    if let Some(n) = INGEST_GROUP_LIMITED.get(i) {
+        n.fetch_add(1, Relaxed);
+    }
+}
+
+/// Counts a `PUT` with a group not checked because the group table is full (ADR 0049 rule 5).
+pub fn ingest_group_unchecked() {
+    INGEST_GROUP_UNCHECKED.fetch_add(1, Relaxed);
+}
+
+/// Sets the `ingest_cap_active` and `ingest_bucket_bytes` gauges.
+pub fn set_ingest_cap(active: bool, level: u64) {
+    INGEST_CAP_ACTIVE.store(u64::from(active), Relaxed);
+    INGEST_BUCKET_BYTES.store(level, Relaxed);
+}
+
+/// Sets the `ingest_group_entries` gauge.
+pub fn set_ingest_group_entries(n: u64) {
+    INGEST_GROUP_ENTRIES.store(n, Relaxed);
+}
+
+/// The ingest counters and gauges, by their ADR 0049 rule 16 names (tests, `/metrics` later).
+/// `ingest_group_limited_total` is one series per `level`, in the order of
+/// [`crate::ingest::GroupLevel::ALL`].
+#[must_use]
+pub fn ingest_snapshot() -> [(&'static str, u64); 9] {
+    let [l56, l48, l24] = &INGEST_GROUP_LIMITED;
+    [
+        ("ingest_bytes_total", INGEST_BYTES.load(Relaxed)),
+        ("ingest_capped_total", INGEST_CAPPED.load(Relaxed)),
+        (
+            "ingest_group_limited_total{level=\"v6_56\"}",
+            l56.load(Relaxed),
+        ),
+        (
+            "ingest_group_limited_total{level=\"v6_48\"}",
+            l48.load(Relaxed),
+        ),
+        (
+            "ingest_group_limited_total{level=\"v4_24\"}",
+            l24.load(Relaxed),
+        ),
+        (
+            "ingest_group_unchecked_total",
+            INGEST_GROUP_UNCHECKED.load(Relaxed),
+        ),
+        ("ingest_cap_active", INGEST_CAP_ACTIVE.load(Relaxed)),
+        ("ingest_bucket_bytes", INGEST_BUCKET_BYTES.load(Relaxed)),
+        ("ingest_group_entries", INGEST_GROUP_ENTRIES.load(Relaxed)),
+    ]
+}
+
 /// `demand_lost_total` since start-up.
 #[must_use]
 pub fn demand_lost_total() -> u64 {
@@ -737,6 +816,12 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("demand_lost", DEMAND_LOST.load(Relaxed)),
         ("demand_suspended", DEMAND_SUSPENDED.load(Relaxed)),
         ("not_modified", BLOCK_NOT_MODIFIED.load(Relaxed)),
+        ("ingest_capped", INGEST_CAPPED.load(Relaxed)),
+        ("ingest_group_limited", sum(&INGEST_GROUP_LIMITED)),
+        (
+            "ingest_group_unchecked",
+            INGEST_GROUP_UNCHECKED.load(Relaxed),
+        ),
         // HOOK(1c-b): `disk_free_bytes`, `disk_state`.
         ("accept_errors", sum(&ACCEPT_ERRORS)),
         ("index_write_errors", sum(&INDEX_WRITE_ERRORS)),

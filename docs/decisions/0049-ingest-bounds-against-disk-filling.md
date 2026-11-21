@@ -1,8 +1,10 @@
 # 0049: Ingest bounds against disk filling: byte budgets per network group, a global cap under disk pressure
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21), as proposed, with its defaults: a global cap of
+  200 MiB per hour on `small`, checked only above the low-water mark; per-network shares of 25 % (/48,
+  IPv4 /24) and 10 % (/56)
 - Date: 2026-11-21
-- Questions: Q-71 (opened: many-network floods and a higher PoW above a share)
+- Questions: Q-71 (opened: many-network floods and a higher PoW above a share; stays open)
 - Amends: ADR 0018 rule 35 (one term in the memory bound); ADR 0019 rules 37 and 38 (profile rows and
   policy settings); ADR 0021 rule 41 (counters and gauges). Nothing else in these ADRs changes
 - Depends on: ADR 0013 rule 18 and ADR 0025 (stored total), ADR 0018 rules 20 and 21 (client key,
@@ -140,7 +142,9 @@ judged as a defence and as a lever (see "Self-blocking analysis").
     `ingest_group_max × 160 + 64` (the global bucket and the two counters of rule 6). `small`:
     163,904 bytes. On top of the computed `small` bound at `7caedba` (14,747,092 bytes) it gives
     14,910,996 bytes, 89,004 bytes under 15,000,000. `standard`: 2.6 MiB; `large`: 20 MiB. A unit test
-    asserts the per-entry estimate as ADR 0027 clarification T1 does.
+    asserts the per-entry estimate as ADR 0027 clarification T1 does. The term is always on, so it counts
+    in the 15 MB budget of `small` with the default settings (ADR 0048 rule 3, item 2, as amended by the
+    owner on 2026-11-21).
 16. **Metrics** (prefix `sbtp_relay_`, ADR 0021 rule 41). No label names a client or a network.
 
     | Name | Kind | Labels |
@@ -236,6 +240,8 @@ the negative level; the charge counted once per stored block under concurrent `P
 `block_id`; the `small` memory bound; no client or network in logs or metrics.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 Core spec §4, "Admission control", the `429` bullet, after "are one client.":
 

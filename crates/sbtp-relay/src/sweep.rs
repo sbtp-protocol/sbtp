@@ -390,14 +390,16 @@ pub(crate) fn demand_apply<I: IndexBackend + 'static>(
             // Re-accepted, demanded since the listing, gone, or unknown: kept for this run.
             _ => continue,
         }
-        let before = store.admission_total();
         match relay.evict_locked(&id) {
-            Ok(deleted) => {
+            Ok(freed) => {
                 done.push(c.position);
                 bytes = bytes.saturating_add(u64::from(c.len));
                 // D6: a deletion that did not lower the stored total ends the run. A row whose
-                // file was already gone deleted nothing: its entries go, the run goes on.
-                if deleted && store.admission_total() >= before {
+                // file was already gone deleted nothing: its entries go, the run goes on. Judged
+                // on the quota bytes the deletion released, not on a total read before and after
+                // it, which concurrent `PUT`s and index growth move (security review 2026-11-21
+                // pre-push, L-1).
+                if freed == Some(0) {
                     break;
                 }
             }
@@ -1411,6 +1413,43 @@ mod demand_tests {
             Some("60"),
             "the suspension ended"
         );
+    }
+
+    /// D6 and security review 2026-11-21 pre-push, L-1: `PUT`s accepted while the pass deletes
+    /// (here, a block file written by the store right after each deletion, as a concurrent `PUT`
+    /// of another block does) do not end the pass: only a deletion that released no quota bytes
+    /// does. Before the fix, the pass stopped after its first deletion.
+    #[tokio::test]
+    async fn concurrent_puts_do_not_end_the_pass() {
+        static NOW: AtomicU64 = AtomicU64::new(T0);
+        fn now() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let f = fixture("concurrent-put", now, &[]);
+        let ids = fill(&f, 0, &NOW).await;
+        NOW.store(T0 + 10 * E, Ordering::SeqCst);
+        let relay = Arc::clone(&f.relay);
+        let written = Arc::new(AtomicU64::new(0));
+        let w = Arc::clone(&written);
+        f.relay.set_after_evict(move || {
+            let n = w.fetch_add(1, Ordering::SeqCst);
+            if n < 3 {
+                let (bytes, _) = block(10_000 + u32::try_from(n).unwrap(), 60_000, &[]);
+                let parsed = sbtp_core::parse(&bytes).unwrap();
+                let valid = parsed.check_pow(0).unwrap().verify_signature().unwrap();
+                assert!(matches!(
+                    relay.store().write_new(&valid),
+                    Ok(store::Stored::Created)
+                ));
+            }
+        });
+        let removed = sweep(&f).await.unwrap();
+        assert!(written.load(Ordering::SeqCst) >= 3);
+        assert!(
+            removed > 3,
+            "the pass went on after the concurrent writes: {removed}"
+        );
+        assert!(ids.iter().filter(|id| !held(&f, id)).count() > 3);
     }
 
     /// D6: when the index part alone is at or above the low-water mark, the sweeper deletes no
