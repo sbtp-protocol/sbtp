@@ -520,6 +520,8 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
   It MUST NOT treat it as proof that the block is invalid or absent elsewhere.
 - A client that receives `451` for a block it publishes treats it as a final refusal by that relay,
   continues with its other relays, and MUST NOT send that block to that relay again automatically.
+  When that relay had already acknowledged the block, the `451` changes the block's availability on
+  that relay, not its delivery: see "Client bounds".
   After `DeniedKey` it MUST NOT send any block signed by that key to that relay automatically. A user
   action MAY. A client MUST NOT create a new block automatically because of a `451`.
 - A re-submission after a missing block follows a `404` to a single `GET` or `HEAD`, never a
@@ -589,6 +591,9 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
   the list is still pending for it. It drops blocks fetched from relays first, then own blocks that
   are not protected. Only to store a new own block, it MAY drop a block of the second kind, oldest
   first acknowledgement first. (ADR 0029, ADR 0047)
+- A relay that acknowledged a block and later answers `451` to a `GET` or `HEAD` of it stays
+  acknowledged, but no longer counts as holding the block for this protection, nor as pending for it.
+  The bounded time since the block's first acknowledgement does not restart. (ADR 0047, ADR 0052)
 - A relay stops being pending for a block when it acknowledges it; when it refuses it with an answer
   that does not change on a repeat (`400` other than `TimestampTooFarInFuture`, `413`, `422`, a
   `3xx`, another `4xx` other than `408` and `429`); when the client has made a bounded number of
