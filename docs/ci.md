@@ -4,8 +4,8 @@ Two GitHub Actions workflows, in `.github/workflows/`.
 
 | Workflow | Runs on | What it does | Token permissions |
 |---|---|---|---|
-| `ci.yml` | push and pull request to `main` | The `CONTRIBUTING.md` checks: `fmt`, `clippy -D warnings`, tests, the `no_std` build, the wasm32 build, the frozen-vector check (job `check`); `cargo deny` on the workspace and on `fuzz/` (job `deny`) | `contents: read` |
-| `relay-image.yml` | push of a `relay-v*` tag; manual dispatch from `main` | Builds `deploy/Dockerfile` for `linux/amd64`, smoke-tests the image, pushes it to `ghcr.io/sbtp-protocol/sbtp-relay`, writes the digest to the job summary, and attests its build provenance once the repository is public | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` (that job only) |
+| `ci.yml` | push and pull request to `main` | The `CONTRIBUTING.md` checks: `fmt`, `clippy -D warnings`, tests, the `no_std` build, the wasm32 build, the frozen-vector check (job `check`); `cargo deny` on the workspace and on `fuzz/` (job `deny`); the ADR 0048 budgets (job `budgets`: relay binary, relay image, `small` memory bound, core WASM) | `contents: read` |
+| `relay-image.yml` | push of a `relay-v*` tag; manual dispatch from `main` | Builds `deploy/Dockerfile` for `linux/amd64`, smoke-tests the image, checks its compressed size against the ADR 0048 budget, pushes it to `ghcr.io/sbtp-protocol/sbtp-relay`, writes the digest to the job summary, and attests its build provenance once the repository is public | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` (that job only) |
 
 ## Hardening rules
 
@@ -44,6 +44,25 @@ Every change to a workflow keeps these:
 - **Timeouts and concurrency** on every job: a superseded CI run on the same pull request is
   cancelled; an image run is never cancelled half-way through a push.
 
+## Budgets (job `budgets`)
+
+The budgets of ADR 0048, each printed by its step before it is compared:
+
+| Budget | Measured on | How |
+|---|---|---|
+| Relay binary below 8,000,000 bytes | `x86_64-unknown-linux-musl` release binary from the `export` stage of `deploy/Dockerfile` | `stat` |
+| Relay image below 5,000,000 bytes compressed | the image of `deploy/Dockerfile` | `deploy/image-size.sh`: every layer of `docker save` gzip-compressed at level 6 (what a push stores) plus the configuration; also run in `relay-image.yml` before the push |
+| `small` memory bound below 15,000,000 bytes (defaults) and 20,000,000 bytes (every function on) | the computed bound of ADR 0018 rule 35 | `crates/sbtp-relay/tests/startup.rs` (`small_profile_*`); a new function adds its row to `FUNCTIONS` there |
+| Core WASM below 200,000 bytes gzip | `cargo build -p sbtp-wasm --target wasm32-unknown-unknown --release` | `web/wasm-budget.py`: the module without its custom sections, gzip -9 |
+
+The WASM figure is an upper bound of what `web/build.sh` ships (`web/pkg/sbtp_wasm_bg.wasm`):
+wasm-bindgen and `wasm-opt -Os` only remove code from it. Measuring the shipped file would need
+the wasm-bindgen CLI and binaryen on the runner, two more toolchains to pin and verify, one of them
+a prebuilt binary download; the bound needs neither. On 2026-11-21 the bound was 116,735 bytes
+for a shipped 78,512 bytes (factor 1.5). If the bound ever nears the budget while the shipped file
+does not, install wasm-bindgen-cli with `cargo install --locked` at the `Cargo.lock` version, as
+cargo-deny is, and measure `web/build.sh` instead.
+
 ## Limits and follow-ups
 
 - **Toolchain version.** `rust-toolchain.toml` pins an exact version (`1.99.1`), so a new Rust
@@ -73,3 +92,5 @@ Every change to a workflow keeps these:
   and approve pull requests" is off.
 - Pull requests from outside collaborators: require approval before workflows run.
 - The `protect-main` ruleset requires the `CI` checks (`check`, `deny`) to pass before a merge.
+  `budgets` (check name `budgets (binary, image, memory, wasm)`) is to be added to it once it has
+  passed on `main`.

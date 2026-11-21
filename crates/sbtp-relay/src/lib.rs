@@ -21,6 +21,7 @@ pub mod config;
 pub mod demand;
 pub mod error;
 pub mod index;
+pub mod ingest;
 pub mod limiter;
 pub mod log;
 pub mod metrics;

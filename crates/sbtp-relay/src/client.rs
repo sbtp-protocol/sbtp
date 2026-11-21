@@ -33,6 +33,47 @@ impl ClientKey {
         prefix: u8::MAX,
     };
 
+    /// ADR 0049 rule 1: the network groups of a request with this client key, from the same
+    /// resolved address. IPv4 (IPv4-mapped IPv6 included, normalised when the key was made): its
+    /// /24. IPv6: its /56 and its /48, each only when it is not longer than `ipv6_prefix`
+    /// (`client_ipv6_prefix`), so that a group never splits one client key; with
+    /// `client_ipv6_prefix = 48` only the /48 is used, and it is also the client key. A group is
+    /// a key of its own prefix length, never equal to a client key of the limiter table, since the
+    /// two live in separate tables. The overflow key has no group. Never logged.
+    #[must_use]
+    pub fn groups(&self, ipv6_prefix: u8) -> [Option<Self>; 2] {
+        if *self == Self::OVERFLOW {
+            return [None, None];
+        }
+        let group = |prefix: u8| {
+            Some(Self {
+                net: Cidr {
+                    addr: self.net,
+                    prefix,
+                }
+                .network(),
+                prefix,
+            })
+        };
+        match self.net {
+            IpAddr::V4(_) => [group(24), None],
+            IpAddr::V6(_) => [
+                (56 <= ipv6_prefix).then(|| group(56)).flatten(),
+                (48 <= ipv6_prefix).then(|| group(48)).flatten(),
+            ],
+        }
+    }
+
+    /// Whether this key is an IPv4 key (or group).
+    pub(crate) fn is_ipv4(&self) -> bool {
+        self.net.is_ipv4()
+    }
+
+    /// The prefix length of this key (or group).
+    pub(crate) fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
     /// The bytes hashed into the client tag (ADR 0021 rule 13): family, prefix length, address.
     /// Never logged.
     pub(crate) fn tag_input(&self) -> [u8; 18] {

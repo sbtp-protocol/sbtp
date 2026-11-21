@@ -59,6 +59,22 @@ Initial public version. Pre-release software: no version is supported for produc
 - CI (`.github/workflows/`, `docs/ci.md`): the `CONTRIBUTING.md` checks on every push and pull request
   to `main`; a relay image built by CI and pushed to `ghcr.io/sbtp-protocol/sbtp-relay` on `relay-v*`
   tags, deployed by digest. Actions pinned by commit SHA, read-only token outside the image job.
+- CI job `budgets` (ADR 0048 budgets): the static musl relay binary under 8,000,000 bytes, the relay
+  image under 5,000,000 bytes compressed (also checked in `relay-image.yml` before the push), the
+  computed `small` memory bound under 15,000,000 bytes with the defaults and 20,000,000 with every
+  function on, and the core WASM under 200,000 bytes gzip (an upper bound from the cargo output,
+  `web/wasm-budget.py`). No new tool is installed.
+- `sbtp-relay`: ingest bounds against disk filling (ADR 0049). Stored bytes per hour are bounded per
+  network group, always: an IPv6 /56 (10 % of `ingest_bytes_per_hour`), an IPv6 /48 or an IPv4 /24
+  (25 %); a group over its budget gets `429` with `Retry-After` before its body is read, and only that
+  group is refused. Group buckets live in a second limiter table of `ingest_group_max` entries (ADR
+  0027 design, fail open when full, no shared overflow group). Above the low-water mark, a global
+  cap of `ingest_bytes_per_hour` (200 MiB on `small`) answers `503` with `Retry-After` of at most
+  300 s to new blocks; held blocks still get `200`. Nothing latches and no network origin is stored
+  with a block. New settings `ingest_bytes_per_hour`, `ingest_group_max` (profile rows),
+  `ingest_group_share_pct`, `ingest_group56_share_pct`; new counters and gauges `ingest_*`, events
+  `ingest_capped` and `ingest_cap_ended`; `deploy/README.md` gains the ingest section, a CDN edge
+  rule and the alerts of ADR 0049 rule 12. Computed `small` memory bound: 14,910,996 bytes.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
 

@@ -145,12 +145,53 @@ otherwise without `Retry-After`, so that clients try another relay.
   values; nothing is configured for them. With demand eviction off, the one-year
   `Cache-Control` alone, as before.
 
+## Ingest bounds against disk filling
+
+Valid blocks within the per-client rates can still fill a store and, with demand eviction, push
+out cold legitimate blocks (ADR 0049). The relay bounds the **bytes it stores per hour**, counted
+as quota cost (a block file rounded up to 4 KiB plus its entry charge), with two kinds of token
+bucket. Nothing is recorded about a writer: group buckets live in memory only, and no network,
+address or client key is stored with a block, logged or put in a metric label.
+
+- **Per network group, always on.** Each `PUT` belongs to the IPv6 /56 and /48, or the IPv4 /24,
+  of its client address (the same address as the client key, so `trusted_proxies` and
+  `client_ip_header` must be right). A /48 or a /24 may store `ingest_group_share_pct` (25 %) of
+  `ingest_bytes_per_hour` per hour, a /56 `ingest_group56_share_pct` (10 %), with five minutes of
+  burst. Over its budget a group gets `429 RateLimited` with `Retry-After`, before its body is
+  read; only that group is refused. At most `ingest_group_max` groups are tracked (1,024 on
+  `small`); when the table is full of active groups, a new group passes unchecked
+  (`ingest_group_unchecked_total`) rather than sharing a bucket with a flooder.
+- **Global cap, only under disk pressure.** All `PUT`s together may store
+  `ingest_bytes_per_hour` (200 MiB on `small`, 2 GiB on `standard`, 16 GiB on `large`) per hour,
+  with five minutes of burst. The cap is checked only while the store is at or above
+  `demand_low_water_pct` (80 %) of `max_store_bytes`; a new block over it gets `503 Unavailable`
+  with `Retry-After` of at most 300 s, and nothing is stored. A block the relay already holds
+  still gets `200`; reads and replication are not affected. A re-sent expired or evicted block is
+  a new block.
+- **No latch.** Every refusal ends as the buckets refill with time; nothing is persisted and no
+  restart or operator action is needed. Addresses in `rate_limit_exempt` are neither charged nor
+  refused. `ingest_bytes_per_hour = 0` turns both bounds off.
+
+Normal traffic does not meet these bounds: a relay with 1,000 writers at five times their average
+rate stores about 21 MB/h, a tenth of the `small` budget. Behind a carrier NAT or a shared host,
+one /24 or /48 carries many users; if `ingest_group_limited_total` grows for such a network,
+raise `ingest_group_share_pct`. Behind a proxy that hides client addresses (no
+`client_ip_header`, proxy outside `trusted_proxies`) every client is one group and the whole relay
+is held to one group's share.
+
+**At the CDN edge.** Behind a CDN, also rate-limit `PUT /sbtp/v1/block` at the edge, per client
+address and, where the CDN offers it, per network prefix, so that a flood stops before it reaches
+the origin; the relay's own bounds remain the guarantee (ADR 0049 rule 11). For example, a
+Cloudflare rate limiting rule on `http.request.method eq "PUT" and http.request.uri.path eq
+"/sbtp/v1/block"`, counted per IP, of a few hundred requests per ten minutes, with the action
+"Block" for the rest of the period.
+
 ## Alerts
 
 The counters and gauges worth an alert on a public relay, with plain starting thresholds. They are
-named as in ADR 0046 rule 29 (prefix `sbtp_relay_` once `/metrics` is served); until then, read
-them from the periodic `stats` log line (field in parentheses) and the `demand_stuck` and
-`demand_suspended` events.
+named as in ADR 0046 rule 29 and ADR 0049 rule 16 (prefix `sbtp_relay_` once `/metrics` is
+served); until then, read them from the periodic `stats` log line (field in parentheses) and the
+`demand_stuck`, `demand_suspended` and `ingest_capped` events.
 
 | Signal | Alert when | What it means |
 |---|---|---|
@@ -158,6 +199,10 @@ them from the periodic `stats` log line (field in parentheses) and the `demand_s
 | `demand_evicted_blocks_total` (`demand_evicted`) | grows by more than 10 % of the held blocks in a day | Blocks are pushed out faster than usual: a write flood (security review 2026-11-21, M-2) or a store sized too small. Consider a larger `max_store_bytes` or a `block_ttl_ms` as an outer bound. |
 | `demand_suspended` (`demand_suspended`) | is `1` for longer than `2 × demand_epoch_ms` | A suspension should end after two epochs; one that keeps renewing means demands keep being lost (see `demand_lost_total`) or the relay keeps stopping uncleanly. |
 | `demand_stuck_total` (`demand_stuck` events) | increases on two sweeper runs in a row | Above the high-water mark with nothing to evict: every block is protected (requested or accepted within three epochs), or `cause=index`, the index file alone reaches the low-water mark. Grow `max_store_bytes`. |
+| `ingest_capped_total` (`ingest_capped`; `ingest_capped` and `ingest_cap_ended` events) | increases for 15 minutes | Ingest capped: the store is above the low-water mark and writers use the whole hourly budget, a flood or real growth. Check `ingest_group_limited_total` and the disk. |
+| `ingest_group_limited_total` (`ingest_group_limited`) | increases by more than 100 in 15 minutes | Group limited: one network takes more than its share. Usually a flood; with a carrier NAT, raise `ingest_group_share_pct`. |
+| `ingest_group_unchecked_total` (`ingest_group_unchecked`) | increases | Group table full: many networks write at once and new groups pass unchecked (ADR 0049 rule 5), possibly a many-network flood (Q-71). |
+| `demand_evicted_blocks_total` while `demand_coldest_ms` is less than 7 days old | increases | Eviction of recent blocks: blocks requested within the week are evicted; the store is too small for its traffic, or a flood. |
 | `demand_lost_total` (`demand_lost`) | increases at all | A demand could not be recorded (set full, or an index write failed); each loss suspends demand eviction for two epochs. Repeated losses point at index write errors (`index_write_errors_total`) or at `demand_touch_max` too small for the read rate. |
 
 ## Pulling the CI image
