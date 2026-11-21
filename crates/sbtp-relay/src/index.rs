@@ -82,8 +82,8 @@ const MIGRATION_LOG_EVERY: u64 = 10;
 /// skips at most (security review 2026-11-21, I-3). They come only from corruption; the bound
 /// keeps a listing's read transaction short whatever their number.
 pub const ORPHAN_SCAN_MAX: u64 = 10_000;
-/// The default demand epoch, one day (ADR 0046 rule 24), until [`IndexBackend::configure_demand`].
-const DEFAULT_DEMAND_EPOCH_MS: u64 = 86_400_000;
+/// The default demand epoch, 8 hours (ADR 0046 rule 24, D10), until [`IndexBackend::configure_demand`].
+const DEFAULT_DEMAND_EPOCH_MS: u64 = 28_800_000;
 /// Blocks given demand entries per transaction of the start-up migration.
 const MIGRATION_BATCH: usize = 10_000;
 /// Length of the fixed part of a `blocks` value: `block_id` and length.

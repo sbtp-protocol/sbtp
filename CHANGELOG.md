@@ -119,7 +119,7 @@ Initial public version. Pre-release software: no version is supported for produc
   difficulty)` (the /info cap of 24 still applies); an explicit difficulty is used as given.
 - **Breaking (defaults):** `sbtp-relay` keeps what it receives (ADR 0046): `block_ttl_ms` defaults
   to 0 (no eviction by age; `/info` `null`) and demand eviction is on (`demand_eviction`,
-  `demand_high_water_pct` 90, `demand_low_water_pct` 80, `demand_epoch_ms` one day,
+  `demand_high_water_pct` 90, `demand_low_water_pct` 80, `demand_epoch_ms` 8 hours,
   `demand_touch_max` 16,384 / 131,072 / 1,048,576 by profile). Above the high-water mark the
   sweeper deletes the blocks requested least recently (a `200` or `304` of `GET` or `HEAD`, a
   `PUT` answered `200`, an acceptance, the acceptance of a child), never one demanded within
@@ -131,6 +131,13 @@ Initial public version. Pre-release software: no version is supported for produc
   gauges and the `demand_evicted`, `demand_stuck` and `demand_suspended` events. An archive relay
   is `demand_eviction = false` with `block_ttl_ms = 0`. `deploy/README.md`: retention modes and the
   Cloudflare cache rules. The `small` profile's computed memory bound is 14,747,092 bytes.
+- **Breaking (defaults):** `sbtp-relay` `demand_epoch_ms` defaults to 28,800,000 (8 hours) instead
+  of 86,400,000 (1 day); range unchanged, 4 hours to 30 days (owner decision, ADR 0046
+  clarification D10). With the default, block responses carry `s-maxage=14400` and
+  `CDN-Cache-Control: public, max-age=14400, must-revalidate` (was 43,200), a block is protected for
+  at least 24 hours (was 3 days), a demand suspension lasts 16 hours (was 2 days), and a shared cache
+  revalidates a requested block up to 6 times a day per cache location (was 2). Set
+  `demand_epoch_ms = 86400000` to keep the former behaviour.
 - Web client: an own block stays protected in the local store until every relay of the list
   acknowledges it, within a bound (ADR 0047). Each own block keeps a delivery state per relay
   (pending, acknowledged, refused, given up) with its attempt count, first attempt and first

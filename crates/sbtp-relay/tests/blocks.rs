@@ -94,14 +94,14 @@ fn new_known_and_served() {
         assert_eq!(r.status, 200);
         assert_eq!(r.body, b);
         assert_eq!(r.header("content-type"), Some("application/octet-stream"));
-        // ADR 0046 rule 15: demand eviction is on by default, `E` one day, `S` 43,200 s.
+        // ADR 0046 rule 15: demand eviction is on by default, `E` 8 hours, `S` 14,400 s (D10).
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, s-maxage=43200, immutable")
+            Some("public, max-age=31536000, s-maxage=14400, immutable")
         );
         assert_eq!(
             r.header("cdn-cache-control"),
-            Some("public, max-age=43200, must-revalidate")
+            Some("public, max-age=14400, must-revalidate")
         );
     }
     let missing = BlockId([0x11; 32]);
@@ -135,11 +135,11 @@ fn etag_and_not_modified() {
         assert_eq!(r.header("etag"), Some(etag.as_str()));
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, s-maxage=43200, immutable")
+            Some("public, max-age=31536000, s-maxage=14400, immutable")
         );
         assert_eq!(
             r.header("cdn-cache-control"),
-            Some("public, max-age=43200, must-revalidate")
+            Some("public, max-age=14400, must-revalidate")
         );
         assert_eq!(r.header("access-control-allow-origin"), Some("*"));
     }
