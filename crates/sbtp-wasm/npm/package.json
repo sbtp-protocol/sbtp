@@ -1,0 +1,54 @@
+{
+  "name": "@sbtp/wasm",
+  "version": "0.1.0",
+  "description": "WebAssembly build of sbtp-core (SBTP layer 0: blocks, BLAKE3, strict Ed25519, proof of work), the generic layer 2 grammar and the sealed envelope.",
+  "keywords": [
+    "sbtp",
+    "webassembly",
+    "wasm",
+    "ed25519",
+    "blake3",
+    "proof-of-work",
+    "dag"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "author": "The SBTP Contributors",
+  "homepage": "https://github.com/sbtp-protocol/sbtp/tree/main/crates/sbtp-wasm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sbtp-protocol/sbtp.git",
+    "directory": "crates/sbtp-wasm"
+  },
+  "bugs": {
+    "url": "https://github.com/sbtp-protocol/sbtp/issues"
+  },
+  "type": "module",
+  "types": "./sbtp_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./sbtp_wasm.d.ts",
+      "node": "./node.js",
+      "default": "./sbtp_wasm.js"
+    },
+    "./sbtp_wasm_bg.wasm": "./sbtp_wasm_bg.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "sbtp_wasm.js",
+    "sbtp_wasm.d.ts",
+    "sbtp_wasm_bg.wasm",
+    "node.js",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "sideEffects": [
+    "./node.js"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
