@@ -26,6 +26,12 @@
 //! | `attachSignature(block, signature)` | Inserts an external signature, verified before returning. |
 //! | `DemoSigningKey.generate()`, `.fromSeed(seed)` | In-WASM key, demo and CLI-like use only. |
 //! | `key.publicKey`, `key.signBlock(block)`, `key.exportSeed()`, `key.free()` | |
+//! | `validateL2Payload(parents, payload)` | Layer 2 grammar validation (feature `l2`), returns an `L2Payload`. |
+//! | `seal(sender, recipientX25519, recipientId, tag, msg, bucket?)` | Sealed envelope (feature `seal`), returns a `SealedEnvelope`. |
+//! | `env.unsignedBlock(timestamp)`, `env.signBlock(block)` | The outer block; the ephemeral key signs once, then is wiped. |
+//! | `openSealed(key, outerPublicKey, tag, payload, recipientId, allowedKinds)` | Opens, returns an `OpenedMessage`; every failure is `OpenFailed`. |
+//! | `EncKeyPair.generate()`, `.fromSecret(secret)`, `.publicKey`, `.exportSecret()` | X25519 key of `sbtp.enc_key`. |
+//! | `directoryTag(pk)`, `isDirectoryTag(pk, tag)`, `applicationTag(context, input)` | Tags (spec §5.4, §5.5). |
 //!
 //! # Argument checks
 //!
@@ -44,6 +50,10 @@
 mod api;
 mod error;
 mod key;
+#[cfg(feature = "l2")]
+mod l2;
+#[cfg(feature = "seal")]
+mod seal;
 
 use js_sys::Uint8Array;
 use sbtp_core::layout::{HASH_LEN, MAX_BLOCK_LEN, SIGNATURE_LEN};
@@ -57,6 +67,10 @@ pub use api::{
 };
 pub use error::{BindError, names};
 pub use key::DemoSigningKey;
+#[cfg(feature = "l2")]
+pub use l2::{L2Payload, validate_l2_payload};
+#[cfg(feature = "seal")]
+pub use seal::{EncKeyPair, OpenedMessage, SealedEnvelope, open_sealed, seal_message};
 
 /// Largest integer a JS `number` represents exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;

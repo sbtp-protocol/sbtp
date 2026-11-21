@@ -1306,6 +1306,8 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "sbtp-core",
+ "sbtp-l2",
+ "sbtp-seal",
  "serde_json",
  "wasm-bindgen",
  "zeroize",

@@ -78,6 +78,12 @@ impl DemoSigningKey {
         self.inner.as_bytes()
     }
 
+    /// The key itself, for the inner signature of a sealed message (`seal`).
+    #[cfg(feature = "seal")]
+    pub(crate) const fn signing_key(&self) -> &SigningKey {
+        &self.inner
+    }
+
     /// The 32-byte public key.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; 32] {
