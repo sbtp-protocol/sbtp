@@ -328,6 +328,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - `demand_eviction`: boolean; `true` when the relay evicts the blocks requested least recently once
   its store is near full (`architecture.md` §2, "Eviction"). A client MUST read an absent member as
   `false`. (ADR 0046)
+- `read_only`: boolean; `true` when the URL serves `GET /sbtp/v1/block/{block_id}` and `/info` only,
+  for example a bucket of static objects. A client MUST NOT send `PUT` or `/query` to it. For
+  `GET /block` on such a URL, any status other than `200` or `304` means that the block is not served
+  there. A client MUST read an absent member as `false`. (ADR 0050)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
@@ -438,9 +442,14 @@ poll `/query` with a cursor. `[Q-23]`
 - `429 Too Many Requests` (`RateLimited`): this client is over its own allowance, in requests per period
   or in requests in flight. The relay answers before reading the body and SHOULD send `Retry-After` in
   seconds. A relay counts clients by address; an IPv6 /64, or the users of one shared address, are one
-  client. A client SHOULD keep at most 8 requests in flight per relay.
+  client. A client SHOULD keep at most 8 requests in flight per relay. A relay MAY also bound the bytes
+  stored per hour from a network prefix (an IPv6 /56 or /48, an IPv4 /24); a `PUT` over that bound gets
+  `429` before its body is read. (ADR 0049)
 - `503 Service Unavailable` (`Unavailable`): the relay is at one of its own limits, starting or
   stopping. The refusal does not depend on the client. The relay SHOULD send `Retry-After` in seconds.
+  A relay whose store is near full MAY bound the bytes it stores per hour from all clients together; a
+  new block over that bound gets `503` with `Retry-After`, and a block the relay holds still gets `200`.
+  (ADR 0049)
 - `408 Request Timeout` (`RequestTimeout`): the request body did not arrive in time.
 - A relay MAY close a connection without a response: when it is idle or too slow, when the client holds
   too many connections, or after a number of requests or a duration. A response MAY carry
