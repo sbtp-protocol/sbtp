@@ -3,6 +3,7 @@ members = [
     "crates/sbtp-core",
     "crates/sbtp-relay",
     "crates/sbtp-l2",
+    "crates/sbtp-seal",
     "crates/sbtp-wasm",
     "examples/cli-demo",
 ]
@@ -21,6 +22,7 @@ license = "MIT OR Apache-2.0"
 # Versions taken from crates.io on 2026-11-18.
 [workspace.dependencies]
 sbtp-core = { path = "crates/sbtp-core", version = "0.1.0", default-features = false }
+sbtp-l2 = { path = "crates/sbtp-l2", version = "0.1.0" }
 
 # Core (no_std)
 blake3 = { version = "1.8.7", default-features = false }
@@ -92,8 +94,8 @@ getrandom = { version = "0.4.3", features = ["wasm_js"] }
 # HKDF-SHA256, ChaCha20Poly1305, single-shot API only. Exact pin; no default features (drops
 # getrandom, ML-KEM, X-Wing, SHAKE). Never use `hpke::danger`. Needs Rust 1.87. Review
 # docs/security/2026-11-20-hpke-dependency.md: the lock MUST hold `ctutils` >= 0.4.4 (RUSTSEC-2026-0385;
-# resolve with the workspace MSRV raised first) and `inout` <= 0.2.5 until 0.2.6 is 14 days old
-# (2026-11-21).
+# resolve with the workspace MSRV raised first; 0.4.8 locked). `inout` 0.2.6 locked: published
+# 2026-11-07T10:57Z, 14 days old when `sbtp-seal` was resolved (2026-11-21, condition 3).
 hpke = { version = "=0.15.1", default-features = false, features = ["x25519", "chacha", "alloc"] }
 
 # Tests & benches
@@ -133,6 +135,9 @@ overflow-checks = true
 # crates/sbtp-wasm/README.md.
 
 [profile.release.package.sbtp-l2]
+overflow-checks = true
+
+[profile.release.package.sbtp-seal]
 overflow-checks = true
 
 [profile.release.package.cli-demo]
