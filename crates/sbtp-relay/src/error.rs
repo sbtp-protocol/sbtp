@@ -93,16 +93,19 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "TimestampTooFarInFuture")
     }
 
-    /// `507 StorageFull` (ADR 0013 rule 19). No `Retry-After`, also with eviction by age: ADR
-    /// 0023 rule 18 (accepted) keeps the `MAY` of rule 19 for other implementations, not this one,
-    /// since the relay cannot predict when room frees.
+    /// `507 StorageFull` (ADR 0013 rule 19), without `Retry-After`. ADR 0023 rule 18 keeps the
+    /// `MAY` of rule 19 out of this relay, since it cannot predict when room frees; ADR 0046 rule
+    /// 8 amends it for demand eviction only ([`ApiError::storage_full_retry`]). This form is the
+    /// answer with demand eviction off (eviction by age included), while it is suspended (rule
+    /// 13), after a stuck pass, and below the high-water mark.
     #[must_use]
     pub fn storage_full() -> Self {
         Self::new(StatusCode::INSUFFICIENT_STORAGE, "StorageFull")
     }
 
-    /// `507 StorageFull` with `Retry-After: retry_after_s`: demand eviction is on and the store
-    /// is above its high-water mark, so the next sweeper run makes room (ADR 0046 rule 8).
+    /// `507 StorageFull` with `Retry-After: retry_after_s` (ADR 0046 rule 8, amending ADR 0023
+    /// rule 18): demand eviction is on, neither suspended nor stuck, and the store is above its
+    /// high-water mark, so the next sweeper run makes room (security review 2026-11-21, L-4).
     #[must_use]
     pub fn storage_full_retry(retry_after_s: u64) -> Self {
         Self {

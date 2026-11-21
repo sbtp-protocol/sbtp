@@ -809,9 +809,13 @@ impl<I: IndexBackend + 'static> Relay<I> {
                     None,
                 );
                 // ADR 0046 rule 8 (MAY): above the high-water mark the next sweeper run makes
-                // room, unless no block is a candidate (`demand_stuck`).
+                // room, but not while rule 13 suspends demand eviction nor after a stuck pass
+                // (security review 2026-11-21, L-4): no room is coming then, and the client is
+                // better served by another relay.
                 let (high, _) = self.watermarks();
-                if self.demand.enabled() && self.store.admission_total() > high {
+                if self.demand.retry_after_useful((self.clock)())
+                    && self.store.admission_total() > high
+                {
                     return ApiError::storage_full_retry(self.sweep_retry_after_s).into_response();
                 }
                 return ApiError::storage_full().into_response();
@@ -956,7 +960,15 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`.
     /// Either is a demand of the block (ADR 0046 rule 10), recorded in the demand set, never in
     /// the index (rule 12).
+    ///
+    /// ADR 0048 rule 18: a request carrying `Sbtp-Replication: 1` is a copy, not a read. It is
+    /// not demand and is answered `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, in
+    /// every mode, so that no shared cache keeps an entry the origin did not count.
     fn block_response(&self, bytes: Bytes, id: &BlockId, request: &HeaderMap) -> Response {
+        if is_replication(request) {
+            let no_store = HeaderValue::from_static("no-store");
+            return block_response(bytes, id, request, &no_store, Some(&no_store));
+        }
         let r = block_response(
             bytes,
             id,
@@ -967,6 +979,14 @@ impl<I: IndexBackend + 'static> Relay<I> {
         self.demand.touch(id, (self.clock)());
         r
     }
+}
+
+/// ADR 0048 rule 18: whether `request` carries `Sbtp-Replication: 1` (exactly `1`, any field line).
+fn is_replication(request: &HeaderMap) -> bool {
+    request
+        .get_all("sbtp-replication")
+        .iter()
+        .any(|v| v.as_bytes() == b"1")
 }
 
 /// ADR 0046 rules 15 and 16: the `Cache-Control` of a block response, and the

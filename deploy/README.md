@@ -106,7 +106,9 @@ and `demand_eviction = true`. When the store passes `demand_high_water_pct` (90 
 `demand_low_water_pct` (80 %); a block requested in the last `demand_epoch_ms` (one day), directly
 or through at most two shared caches in series, is never deleted, and a new block stays at least
 three epochs. A `PUT` never deletes anything: a new block that does not fit gets `507`, with a
-`Retry-After` of one sweeper interval while the store is above the high-water mark.
+`Retry-After` of one sweeper interval only while the store is above the high-water mark and the
+sweeper can make room (demand eviction neither suspended nor stuck, ADR 0046 clarification D5);
+otherwise without `Retry-After`, so that clients try another relay.
 
 - **Archive relay.** Set `demand_eviction = false` and leave `block_ttl_ms = 0`. Nothing is ever
   deleted; a full store answers `507` (ADR 0013 rule 19). `/info` publishes
@@ -117,9 +119,24 @@ three epochs. A `PUT` never deletes anything: a new block that does not fit gets
   60,000 ms).
 - **Privacy.** With demand eviction on, the index records, per block, the epoch in which it was
   last requested (never by whom). An operator who does not want this turns demand eviction off.
-- **Restarts.** A stop that is not clean (`SIGKILL`, a crash, a power loss) suspends demand
-  eviction for two epochs after the next start, because demands kept in memory were lost; reads
-  and writes are unaffected and a full store answers `507` meanwhile. Stop with `SIGTERM`.
+- **Restarts and suspensions.** Demand eviction is suspended for two epochs (`2 ×
+  demand_epoch_ms`, two days by default) whenever a demand may have gone unrecorded (ADR 0046
+  rule 13 and clarifications D1 to D4); reads and writes are unaffected and a full store answers
+  `507` meanwhile. The start-up line `demand_suspended` gives the `cause`:
+  - `unclean_start`: the last stop was not clean: `SIGKILL`, a crash, a power loss, or a drain
+    cut by a second signal or by its deadline (requests were still running). Stop with one
+    `SIGTERM` and let the drain finish.
+  - `no_history`: the first start after the upgrade that added demand tracking, or an index
+    rebuilt from the block files: the index knows when blocks were accepted, not when they were
+    last read. A new, empty data directory is not suspended.
+  - `enabled`: `demand_eviction` was `false` at the previous start, when reads were not recorded.
+  - `restored`: a suspension was running at the last clean stop; it keeps its end.
+  - `lost` (while running, rate-capped): the demand set was full or a flush failed.
+
+  The first start on an index written before demand tracking also fills the demand tables before
+  it listens, logging `demand_migration` lines (`phase=start`, `progress` every 100,000 blocks,
+  `end` with `filled` and `duration_ms`), so that a slow start on a large index can be told from
+  a hang.
 - **Response headers.** With demand eviction on, a block response carries
   `Cache-Control: public, max-age=31536000, s-maxage=<E/2>, immutable` and
   `CDN-Cache-Control: public, max-age=<E/2>, must-revalidate` (`E/2` in seconds, 43,200 by
@@ -127,6 +144,21 @@ three epochs. A `PUT` never deletes anything: a new block that does not fit gets
   the relay sees that demand. Browsers keep the one-year lifetime. The relay computes these
   values; nothing is configured for them. With demand eviction off, the one-year
   `Cache-Control` alone, as before.
+
+## Alerts
+
+The counters and gauges worth an alert on a public relay, with plain starting thresholds. They are
+named as in ADR 0046 rule 29 (prefix `sbtp_relay_` once `/metrics` is served); until then, read
+them from the periodic `stats` log line (field in parentheses) and the `demand_stuck` and
+`demand_suspended` events.
+
+| Signal | Alert when | What it means |
+|---|---|---|
+| `storage_full_total` (`refused_507`) | increases for more than one hour | New blocks are refused with `507`: the store is full and eviction is not making room fast enough, or cannot (see `demand_stuck`). |
+| `demand_evicted_blocks_total` (`demand_evicted`) | grows by more than 10 % of the held blocks in a day | Blocks are pushed out faster than usual: a write flood (security review 2026-11-21, M-2) or a store sized too small. Consider a larger `max_store_bytes` or a `block_ttl_ms` as an outer bound. |
+| `demand_suspended` (`demand_suspended`) | is `1` for longer than `2 × demand_epoch_ms` | A suspension should end after two epochs; one that keeps renewing means demands keep being lost (see `demand_lost_total`) or the relay keeps stopping uncleanly. |
+| `demand_stuck_total` (`demand_stuck` events) | increases on two sweeper runs in a row | Above the high-water mark with nothing to evict: every block is protected (requested or accepted within three epochs), or `cause=index`, the index file alone reaches the low-water mark. Grow `max_store_bytes`. |
+| `demand_lost_total` (`demand_lost`) | increases at all | A demand could not be recorded (set full, or an index write failed); each loss suspends demand eviction for two epochs. Repeated losses point at index write errors (`index_write_errors_total`) or at `demand_touch_max` too small for the read rate. |
 
 ## Pulling the CI image
 
@@ -369,6 +401,23 @@ documentation and source read through Context7 on 2026-11-20):
     and one upper tier, ADR 0046 rule 17); with more, turn demand eviction off. `/sbtp/v1/info`
     and `/sbtp/v1/query` are always bypassed: `/info` is `no-store`, and a cached `/query` page
     would hide new blocks.
+  - **Turning demand eviction on.** A relay that served blocks with `demand_eviction = false` sent
+    a one-year shared lifetime, and the CDN may serve those entries for a year without asking the
+    relay, so their demand never reaches it. Restart the relay with `demand_eviction = true` first,
+    then purge `/sbtp/v1/block/*` from the CDN cache (a purge by prefix where the plan offers it,
+    otherwise a purge of everything cached for the relay's host), within
+    `2 × demand_epoch_ms` of the restart. A purge before the restart is not enough. With the cache
+    bypassed on `/sbtp/v1/*`, no purge is needed.
+
+    Why: the relay suspends demand eviction for `2 × demand_epoch_ms` after this restart
+    (`demand_suspended cause=enabled`), which covers the reads it did not record while it was off,
+    but not the ones a CDN keeps answering from its own one-year entries. Requests made before the
+    restart are still cached with the one-year lifetime, so a purge made then is refilled at once;
+    a purge after the restart makes every later request reach the relay, or be cached with the
+    short lifetime of demand eviction, before the suspension ends.
+  - Replication requests (`Sbtp-Replication: 1`, ADR 0048 rule 18) are answered
+    `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and are not counted as demand:
+    a copy made by another relay is not a read.
 
 ## Logs and client addresses
 

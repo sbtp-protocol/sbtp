@@ -12,7 +12,10 @@
 //! The two demand tables are written in the transaction that writes the other entries of a block
 //! and removed with them. An index written before ADR 0046 gets them at the first start
 //! ([`IndexBackend::configure_demand`]). The `meta` table also records whether the index was
-//! closed cleanly (`open`), for the suspension of ADR 0046 rule 13.
+//! closed cleanly (`open`), the end of a demand-eviction suspension running at the last clean
+//! close (`suspended_until`), and the `demand_eviction` setting of the last start
+//! (`demand_eviction`), for the suspensions of ADR 0046 rule 13 (security review 2026-11-21, M-1
+//! and L-1).
 //!
 //! Keys are 32-byte values taken from validated blocks; no path is built from them.
 //!
@@ -36,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use sbtp_core::BlockId;
 
+use crate::log::{Event, Value};
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition,
@@ -65,6 +69,19 @@ const EPOCH_KEY: &str = "epoch";
 const DEMAND_KEY: &str = "demand";
 /// `1` while a relay has the index open, `0` after a clean close (ADR 0046 rule 13).
 const OPEN_KEY: &str = "open";
+/// The end, Unix milliseconds, of the demand-eviction suspension that was running at the last
+/// clean close (security review 2026-11-21, L-1); `0` when none.
+const SUSPENDED_KEY: &str = "suspended_until";
+/// The `demand_eviction` setting of the last start, `0` or `1`; absent before the first start of
+/// a relay that records it (security review 2026-11-21, M-1).
+const DEMAND_ON_KEY: &str = "demand_eviction";
+/// The migration logs its progress every this many transactions (security review 2026-11-21,
+/// I-4): every 100,000 blocks.
+const MIGRATION_LOG_EVERY: u64 = 10;
+/// Order entries without a `blocks` row that one [`IndexBackend::demand_candidates`] listing
+/// skips at most (security review 2026-11-21, I-3). They come only from corruption; the bound
+/// keeps a listing's read transaction short whatever their number.
+pub const ORPHAN_SCAN_MAX: u64 = 10_000;
 /// The default demand epoch, one day (ADR 0046 rule 24), until [`IndexBackend::configure_demand`].
 const DEFAULT_DEMAND_EPOCH_MS: u64 = 86_400_000;
 /// Blocks given demand entries per transaction of the start-up migration.
@@ -144,6 +161,16 @@ pub struct Candidate {
     pub id: BlockId,
     /// Its length in bytes.
     pub len: u32,
+}
+
+/// One listing of demand candidates (ADR 0046 rules 6 and 7).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Candidates {
+    /// The candidates, in increasing `(last_demand, position)`.
+    pub list: Vec<Candidate>,
+    /// Order entries skipped because their `blocks` row is missing (corruption), at most
+    /// [`ORPHAN_SCAN_MAX`]; they do not count toward `max`.
+    pub orphans: u64,
 }
 
 /// One page of `/query` (ADR 0012 rule 10), before JSON encoding.
@@ -349,13 +376,15 @@ pub trait IndexBackend: Send + Sync + Sized {
     }
 
     /// ADR 0046 rules 6 and 7: up to `max` blocks with `last_demand ≤ bound`, in increasing order
-    /// of `(last_demand, position)`. `max` is clamped to `1..=MAX_QUERY_LIMIT`. None by default.
+    /// of `(last_demand, position)`. `max` is clamped to `1..=MAX_QUERY_LIMIT`. Order entries
+    /// whose block row is missing are skipped and counted, without counting toward `max`, up to
+    /// [`ORPHAN_SCAN_MAX`] of them (security review 2026-11-21, I-3). None by default.
     ///
     /// # Errors
     ///
     /// Backend errors.
-    fn demand_candidates(&self, _bound: u64, _max: usize) -> Result<Vec<Candidate>, Self::Error> {
-        Ok(Vec::new())
+    fn demand_candidates(&self, _bound: u64, _max: usize) -> Result<Candidates, Self::Error> {
+        Ok(Candidates::default())
     }
 
     /// The position and `last_demand` of `id`, if indexed (the re-check of ADR 0046 rule 22).
@@ -406,6 +435,8 @@ pub struct RedbIndex {
     demand_epoch_ms: AtomicU64,
     /// The index was open, not closed cleanly, when this process opened it (ADR 0046 rule 13).
     unclean: bool,
+    /// The suspension end recorded by the last clean close (security review 2026-11-21, L-1).
+    suspended_until: u64,
 }
 
 impl IndexBackend for RedbIndex {
@@ -432,7 +463,7 @@ impl IndexBackend for RedbIndex {
         let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
         // The default durability (`Immediate`): the `open` mark is on disk before any request.
         let txn = db.begin_write()?;
-        let (epoch, last, unclean) = {
+        let (epoch, last, unclean, suspended_until) = {
             let mut meta = txn.open_table(META)?;
             let stored = meta.get(EPOCH_KEY)?.map(|g| g.value());
             let epoch = if let Some(epoch) = stored {
@@ -445,6 +476,7 @@ impl IndexBackend for RedbIndex {
             // ADR 0046 rule 13: still marked open means the last run did not close it.
             let unclean = meta.get(OPEN_KEY)?.map(|g| g.value()) == Some(1);
             meta.insert(OPEN_KEY, 1)?;
+            let suspended_until = meta.get(SUSPENDED_KEY)?.map_or(0, |g| g.value());
             txn.open_table(IDS)?;
             txn.open_table(EDGES)?;
             txn.open_table(DEMAND)?;
@@ -455,7 +487,7 @@ impl IndexBackend for RedbIndex {
             if last.is_none() && meta.get(DEMAND_KEY)?.is_none() {
                 meta.insert(DEMAND_KEY, 1)?;
             }
-            (epoch, last, unclean)
+            (epoch, last, unclean, suspended_until)
         };
         txn.commit()?;
         Ok(Self {
@@ -468,6 +500,7 @@ impl IndexBackend for RedbIndex {
             }),
             demand_epoch_ms: AtomicU64::new(DEFAULT_DEMAND_EPOCH_MS),
             unclean,
+            suspended_until,
         })
     }
 
@@ -738,7 +771,12 @@ impl IndexBackend for RedbIndex {
         if done.is_some_and(|g| g.value() == 1) {
             return Ok(0);
         }
+        // Security review 2026-11-21, I-4: counts and durations only, never a `block_id`.
+        let started = Instant::now();
+        let total = self.db.begin_read()?.open_table(BLOCKS)?.len()?;
+        migration_line("start", &[("blocks", Value::Int(total))]);
         let mut filled = 0u64;
+        let mut batches = 0u64;
         let mut from = Position::default();
         loop {
             let txn = self.db.begin_write()?;
@@ -769,6 +807,18 @@ impl IndexBackend for RedbIndex {
                 }
             };
             txn.commit()?;
+            batches += 1;
+            if !more || batches.is_multiple_of(MIGRATION_LOG_EVERY) {
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                migration_line(
+                    if more { "progress" } else { "end" },
+                    &[
+                        ("batches", Value::Int(batches)),
+                        ("filled", Value::Int(filled)),
+                        ("duration_ms", Value::Int(ms)),
+                    ],
+                );
+            }
             if !more {
                 return Ok(filled);
             }
@@ -808,18 +858,28 @@ impl IndexBackend for RedbIndex {
         Ok(updated)
     }
 
-    fn demand_candidates(&self, bound: u64, max: usize) -> Result<Vec<Candidate>, IndexError> {
+    fn demand_candidates(&self, bound: u64, max: usize) -> Result<Candidates, IndexError> {
         let txn = self.db.begin_read()?;
         let order = txn.open_table(DEMAND_ORDER)?;
         let blocks = txn.open_table(BLOCKS)?;
         let max = max.clamp(1, MAX_QUERY_LIMIT);
         let mut out = Vec::with_capacity(max);
-        for item in order.range(..=(bound, u64::MAX, u32::MAX))?.take(max) {
+        let mut orphans = 0u64;
+        for item in order.range(..=(bound, u64::MAX, u32::MAX))? {
+            if out.len() >= max {
+                break;
+            }
             let (k, _) = item?;
             let (last_demand, received_at, n) = k.value();
             let position = Position { received_at, n };
-            // Written in the same transaction as the row: a missing row is not a candidate.
+            // Written in the same transaction as the row: a missing row (corruption) is not a
+            // candidate. Skipped before counting, so that orphans at the head of the order
+            // cannot fill the batch and stall every pass (security review 2026-11-21, I-3).
             let Some(row) = blocks.get(position.key())? else {
+                orphans += 1;
+                if orphans >= ORPHAN_SCAN_MAX {
+                    break;
+                }
                 continue;
             };
             let row = row.value();
@@ -838,7 +898,7 @@ impl IndexBackend for RedbIndex {
                 len,
             });
         }
-        Ok(out)
+        Ok(Candidates { list: out, orphans })
     }
 
     fn demand_state(&self, id: &BlockId) -> Result<Option<(Position, u64)>, IndexError> {
@@ -872,19 +932,57 @@ impl RedbIndex {
         self.unclean
     }
 
-    /// Records a clean shutdown, durably: call once every write is done and durable, right before
-    /// [`RedbIndex::close`]. An index closed without it is an unclean start at the next open.
+    /// The end, Unix milliseconds, of the demand-eviction suspension that was running when the
+    /// index was last closed cleanly; `0` when none (security review 2026-11-21, L-1).
+    #[must_use]
+    pub fn suspended_until(&self) -> u64 {
+        self.suspended_until
+    }
+
+    /// Records the `demand_eviction` setting of this start, durably, and returns the one of the
+    /// previous start: `None` when none was recorded (an index written before this record, or a
+    /// new index). Security review 2026-11-21, M-1: an off-to-on transition, or no record, means
+    /// that the index holds no usable demand history.
     ///
     /// # Errors
     ///
     /// redb errors.
-    pub fn mark_clean(&self) -> Result<(), IndexError> {
+    pub fn record_demand_eviction(&self, on: bool) -> Result<Option<bool>, IndexError> {
         let _w = self
             .writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let txn = self.db.begin_write()?;
-        txn.open_table(META)?.insert(OPEN_KEY, 0)?;
+        let previous = {
+            let mut meta = txn.open_table(META)?;
+            let previous = meta.get(DEMAND_ON_KEY)?.map(|g| g.value() == 1);
+            meta.insert(DEMAND_ON_KEY, u64::from(on))?;
+            previous
+        };
+        txn.commit()?;
+        Ok(previous)
+    }
+
+    /// Records a clean shutdown, durably: call once every write is done and durable, right before
+    /// [`RedbIndex::close`]. An index closed without it is an unclean start at the next open.
+    /// `suspended_until` is the end of the running demand-eviction suspension (`0` when none),
+    /// restored at the next start so that a clean restart does not cancel it (security review
+    /// 2026-11-21, L-1).
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    pub fn mark_clean(&self, suspended_until: u64) -> Result<(), IndexError> {
+        let _w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            meta.insert(SUSPENDED_KEY, suspended_until)?;
+            meta.insert(OPEN_KEY, 0)?;
+        }
         txn.commit()?;
         Ok(())
     }
@@ -981,6 +1079,13 @@ impl<'t> Tables<'t> {
         }
         Ok(true)
     }
+}
+
+/// One `demand_migration` line (security review 2026-11-21, I-4): `phase`, then `fields`.
+fn migration_line(phase: &'static str, fields: &[(&'static str, Value<'_>)]) {
+    let mut all = vec![("phase", Value::Str(phase))];
+    all.extend_from_slice(fields);
+    crate::log::emit(Event::DemandMigration, &all);
 }
 
 /// 64 random bits from the operating system (index epoch, rule 5).
@@ -1223,6 +1328,7 @@ mod tests {
         let order = |bound| -> Vec<_> {
             idx.demand_candidates(bound, 10)
                 .unwrap()
+                .list
                 .into_iter()
                 .map(|c| (c.last_demand, c.position, c.id, c.len))
                 .collect()
@@ -1232,7 +1338,7 @@ mod tests {
             vec![(10_000, a, id(1), 100), (10_000, b, id(2), 100)]
         );
         assert_eq!(order(12_000).len(), 3);
-        assert_eq!(idx.demand_candidates(u64::MAX, 0).unwrap().len(), 1);
+        assert_eq!(idx.demand_candidates(u64::MAX, 0).unwrap().list.len(), 1);
         // Forward only, once per epoch.
         assert_eq!(idx.record_demand(&[id(1), id(9)], 13_000).unwrap(), 1);
         assert_eq!(idx.record_demand(&[id(1)], 13_000).unwrap(), 0);
@@ -1253,6 +1359,44 @@ mod tests {
         let again = put(&idx, 1, &[], 20_100).unwrap();
         assert_eq!(idx.demand_state(&id(1)).unwrap(), Some((again, 20_000)));
         assert_eq!(order(u64::MAX).len(), 3);
+    }
+
+    /// Security review 2026-11-21, I-3: order entries without a `blocks` row (corruption) at the
+    /// head of the order are skipped and counted, without filling the batch; the scan of them is
+    /// bounded by `ORPHAN_SCAN_MAX`.
+    #[test]
+    fn orphan_order_entries_do_not_stall_the_listing() {
+        let idx = RedbIndex::open(&tmp("orphans"), DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        idx.configure_demand(1_000).unwrap();
+        let a = put(&idx, 1, &[], 10_500).unwrap();
+        let b = put(&idx, 2, &[], 10_600).unwrap();
+        let txn = idx.db.begin_write().unwrap();
+        {
+            let mut order = txn.open_table(DEMAND_ORDER).unwrap();
+            for n in 0..25u32 {
+                order.insert((0, 5, n), ()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let c = idx.demand_candidates(u64::MAX, 2).unwrap();
+        assert_eq!(c.orphans, 25);
+        assert_eq!(
+            c.list.iter().map(|c| c.position).collect::<Vec<_>>(),
+            [a, b]
+        );
+        let c = idx.demand_candidates(u64::MAX, 1).unwrap();
+        assert_eq!((c.orphans, c.list.len()), (25, 1));
+        // The bound: a listing past `ORPHAN_SCAN_MAX` orphans stops, with what it found.
+        let txn = idx.db.begin_write().unwrap();
+        {
+            let mut order = txn.open_table(DEMAND_ORDER).unwrap();
+            for n in 0..u32::try_from(ORPHAN_SCAN_MAX).unwrap() {
+                order.insert((1, 6, n), ()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let c = idx.demand_candidates(u64::MAX, 10).unwrap();
+        assert_eq!((c.orphans, c.list.len()), (ORPHAN_SCAN_MAX, 0));
     }
 
     /// ADR 0046 implementation plan, step 2: an index written before the demand tables gets them
@@ -1281,7 +1425,7 @@ mod tests {
                 at - at % 2_000
             );
         }
-        assert_eq!(idx.demand_candidates(u64::MAX, 10).unwrap().len(), 5);
+        assert_eq!(idx.demand_candidates(u64::MAX, 10).unwrap().list.len(), 5);
         assert_eq!(idx.configure_demand(2_000).unwrap(), 0, "done once");
         idx.close().unwrap();
         let idx = RedbIndex::open(&path, DEFAULT_INDEX_CACHE_BYTES).unwrap();

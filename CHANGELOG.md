@@ -118,6 +118,29 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- `sbtp-relay`, demand eviction (security review 2026-11-21, ADR 0046 clarifications D1 to D6):
+  - a start with no demand history (first start after the upgrade, an index rebuilt from the block
+    files) and every change of `demand_eviction` from off to on now suspend demand eviction for
+    `2 × E` (`demand_suspended cause=no_history` or `cause=enabled`); the setting of each start is
+    recorded in the index metadata. A new empty data directory is not suspended (M-1);
+  - a running suspension is written to the index at a clean stop and restored at the next start
+    (`cause=restored`) (L-1);
+  - each candidate of a demand pass checks the suspension again under its lock: a demand lost
+    during the pass ends it (L-2);
+  - a drain ended by its deadline or by a second signal no longer marks the index clean (L-3);
+  - `507` carries `Retry-After` only while demand eviction is on, neither suspended nor stuck;
+    otherwise none (L-4, amends ADR 0023 rule 18);
+  - when the index part alone reaches the low-water mark, the sweeper deletes nothing and logs
+    `demand_stuck cause=index`; a run also ends when a deletion did not lower the stored total (I-2);
+  - order entries without an index row no longer fill a candidate listing and stall it: they are
+    skipped and counted (`orphans` field), at most 10,000 per listing (I-3);
+  - the start-up migration of the demand tables logs `demand_migration` lines (start, every
+    100,000 blocks, end), with counts and durations only (I-4).
+- `sbtp-relay`: a `GET` or `HEAD` of `/block` carrying `Sbtp-Replication: 1` is answered
+  `Cache-Control: no-store` and `CDN-Cache-Control: no-store` in every mode and is not counted as
+  demand (ADR 0048 rule 18).
+- `deploy/README.md`: the CDN purge to make after turning demand eviction on, the start-up
+  suspension causes, and an "Alerts" section.
 - `sbtp-relay`: the sweeper could delete a block that had just been answered `201` when it listed
   the expired position while the acceptance's index insert was still being written (pre-push review
   2026-11-20 M-1, ADR 0043 rule 4). An acceptance now counts itself only after its index insert

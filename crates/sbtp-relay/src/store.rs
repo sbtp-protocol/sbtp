@@ -389,8 +389,15 @@ impl Store {
     /// (ADR 0046 rule 5), so that eviction makes room before `PUT`s get `507`.
     #[must_use]
     pub fn admission_total(&self) -> u64 {
-        self.used_bytes()
-            .saturating_add(index_reserve(self.index_bytes()))
+        self.used_bytes().saturating_add(self.index_reserve_bytes())
+    }
+
+    /// The part of [`Store::admission_total`] that no block deletion reduces: the index file and
+    /// its growth reserve ([`index_reserve`]; redb does not shrink its file). Security review
+    /// 2026-11-21, I-2.
+    #[must_use]
+    pub fn index_reserve_bytes(&self) -> u64 {
+        index_reserve(self.index_bytes())
     }
 
     fn publish(&self, index: u64) {

@@ -140,9 +140,10 @@ where
     let index_file = data_dir.join("index.redb");
     let index = RedbIndex::open(&index_file, cache)?;
     // ADR 0046 rule 13: read before anything else writes; implementation plan step 2: the demand
-    // entries of an index written before ADR 0046, before any request.
-    let unclean = index.unclean_start();
-    index.configure_demand(settings.demand_epoch_ms)?;
+    // entries of an index written before ADR 0046, before any request. Security review
+    // 2026-11-21: the migration and the `demand_eviction` record tell whether the index holds a
+    // demand history (M-1); the suspension of the last clean close is restored (L-1).
+    let mut start = demand_start(&index, &settings)?;
     let index = Arc::new(index);
     // ADR 0018 rules 9 to 11: from here on only the index threads call the index.
     let pool = IndexPool::start(&index, &settings)
@@ -153,15 +154,18 @@ where
             // ADR 0023 rule 15, before listening: the index is ready when the relay listens
             // (rule 11). The walk is one job of the writer thread: its lookups and inserts run
             // there, before any request can queue a read.
+            // Whether the index holds a block is read after the walk, which re-indexes the files
+            // of a rebuilt index with their file times: no demand history either (M-1).
             let walked = pool
                 .handle()
                 .write_blocking(move |i| {
-                    let r = store::reconcile(&store, i).map(|_| ());
+                    let r = store::reconcile(&store, i)
+                        .and_then(|_| i.is_empty().map_err(ReconcileError::Index));
                     (store, r)
                 })
                 .map_err(|_| StartError::Shutdown("the index writer thread is not running"))?;
             match walked {
-                (store, Ok(())) => Ok(store),
+                (store, Ok(empty)) => Ok((store, empty)),
                 (_, Err(ReconcileError::Io(e))) => {
                     Err(StartError::Io("reconciling the block store", e))
                 }
@@ -169,14 +173,18 @@ where
             }
         });
     let served = match opened {
-        Ok(store) => match Relay::new(&settings, store, pool.handle()) {
+        Ok((store, empty)) => match Relay::new(&settings, store, pool.handle()) {
             Ok(relay) => {
-                if unclean {
-                    relay.demand().unclean_start(log::unix_ms());
-                }
+                start.empty = empty;
+                relay.demand().start(&start, log::unix_ms());
                 let relay = Arc::new(relay);
+                let kept = Arc::clone(&relay);
                 let app = api::app(&settings, Arc::clone(&relay));
-                serve(&settings, app, relay, shutdown, on_listen)
+                let drain = serve(&settings, app, relay, shutdown, on_listen);
+                // L-1: written by the clean mark, restored at the next start.
+                let until = kept.demand().suspended_until();
+                drop(kept);
+                drain.map(|d| (d, until))
             }
             Err(e) => Err(StartError::Io(
                 "allocating the demand set",
@@ -190,14 +198,21 @@ where
         ShutdownError::Flush(e) => StartError::Index(e),
         ShutdownError::Panicked(m) => StartError::Shutdown(m),
     });
-    // ADR 0046 rule 13: the index is marked closed cleanly only when every write is durable and
-    // the demand set was flushed; otherwise the next start suspends demand eviction.
-    let clean = served.is_ok() && durable.is_ok();
+    // ADR 0046 rule 13: the index is marked closed cleanly only when every write is durable, the
+    // demand set was flushed, and every request handler had ended before that flush; otherwise
+    // the next start suspends demand eviction. Security review 2026-11-21, L-3: after a drain cut
+    // by its deadline or a second signal, handlers still running can record a demand after the
+    // final flush, which would be lost without a trace; such a stop is therefore not clean.
+    let suspended_until = match &served {
+        Ok((drain, until)) if drain.complete() && durable.is_ok() => Some(*until),
+        _ => None,
+    };
+    let served = served.map(|_| ());
     let closed = Arc::try_unwrap(index)
         .map_err(|_| StartError::Shutdown("index still shared, not closed"))
         .and_then(|i| {
-            let marked = if clean {
-                i.mark_clean().map_err(StartError::Index)
+            let marked = if let Some(until) = suspended_until {
+                i.mark_clean(until).map_err(StartError::Index)
             } else {
                 Ok(())
             };
@@ -208,6 +223,20 @@ where
         log::emit(Event::Shutdown, &[("phase", Value::Str("index_closed"))]);
     }
     served.and(durable).and(closed)
+}
+
+/// The start state of demand eviction (ADR 0046 rule 13, clarifications D1 and D2), read and
+/// recorded before the index is shared: the unclean mark, the stored suspension end, the
+/// migration of an index written before ADR 0046, and the `demand_eviction` of the previous start
+/// (this start's value is recorded, durably). `empty` is set after the start-up walk.
+fn demand_start(index: &RedbIndex, settings: &Settings) -> Result<demand::StartState, IndexError> {
+    Ok(demand::StartState {
+        unclean: index.unclean_start(),
+        suspended_until: index.suspended_until(),
+        migrated: index.configure_demand(settings.demand_epoch_ms)? > 0,
+        previous: index.record_demand_eviction(settings.demand_eviction)?,
+        empty: false,
+    })
 }
 
 /// The start-up lines from `profile` to `config_warning` (ADR 0019 rules 22 and 36.6, ADR 0018
@@ -287,14 +316,14 @@ fn log_settings(settings: &Settings) -> Result<(), StartError> {
 /// installs the shutdown signal, binds and serves. The sweeper ([`sweep::run`]) runs beside the
 /// accept loop; if it ends while the relay serves (a run panicked), the process exits like a
 /// supervised index thread (ADR 0018 rule 37). On shutdown it is stopped and its current run, if
-/// any, is waited for, before the index threads stop.
+/// any, is waited for, before the index threads stop. Returns how the drain ended.
 fn serve<S, T>(
     settings: &Settings,
     app: axum::Router,
     relay: Arc<Relay<RedbIndex>>,
     shutdown: S,
     on_listen: impl FnOnce(SocketAddr),
-) -> Result<(), StartError>
+) -> Result<server::Drain, StartError>
 where
     S: FnOnce() -> std::io::Result<T>,
     T: server::StopSignal,
@@ -349,11 +378,11 @@ where
         let lost = tokio::task::spawn_blocking(move || sweep::flush_demand(&flushed).lost)
             .await
             .unwrap_or(1);
-        served.map_err(|e| StartError::Io("serving", e))?;
+        let drain = served.map_err(|e| StartError::Io("serving", e))?;
         if lost > 0 {
             return Err(StartError::Shutdown("the demand set was not flushed"));
         }
-        Ok(())
+        Ok(drain)
     })
 }
 

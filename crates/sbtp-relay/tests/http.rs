@@ -680,7 +680,11 @@ struct Running {
 
 /// The whole shipped start-up path (`sbtp_relay::run`) on a fresh data directory.
 fn run_relay(name: &str, pairs: &[(&str, &str)]) -> Running {
-    let data = tmp_dir(name);
+    run_relay_in(tmp_dir(name), pairs)
+}
+
+/// [`run_relay`] on the data directory `data`, kept if it exists.
+fn run_relay_in(data: std::path::PathBuf, pairs: &[(&str, &str)]) -> Running {
     let mut e = env(&[
         ("MIN_POW_DIFFICULTY", "16"),
         ("LISTEN", "127.0.0.1:0"),
@@ -732,7 +736,12 @@ fn second_signal_skips_the_drain() {
     relay.thread.join().unwrap().unwrap();
     assert!(t.elapsed() < Duration::from_secs(2));
     assert!(is_closed(&mut c));
-    RedbIndex::open(&relay.data.join("index.redb"), 1 << 20).unwrap();
+    let reopened = RedbIndex::open(&relay.data.join("index.redb"), 1 << 20).unwrap();
+    // ADR 0046 clarification D4: a forced drain is not a clean stop.
+    assert!(
+        reopened.unclean_start(),
+        "a forced drain leaves the index unclean"
+    );
 }
 
 #[test]
@@ -761,8 +770,43 @@ fn graceful_shutdown_flushes_and_closes() {
     assert!(t.elapsed() < Duration::from_secs(5));
     let reopened = RedbIndex::open(&index, 1 << 20).unwrap();
     assert!(reopened.is_empty().unwrap());
+    assert!(
+        !reopened.unclean_start(),
+        "a completed drain is a clean stop"
+    );
+    // A new empty index is not suspended (ADR 0046 clarification D1).
+    assert_eq!(reopened.suspended_until(), 0);
     // The listener is gone.
     assert!(std::net::TcpStream::connect(addr).is_err());
+}
+
+/// ADR 0046 clarifications D1 and D2 on the shipped start-up path: a start that turns demand
+/// eviction from off to on suspends it for `2 × E`, written at the clean stop and restored at the
+/// next start; the setting of each start is recorded.
+#[test]
+fn turning_demand_eviction_on_suspends_across_clean_restarts() {
+    let data = tmp_dir("demand-on");
+    let stop = |r: Running| {
+        r.stop.send(()).unwrap();
+        r.thread.join().unwrap().unwrap();
+    };
+    stop(run_relay_in(data.clone(), &[("DEMAND_EVICTION", "false")]));
+    let index = data.join("index.redb");
+    let started = sbtp_relay::log::unix_ms();
+    stop(run_relay_in(data.clone(), &[]));
+    let reopened = RedbIndex::open(&index, 1 << 20).unwrap();
+    assert!(!reopened.unclean_start());
+    let until = reopened.suspended_until();
+    let two_epochs = 2 * 86_400_000;
+    assert!(until >= started + two_epochs, "{until} {started}");
+    assert!(until <= sbtp_relay::log::unix_ms() + two_epochs);
+    assert_eq!(reopened.record_demand_eviction(true).unwrap(), Some(true));
+    reopened.mark_clean(until).unwrap();
+    reopened.close().unwrap();
+    // On to on: no new suspension, the running one is kept.
+    stop(run_relay_in(data.clone(), &[]));
+    let reopened = RedbIndex::open(&index, 1 << 20).unwrap();
+    assert_eq!(reopened.suspended_until(), until, "restored, not moved");
 }
 
 /// Security review F-1: a connection that never sends a byte is cut at `header_timeout_ms`, not
