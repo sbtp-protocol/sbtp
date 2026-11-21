@@ -85,6 +85,11 @@ test("error body: name or null", () => {
   assert.equal(errorName(enc({ error: "InvalidCursor", message: "x" })), "InvalidCursor");
   assert.equal(errorName(enc("<html>")), null);
   assert.equal(errorName(null), null);
+  // Pre-push review I-2: only [A-Za-z0-9_-] is kept, so no line break or forged text.
+  assert.equal(errorName(enc({ error: "Rate\nhttps://other: acknowledged" })), "Ratehttpsotheracknowledged");
+  assert.equal(errorName(enc({ error: "Bad_Name-1 \u00e9\t" })), "Bad_Name-1");
+  assert.equal(errorName(enc({ error: "\n \r" })), null);
+  assert.equal(errorName(enc({ error: "x".repeat(100) })), "x".repeat(64));
 });
 
 test("relay URL: https anywhere, http on loopback only, no credentials/query/fragment", () => {

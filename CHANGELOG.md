@@ -149,6 +149,16 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- Pre-push security review 2026-11-21 (`docs/security/2026-11-21-pre-push-eviction-fixes-web-0047.md`):
+  - `sbtp-relay`: a demand pass no longer ends after one deletion when `PUT`s or index growth move
+    the admission total during it; a deletion ends the pass only when it released no quota bytes
+    (L-1);
+  - `sbtp-relay`: a suspension restored at start-up is capped at `2 × E` from the start, so that an
+    end written under a wall clock far ahead cannot suspend demand eviction for years (I-1);
+  - web client: a relay-supplied error name keeps only `[A-Za-z0-9_-]` before it is stored or
+    shown (I-2);
+  - `deploy/README.md`: the `no_history` cause also covers the one-off suspension of a relay
+    upgraded from the previous build (I-5).
 - `sbtp-relay`, demand eviction (security review 2026-11-21, ADR 0046 clarifications D1 to D6):
   - a start with no demand history (first start after the upgrade, an index rebuilt from the block
     files) and every change of `demand_eviction` from off to on now suspend demand eviction for

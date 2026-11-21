@@ -131,11 +131,18 @@ export function parseRetryAfter(value) {
   return { ms: Number(text) * 1000 };
 }
 
-/** The `error` member of an error body, or null when missing or unparseable (spec §4 "Errors"). */
+/**
+ * The `error` member of an error body, or null when missing or unparseable (spec §4 "Errors"). Only
+ * `[A-Za-z0-9_-]` is kept (at most 64 characters), so that a relay cannot put a line break or other
+ * text into what is stored and shown (security review 2026-11-21 pre-push, I-2); a name left empty
+ * is null.
+ */
 export function errorName(bytes) {
   if (bytes === null) return null;
   const v = parseJson(bytes);
-  return isObject(v) && typeof v.error === "string" ? v.error.slice(0, 64) : null;
+  if (!isObject(v) || typeof v.error !== "string") return null;
+  const name = v.error.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return name === "" ? null : name;
 }
 
 function statusError(res) {

@@ -126,9 +126,11 @@ otherwise without `Retry-After`, so that clients try another relay.
   - `unclean_start`: the last stop was not clean: `SIGKILL`, a crash, a power loss, or a drain
     cut by a second signal or by its deadline (requests were still running). Stop with one
     `SIGTERM` and let the drain finish.
-  - `no_history`: the first start after the upgrade that added demand tracking, or an index
-    rebuilt from the block files: the index knows when blocks were accepted, not when they were
-    last read. A new, empty data directory is not suspended.
+  - `no_history`: the first start after an upgrade that added demand tracking or the record of
+    the `demand_eviction` setting (a relay already running the previous build gets this one-off
+    `2 × demand_epoch_ms` suspension once), or an index rebuilt from the block files: the index
+    knows when blocks were accepted, not when they were last read. A new, empty data directory
+    is not suspended.
   - `enabled`: `demand_eviction` was `false` at the previous start, when reads were not recorded.
   - `restored`: a suspension was running at the last clean stop; it keeps its end.
   - `lost` (while running, rate-capped): the demand set was full or a flush failed.

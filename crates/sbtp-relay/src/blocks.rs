@@ -138,6 +138,9 @@ pub struct Relay<I> {
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Tests: run by [`Relay::evict_locked`] right after each file deletion, under the lock.
+    #[cfg(test)]
+    after_evict: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl<I: IndexBackend + 'static> Relay<I> {
@@ -188,6 +191,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
             ingest: Ingest::from_settings(s)?,
             #[cfg(test)]
             before_insert: Mutex::new(None),
+            #[cfg(test)]
+            after_evict: Mutex::new(None),
         })
     }
 
@@ -232,6 +237,15 @@ impl<I: IndexBackend + 'static> Relay<I> {
     pub(crate) fn set_before_insert(&self, f: impl FnOnce() + Send + 'static) {
         *self
             .before_insert
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
+    }
+
+    /// Tests: `f` runs inside every later [`Relay::evict_locked`], right after the file deletion.
+    #[cfg(test)]
+    pub(crate) fn set_after_evict(&self, f: impl FnMut() + Send + 'static) {
+        *self
+            .after_evict
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
@@ -310,10 +324,19 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// The sweeper's deletion of one block, under the lock of `id` (ADR 0013 rule 15, first two
     /// steps): the cache entry, the file, then the cache entry again, so that a `GET` miss that
     /// read the file before the `unlink` cannot leave it cached ([`Relay::cache_loaded`]).
-    /// Returns whether a file was there.
-    pub(crate) fn evict_locked(&self, id: &BlockId) -> io::Result<bool> {
+    /// Returns the quota bytes released, or `None` when no file was there ([`Store::evict`]).
+    pub(crate) fn evict_locked(&self, id: &BlockId) -> io::Result<Option<u64>> {
         self.cache.remove(id);
         let deleted = self.store.evict(id)?;
+        #[cfg(test)]
+        if let Some(f) = self
+            .after_evict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            f();
+        }
         if let Some(a) = self.evicted.get(stripe(id)) {
             a.fetch_add(1, Ordering::SeqCst);
         }
