@@ -22,6 +22,8 @@
 - Clarification: 2026-11-21, editorial: the body of rule 3, item 2 now states the current total
   (19,425,202 bytes with every function on) and the history of the figure, as recorded by ADR 0050
   U3, ADR 0052 rule 21 and ADR 0054 rule 35. No figure changes
+- Amended by: 0053, proposed (2026-11-21): clarification S16 (rule 22: a learned relay serves only
+  fetches by `block_id`; no listing or poll is sent there, and it does not count for completeness)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)

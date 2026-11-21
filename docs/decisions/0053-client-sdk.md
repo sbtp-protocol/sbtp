@@ -17,7 +17,9 @@
   sent to (ADR 0047 D3), duplicates in a page, own time limit, other `5xx` (ADR 0047 D2), re-submission
   schedule base, cut batch record, `follow` without `head`, bad `relays` member, `451` on a
   `read_only` URL, malformed flags, absent `block_ttl_ms`, a page that does not advance (ADR 0051
-  B10)
+  B10); S16 to S19, proposed (2026-11-21): candidate relays serve fetches by `block_id` only, bad
+  `/.well-known/sbtp` list, no redirect of `/.well-known/sbtp`, the first 4 URI hints counted before
+  validation
 - Date: 2026-11-21
 - Questions: none resolved; opens Q-78 and Q-79. Refers to Q-23 (subscriptions, `follow`), Q-26
   (peer-to-peer serving) and Q-77 (snapshot format)
@@ -530,7 +532,7 @@ Applied on acceptance (2026-11-21).
 - **A two-person release rule now.** With the current maintainers it would block every release. It
   is reconsidered when maintainers are added (rule 32).
 
-## Clarifications S1 to S15 (2026-11-21, proposed)
+## Clarifications S1 to S19 (2026-11-21, proposed)
 
 Raised by the first TypeScript implementation of this ADR. Each clarification is proposed on its own,
 for the project owner to accept one by one. None changes the wire format of a block, the relay
@@ -652,8 +654,48 @@ and applied only for the clarifications accepted.
   answer a request that carried cursor `C` with a page of that listing that holds no identifier, has
   `more = true` and returns `C`; a client MAY treat such a page as a relay fault. *Implementation:*
   ends the listing incomplete (reason "stalled"); conforms.
+- **S16. What a candidate relay is used for (rule 15, ADR 0048 rule 22).** Yes, this is the intent.
+  A candidate relay (learned from `/info` `relays`, `/.well-known/sbtp` or a URI hint, and not chosen
+  by the user or the application's configuration) serves only fetches by `block_id` of public
+  blocks (`GET /block`, `POST /blocks`), and only when the application enables it. Walks, `follow`,
+  polls, publication and presence checks of own blocks use the user's relay list only. A candidate's
+  listings never count for completeness (rule 10). *Reason:* a listing or a poll names the parents the
+  user follows and can be the user's own traffic (the delivery tags of sealed messages); completeness
+  is defined over the user's list (ADR 0051 clarification B8), and a listing from a relay the user did
+  not choose would make it depend on an untrusted set. A fetch by `block_id` is checked by R1 (§3.4),
+  so a candidate can withhold a block but cannot substitute one. "Public reads" in ADR 0048 rule 22
+  means these fetches. *Implementation:* conforms.
+- **S17. An invalid entry in `/.well-known/sbtp` `relays` (ADR 0040 rule 17, ADR 0048 rule 20).** As
+  S11: the whole member is read as absent. The same holds for `graph_gateways`, which has the same
+  bounds. *Reason:* ADR 0048 rule 20 makes this member a relay list, one format everywhere; a list
+  that breaks it is out of range (ADR 0029 rule 13). "Every URL is a hint" (ADR 0040 rule 17) says what
+  a valid entry is worth, not how to repair a list. A URI hint differs: each `relay` parameter of a URI
+  is a separate value with no list constraint, so ADR 0040 rule 4 ignores bad hints one by one. A
+  document and an `/info` body are each one JSON value produced by one party, and keeping part of
+  them would let two consumers learn different sets from the same bytes. *Implementation:* drops the
+  member; conforms.
+- **S18. A redirect of `/.well-known/sbtp`.** Not following it is correct. The document is not under
+  a relay URL, so rule 4 does not apply to it as written. The same transport rules apply to it all the
+  same: no redirect is followed, no cookies and no authentication are sent, a total time limit, a
+  ceiling of 16,384 bytes. A `3xx` means that the site serves no document at that origin. *Reason:*
+  the document speaks for the origin it was asked from (RFC 8615). Following a redirect, to another
+  origin in particular, would let a third party answer for the site. It would also let a server-side
+  consumer (a gateway, the MCP server of ADR 0042) be steered to a host it did not choose. A site
+  that redirects between host names serves the document on each of them. *Implementation:* conforms.
+- **S19. The first 4 URI hints (ADR 0040 rule 4).** The resolver counts first: it takes the first 4
+  `relay` parameters in URI order, then ignores those that are invalid. It never reads past the 4th
+  `relay` parameter. *Reason:* the selection then depends on the URI alone, not on a resolver's local
+  validity rules (the `http` loopback allowance of rule 4 differs between resolvers). It matches the
+  order of the sentences of rule 4. It gives an honest producer all it needs, since a producer SHOULD
+  add at most 2 hints. Amplification and tracking are bounded by the same 4 hosts in both readings: a
+  URI's author chooses the hosts a resolver contacts and learns its address and the time, whether
+  invalid hints count or not. Dropping invalid hints first would only let the author push valid hints
+  past filler that one resolver accepts and another refuses. The defence against tracking is not the
+  count: hints are candidates (S16, rule 15) that are used only when the application enables them,
+  and the MCP server keeps them off by default (ADR 0042). *Implementation:* counts before dropping;
+  conforms.
 
-### Spec change on acceptance of S1 to S15
+### Spec change on acceptance of S1 to S19
 
 Core spec §4, `GET /sbtp/v1/info`:
 
@@ -693,9 +735,37 @@ Core spec §4, "Admission control":
   > expiry of the client's own time limit is a failed request, followed by back-off. (ADR 0053,
   > clarification S6)
 
+Core spec §4, `GET /sbtp/v1/info`, the bullet on `relays`, after "does not send the user's own
+traffic to a listed relay unless the user chose it.":
+
+- **S16**:
+  > A relay it learned and did not choose serves it only fetches by `block_id`; it sends no listing
+  > or poll there, and such a relay does not count for completeness. (ADR 0048, ADR 0053,
+  > clarification S16)
+
+`graph-access.md` §5.2, the bullet "Every member except `sbtp_discovery` is optional…" gains:
+
+- **S17**:
+  > A `relays` or `graph_gateways` member that breaks its bounds or the relay list format (core spec
+  > §4) is read as absent. (ADR 0048, ADR 0053, clarification S17)
+- **S18**, a new bullet:
+  > - A consumer does not follow a redirect for this document: a `3xx` means that the site serves no
+  >   document at that origin. It sends no cookies and no authentication. (ADR 0053, clarification
+  >   S18)
+
+`graph-access.md` §1.4, the bullet "A resolver uses at most the first 4 hints. It ignores a hint…"
+becomes:
+
+- **S19**:
+  > - A resolver uses at most the first 4 `relay` parameters, in URI order, and never reads past the
+  >   4th. Among them it ignores a hint that is not an absolute `https` URL without userinfo, query or
+  >   fragment (its local configuration MAY allow `http` for loopback hosts). It counts fetches from
+  >   hints in its client bounds (core spec §4, "Client bounds"). (ADR 0040 rule 4; ADR 0053,
+  >   clarification S19)
+
 S4, S7 and S15: see ADR 0047 amendments D2 and D3 and ADR 0051 clarification B10. S8 to S12 change no
 spec text: they state how the SDK applies rules the specification already has.
 
 Test cases: `client-v1/` (planned, not frozen) gains one positive and one negative case for each
-accepted clarification that states a MUST (S1, S2, S3, S5, S6, S12, S13, S14), and the cases of ADR 0047
+accepted clarification that states a MUST (S1, S2, S3, S5, S6, S12, S13, S14, S16 to S19), and the cases of ADR 0047
 amendments D2 and D3 and ADR 0051 clarification B10.
