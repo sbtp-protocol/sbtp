@@ -401,18 +401,22 @@ deny_file = "/etc/sbtp-relay/deny.txt"
   (for example by a `GET`) before loading a `purge` entry.
 - **Copies the relay cannot reach.**
   - A CDN keeps `200` responses up to a year: purge `/sbtp/v1/block/<block_id>` from it after each
-    new block entry. For a key entry, purge each held block of that key. A command that lists
-    them is not part of this version yet, and once a key entry is loaded the relay hides its
-    blocks from `/query` and answers `451`, so the list must be collected **before** the key takes
-    effect:
-    1. Load the key with `hide` first if you intend `purge` (a `purge` entry deletes the local
-       bytes, so nothing would be left to inspect). Or collect the list before loading the entry
-       at all.
-    2. Collect the list: with no key entry loaded yet, walk `/query` and keep the blocks whose
-       header carries the key (bytes 19 to 50 of each block); with a `hide` entry already loaded,
-       read the block files in the data directory directly, since `/query` no longer lists them.
-    3. Purge each `/sbtp/v1/block/<block_id>` of that list from the CDN.
-    4. Only then switch the entry to `purge`, if wanted, and reload.
+    new block entry. For a key entry, purge each held block of that key. The relay lists them:
+
+    ```sh
+    sbtp-relay key-blocks <public-key-hex> [--config <path>] > key-blocks.txt
+    ```
+
+    It reads the block headers in the data directory (same settings as the relay, so the same
+    `--config` and `SBTP_RELAY_*` variables), read-only, and works while the relay runs, before or
+    after the key entry is loaded. It prints one `block_id` per line on standard output and
+    writes nothing else, to the log or elsewhere; keep the list file as private as the deny file.
+    Run it as the relay's user (in the image:
+    `docker exec <container> /usr/local/bin/sbtp-relay key-blocks …`).
+    A `purge` entry deletes the local bytes, after which nothing is left to list, so:
+    1. Load the key with `hide` (or not at all yet) and run `key-blocks`.
+    2. Purge each `/sbtp/v1/block/<block_id>` of that list from the CDN.
+    3. Only then switch the entry to `purge`, if wanted, and reload.
   - The archive copy never uploads a denied block, but never deletes from the bucket either.
     Removing an object already uploaded is an operator task, with credentials the relay does not
     hold (the relay's own allow `PutObject` only): delete

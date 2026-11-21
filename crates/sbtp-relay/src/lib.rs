@@ -29,6 +29,7 @@ pub mod log;
 pub mod metrics;
 #[cfg(feature = "object-store")]
 pub mod mirror;
+pub mod operator;
 pub mod peers;
 pub mod pool;
 pub mod query;

@@ -302,7 +302,7 @@ impl List {
             || added_purge(&self.keys, old.map(|o| &o.keys))
     }
 
-    /// Every listed key with `hide` or `purge`, for the operator command.
+    /// Every listed key, with `hide` or `purge`.
     pub fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.keys.keys()
     }
