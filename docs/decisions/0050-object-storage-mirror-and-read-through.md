@@ -1,12 +1,17 @@
 # 0050: Archive copy to S3-compatible object storage, and read-through fallback from read-only sources
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21), as proposed, with the owner choices recorded in
+  "Decisions of the project owner": the `/info` member `read_only` (a core spec change);
+  `fallback_sources` as a separate setting; `fallback_keep` on by default; one writer per bucket
+  recommended. Rule 27 (memory) is replaced by the owner's budget decision: the outbound terms are added
+  to the bound, and the block cache keeps its default
 - Date: 2026-11-21
-- Questions: Q-72 (opened: memory of the outbound functions on `small`), Q-73 (opened: verification
-  and repair of a shared bucket)
-- Amends: ADR 0018 rule 35 (the outbound terms are taken from `block_cache_bytes`); ADR 0019 rules 37
-  and 38 (profile rows and policy settings); ADR 0021 rule 41 (counters). If ADR 0048 is accepted, its
-  rule 18 gains rule 17 below. Nothing else in these ADRs changes
+- Questions: Q-72 (opened here; resolved by the owner's budget decision, rule 27), Q-73 (opened:
+  verification and repair of a shared bucket; stays open)
+- Amends: ADR 0018 rule 35 (the outbound terms of rule 27 are added to the bound when a function is
+  on); ADR 0019 rules 37 and 38 (profile rows and policy settings); ADR 0021 rule 41 (counters);
+  ADR 0048 rule 18 (gains rule 17 below). The owner's budget decision recorded in rule 27 also amends
+  ADR 0048 rule 3, item 2 (recorded there). Nothing else in these ADRs changes
 - Depends on: ADR 0010 (chunks, out of scope), ADR 0023 (integrity of served bytes), ADR 0029 (client
   bounds), ADR 0030 (no redirects), ADR 0040 (relay URLs, hints), ADR 0043 (re-acceptance), ADR 0045,
   ADR 0046 (demand eviction), ADR 0047 (final refusals), ADR 0048 (outbound client, relay lists, URL
@@ -205,15 +210,25 @@ documentation):
     150 KB of binary, under 100 KB compressed in the image; without it, the TLS stack adds about 1 MB
     (ADR 0048 estimate). The CI budget job of ADR 0048 rule 3 (binary < 8,000,000 bytes, image
     < 5,000,000 bytes compressed) measures the image with every feature on.
-27. **Memory.** New terms, estimates: per upload or fetch in flight, 65,909 (block) + 90,000 (TLS and
-    HTTP state); the root store, 400,000, shared with replication when both are on; the uploader's page,
-    64 × 32; the negative cache, `fallback_negative_max × 48`. On `small` with both functions on
-    (one upload, one fetch, 256 negative entries): 2 × 155,909 + 400,000 + 2,048 + 12,288 = 726,154
-    bytes. They do not fit next to the `small` bound (89,004 bytes left after ADR 0049), so **they are
-    taken from `block_cache_bytes`**: when either function is on, the block cache gets
-    `block_cache_bytes` minus these terms (at least 0), and the computed bound of ADR 0018 rule 35 does
-    not change. On `small` the block cache goes from 2 MiB to about 1.3 MiB. The relay logs the
-    effective block cache at start-up. A deployment that wants both keeps `small`'s 15 MB bound.
+27. **Memory** (owner decision of 2026-11-21, replacing the proposed text, which took these terms from
+    `block_cache_bytes`). New terms of ADR 0018 rule 35, estimates: per upload or fetch in flight,
+    65,909 (block) + 90,000 (TLS and HTTP state); the root store, 400,000, counted once and shared with
+    replication when both are on; the uploader's page, 64 × 32; the negative cache,
+    `fallback_negative_max × 48`. The terms count only when the feature is compiled and the function is
+    on (`mirror_endpoint` set, `fallback_sources` not empty); they are **added to the bound**. The block
+    cache keeps its default (`block_cache_bytes`, 2 MiB on `small`) whether these functions are on or
+    off. On `small` with both functions on (one upload, one fetch, 256 negative entries):
+    2 × 155,909 + 400,000 + 2,048 + 12,288 = 726,154 bytes alone, 326,154 bytes when replication is
+    also on (the root store is already counted).
+
+    The owner accepts about 1 MB per enabled outbound function rather than a smaller block cache. The
+    budget of ADR 0048 rule 3, item 2 (as amended on 2026-11-21) applies: `small` with the default
+    settings stays under 15,000,000 bytes (these functions are off by default); `small` with every
+    function on stays under 20,000,000 bytes. Computed on `small`: the default bound with ADR 0049,
+    14,910,996 bytes; plus server TLS (ADR 0028 rule 36, 2,228,224), replication (ADR 0048 rule 16,
+    723,077) and this ADR (326,154): 18,188,451 bytes, 1,811,549 bytes under 20,000,000. That margin is
+    what later functions (sync, streaming, chunks, OHTTP) have; each later ADR states its terms and the
+    new total.
 
 ### Settings and metrics
 
@@ -284,9 +299,27 @@ private-address refusal with DNS that changes between checks, no redirect; every
 before allocation; the uploader's backlog lives on disk and its memory is constant; the no-chain rule;
 fetch bounds and the negative cache against a client asking for random identifiers; a hostile source
 (wrong body, `200` with a valid block for another id, slow body); the keep path takes no check the
-`PUT` path has; the `small` bound with the block cache reduced.
+`PUT` path has; the `small` bound with every function on (rule 27).
+
+## Decisions of the project owner (2026-11-21)
+
+1. **Accepted as proposed**, including the `/info` member `read_only` (core spec §4, a change of the
+   relay interface; rule 3).
+2. **`fallback_sources` is a separate setting**, not a marker in `peers` (rule 15).
+3. **`fallback_keep` is on by default** (rule 19).
+4. **One writer per bucket is recommended** (rule 13).
+5. **Memory and size budget.** The proposed rule 27 (outbound terms taken from the block cache) is
+   replaced: about 1 MB per enabled outbound function is accepted, and the block cache keeps its
+   default. The budgets, checked in CI on every pull request, are recorded in ADR 0048 rule 3, item 2:
+   binary under 8 MB; published image (the single image, every feature compiled in) under 5 MB
+   compressed; `small` worst case under 15 MB with the default settings and under 20 MB with every
+   function on; core `.wasm` under 200 KB gzip, with any MLS (group encryption) code in a separate
+   module loaded on demand and budgeted on its own. This replaces the 16 MB bound of `small` with
+   replication on (ADR 0048) and resolves Q-72.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 Core spec §4, `GET /sbtp/v1/info`, new bullet after `demand_eviction`:
 
