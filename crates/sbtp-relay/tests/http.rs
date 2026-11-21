@@ -24,13 +24,13 @@ fn server(pairs: &[(&str, &str)]) -> TestServer {
 }
 
 /// ADR 0018 rules 21 and 29, ADR 0020 rules 23 and 25(c), over HTTP: a CORS preflight and a
-/// request to an unknown path each take a `block` token, then `/info` gets `429 RateLimited`
+/// request to an unknown path each take a `block` token, then, once the burst is spent, `/info` gets `429 RateLimited`
 /// with the JSON body, `Retry-After` and the CORS headers; the `put` bucket refuses a `PUT`
 /// before its body is read. `query` keeps its own bucket.
 #[test]
 fn block_and_put_buckets_give_429() {
     let relay = server(&[
-        ("RATE_BLOCK_BURST", "2"),
+        ("RATE_BLOCK_BURST", "64"),
         ("RATE_BLOCK_PER_MIN", "1"),
         ("RATE_PUT_BURST", "1"),
         ("RATE_PUT_PER_MIN", "1"),
@@ -43,6 +43,10 @@ fn block_and_put_buckets_give_429() {
     );
     assert!(preflight.status < 300, "{}", preflight.status);
     assert_eq!(http_get(&mut c, "/no/such/path", "").status, 404);
+    // 64 tokens, the smallest burst: 62 more requests of the class pass.
+    for _ in 0..62 {
+        assert_eq!(http_get(&mut c, "/sbtp/v1/info", "").status, 200);
+    }
     let r = http_get(&mut c, "/sbtp/v1/info", "");
     assert_eq!(r.status, 429);
     assert_eq!(r.json()["error"], "RateLimited");

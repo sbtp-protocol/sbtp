@@ -28,14 +28,23 @@ impl Write for Capture {
 }
 
 const BUCKET: [(&str, &str); 3] = [
-    ("RATE_QUERY_BURST", "1"),
+    ("RATE_QUERY_BURST", "4"),
     ("RATE_QUERY_PER_MIN", "1"),
     ("LOG_LEVEL", "debug"),
 ];
 
+/// A grouped `/query` of 32 parents: its weight, `⌈32/8⌉ = 4` (ADR 0051 rule 21), is the whole
+/// burst of a client (the smallest burst the relay accepts), so a second one gets `429`.
+fn full_burst_target() -> String {
+    let parents: Vec<String> = (0..32u8)
+        .map(|n| format!("parent={}", "ab".repeat(31) + &format!("{n:02x}")))
+        .collect();
+    format!("/sbtp/v1/query?{}", parents.join("&"))
+}
+
 fn query(relay: &TestServer, headers: &str) -> u16 {
     let mut c = relay.connect();
-    http_get(&mut c, "/sbtp/v1/query", headers).status
+    http_get(&mut c, &full_burst_target(), headers).status
 }
 
 fn cf(v: &str) -> String {
@@ -107,7 +116,8 @@ fn client_address_from_a_single_value_header() {
         exchange(
             &mut c,
             &format!(
-                "GET /sbtp/v1/query HTTP/1.1\r\nHost: relay.test\r\n{}{}\r\n",
+                "GET {} HTTP/1.1\r\nHost: relay.test\r\n{}{}\r\n",
+                full_burst_target(),
                 xff("198.51.100.30"),
                 cf("203.0.113.30")
             )

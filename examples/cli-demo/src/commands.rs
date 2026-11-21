@@ -17,7 +17,7 @@ use sbtp_core::{
 
 use crate::args::{Kind, Parsed, parse as parse_args};
 use crate::fail::{self, Fail, untrusted};
-use crate::relay::{MAX_BATCH_IDS, READ_API, Relay, Stored};
+use crate::relay::{BatchError, MAX_BATCH_IDS, READ_API, Relay, Stored};
 use crate::walk::{self, Event, Filter, Policy, Walker};
 use crate::{hex, keyfile, output};
 
@@ -577,19 +577,7 @@ fn get_many(p: &Parsed, relays: &[Relay], ids: &[BlockId], difficulty: u32) -> R
         if pending.is_empty() {
             break;
         }
-        // ADR 0051 rule 31: a batch only to a relay that announces read_api 2.
-        let batch = relay.info().is_ok_and(|i| i.read_api >= READ_API);
-        if batch {
-            batch_from(relay, &mut wanted, &pending, difficulty);
-        } else {
-            for i in pending {
-                let Some(w) = wanted.get_mut(i) else { continue };
-                match relay.get_block(&w.id) {
-                    Ok(bytes) => w.receive(relay, bytes, difficulty),
-                    Err(f) => w.tried.push(f.message),
-                }
-            }
-        }
+        let batch = fetch_from(relay, &mut wanted, pending, difficulty);
         let served = wanted.iter().filter(|w| w.bytes.is_some()).count();
         if relays.len() > 1 {
             eprintln!(
@@ -656,12 +644,44 @@ fn get_many(p: &Parsed, relays: &[Relay], ids: &[BlockId], difficulty: u32) -> R
     Err(Fail { code, message })
 }
 
+/// Asks `relay` for the blocks at `pending`: in batches when its /info announces `read_api >= 2`
+/// (ADR 0051 rule 31), else with single GETs. A batch route that does not work (refused, or a
+/// broken answer) gets single GETs for what is still missing, on the same relay (security review
+/// 2026-11-21, I-1). Returns whether batches were tried.
+fn fetch_from(relay: &Relay, wanted: &mut [Wanted], pending: Vec<usize>, difficulty: u32) -> bool {
+    let batch = relay.info().is_ok_and(|i| i.read_api >= READ_API);
+    let gets = if batch && batch_from(relay, wanted, &pending, difficulty) {
+        eprintln!(
+            "Relay {}: POST /sbtp/v1/blocks failed; using single GETs for this relay.",
+            relay.base()
+        );
+        pending
+            .into_iter()
+            .filter(|i| wanted.get(*i).is_some_and(Wanted::pending))
+            .collect()
+    } else if batch {
+        Vec::new()
+    } else {
+        pending
+    };
+    for i in gets {
+        let Some(w) = wanted.get_mut(i) else { continue };
+        match relay.get_block(&w.id) {
+            Ok(bytes) => w.receive(relay, bytes, difficulty),
+            Err(f) => w.tried.push(f.message),
+        }
+    }
+    batch
+}
+
 /// Asks `relay` (`read_api >= 2`) for the blocks at `pending` with `POST /sbtp/v1/blocks`, 256 at
 /// most per request. A record of length 0: not served by this relay. A prefix (ADR 0051 rule 3):
-/// the rest is asked again (each `200` holds at least one record, so this ends). A failed request,
-/// a body over 1 MiB, a record above `MAX_BLOCK_LEN` or a body ending inside a record ends this
-/// relay: the blocks not answered go to the next one; complete records before a truncation are used.
-fn batch_from(relay: &Relay, wanted: &mut [Wanted], pending: &[usize], difficulty: u32) {
+/// the rest is asked again (each `200` holds at least one record, so this ends). A failed request
+/// ends batches on this relay; complete records before a truncation are used. Returns `true` when
+/// the batch route itself failed (a refusal of the form, a body over 1 MiB, a record above
+/// `MAX_BLOCK_LEN`, a body ending inside a record): the caller then uses single GETs on this relay.
+/// Any other failure (network, `429`, `5xx`) returns `false`: the rest goes to the next relay.
+fn batch_from(relay: &Relay, wanted: &mut [Wanted], pending: &[usize], difficulty: u32) -> bool {
     for chunk in pending.chunks(MAX_BATCH_IDS) {
         let mut rest: &[usize] = chunk;
         while !rest.is_empty() {
@@ -677,9 +697,9 @@ fn batch_from(relay: &Relay, wanted: &mut [Wanted], pending: &[usize], difficult
                 }
             };
             match relay.post_blocks(&ask) {
-                Err(f) => {
-                    failed(wanted, rest, &f.message);
-                    return;
+                Err(e) => {
+                    failed(wanted, rest, &e.fail().message);
+                    return matches!(e, BatchError::Route(_));
                 }
                 Ok(batch) => {
                     let n = batch.records.len();
@@ -707,12 +727,13 @@ fn batch_from(relay: &Relay, wanted: &mut [Wanted], pending: &[usize], difficult
                                 relay.base()
                             ),
                         );
-                        return;
+                        return true;
                     }
                 }
             }
         }
     }
+    false
 }
 
 fn invalid_from_relay(relay: &Relay, id: &BlockId, e: &sbtp_core::Error) -> Fail {

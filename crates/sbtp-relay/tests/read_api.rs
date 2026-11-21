@@ -225,15 +225,15 @@ fn preflight_allows_post() {
 }
 
 /// Rule 7: `⌈N / 4⌉` tokens of the `block` bucket at admission, from `Content-Length`, before
-/// the body is read; 64 (capped at the burst) without `Content-Length`. With a burst of 10 and a
-/// refill of 1 per minute: five batches of 8 identifiers (2 tokens each) pass, the next request
-/// of the bucket gets `429`.
+/// the body is read; 64 (capped at the burst) without `Content-Length`. With a burst of 64 (the
+/// smallest accepted) and a refill of 1 per minute: 32 batches of 8 identifiers (2 tokens each)
+/// pass, the next request of the bucket gets `429`.
 #[test]
 fn weight_is_taken_at_admission() {
-    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let relay = start(&[("RATE_BLOCK_BURST", "64"), ("RATE_BLOCK_PER_MIN", "1")]);
     let mut c = relay.connect();
     let ids: Vec<BlockId> = (0..8u8).map(unknown).collect();
-    for k in 0..5 {
+    for k in 0..32 {
         assert_eq!(batch(&mut c, &body_of(&ids), "").status, 200, "{k}");
     }
     let r = batch(&mut c, &body_of(&ids[..1]), "");
@@ -243,7 +243,7 @@ fn weight_is_taken_at_admission() {
     );
 
     // A head without `Content-Length` takes the whole burst of a fresh client.
-    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let relay = start(&[("RATE_BLOCK_BURST", "64"), ("RATE_BLOCK_PER_MIN", "1")]);
     let mut c = relay.connect();
     c.write_all(b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\n\r\n")
         .unwrap();
@@ -252,9 +252,9 @@ fn weight_is_taken_at_admission() {
     assert_eq!(get(&mut c, "/sbtp/v1/info", "").status, 429);
 
     // A batch heavier than what is left is refused whole before its body is read.
-    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let relay = start(&[("RATE_BLOCK_BURST", "64"), ("RATE_BLOCK_PER_MIN", "1")]);
     let mut c = relay.connect();
-    let many: Vec<BlockId> = (0..36u8).map(unknown).collect(); // 9 tokens
+    let many: Vec<BlockId> = (0..252u8).map(unknown).collect(); // 63 tokens
     assert_eq!(batch(&mut c, &body_of(&many), "").status, 200);
     let mut c = relay.connect();
     c.write_all(
@@ -274,8 +274,8 @@ fn weight_is_taken_at_admission() {
 /// Rule 7 and "Weights": the same tokens never buy more than 4 times the blocks single `GET`s
 /// would, while `rate_block_burst` is at least 64 (every profile: 200 to 600). With a burst of
 /// 64 and a refill of 1 per minute, single `GET`s serve 64 blocks; batches serve at most 256,
-/// whatever their sizes. Below a burst of 64 the cap of rule 7 lets a batch cost the whole
-/// burst only, so the ratio grows (shown last).
+/// whatever their sizes. A burst below 64 would let the cap of rule 7 sell a 256-id batch for
+/// the whole burst only, so the relay refuses it at start-up (security review 2026-11-21, L-1).
 #[test]
 fn batches_buy_at_most_four_times_the_single_gets() {
     let burst = 64usize;
@@ -324,13 +324,8 @@ fn batches_buy_at_most_four_times_the_single_gets() {
         );
         assert!(served >= burst, "size {size}: {served}");
     }
-    // Rule 7 caps the weight at the burst: with a burst of 16, 256 identifiers cost 16 tokens.
-    let (relay, ids) = fresh(&[("RATE_BLOCK_BURST", "16"), ("RATE_BLOCK_PER_MIN", "1")]);
-    let mut c = relay.connect();
-    let r = batch(&mut c, &body_of(&ids[..256]), "");
-    assert_eq!(records(&r.body).len(), 256);
-    let mut c = relay.connect();
-    assert_eq!(get(&mut c, "/sbtp/v1/info", "").status, 429);
+    // A burst below 64 would make 256 identifiers cost less than 64 tokens: refused at start-up
+    // (`startup.rs`, `bursts_below_the_largest_weight_are_refused`).
 }
 
 /// ADR 0051 rules 13 and 14: `fields=parents` adds `parents` and `lens`, aligned with

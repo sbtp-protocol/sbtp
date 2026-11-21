@@ -187,9 +187,10 @@ async function makeBlock(text, parents = []) {
  * `readApi` (absent from /info when null; the new forms are then refused as an old relay would),
  * `prefix` (most records per POST response), `zero` (ids answered with length 0), `wrong` (id →
  * bytes served instead), `overLength` (a record length above the ceiling), `truncate` (the body
- * ends inside the second record), `lie` (id → the parents the relay claims). Records every request.
+ * ends inside the second record), `lie` (id → the parents the relay claims), `refuseBatch`
+ * (`[status, error]`: POST /blocks refused so, /info still saying `read_api`). Records every request.
  */
-async function fakeRelay({ readApi = 2, prefix = Infinity, zero = new Set(), wrong = new Map(), overLength = false, truncate = false, lie = new Map() } = {}) {
+async function fakeRelay({ readApi = 2, prefix = Infinity, zero = new Set(), wrong = new Map(), overLength = false, truncate = false, lie = new Map(), refuseBatch = null } = {}) {
   const blocks = new Map();
   const order = [];
   const parentsOf = new Map();
@@ -211,6 +212,7 @@ async function fakeRelay({ readApi = 2, prefix = Infinity, zero = new Set(), wro
       if (url.pathname === "/sbtp/v1/blocks" && req.method === "POST") {
         hits.push(`POST /sbtp/v1/blocks n=${body.length / 32}`);
         if (readApi === null) return json(res, 405, { error: "MethodNotAllowed" });
+        if (refuseBatch) return json(res, refuseBatch[0], { error: refuseBatch[1] });
         if (body.length === 0 || body.length % 32 !== 0 || body.length > 8192) return bad(res);
         const ids = [];
         for (let i = 0; i < body.length; i += 32) ids.push(toHex(body.subarray(i, i + 32)));
@@ -351,7 +353,7 @@ test("batch: wrong bytes for one id, length 0, partial answers: failover and re-
   assert.equal(r.attempts, 23);
 });
 
-test("batch: a length above the ceiling or a truncated body is a failed request; the next relay is asked", { skip }, async () => {
+test("batch: a length above the ceiling or a truncated body breaks the route; that relay falls back to GETs", { skip }, async () => {
   const blocks = await Promise.all(Array.from({ length: 3 }, (_, i) => makeBlock(`t${i}`)));
   const ids = blocks.map((b) => b.id);
   for (const [opt, firstServed] of [[{ overLength: true }, 0], [{ truncate: true }, 1]]) {
@@ -365,11 +367,101 @@ test("batch: a length above the ceiling or a truncated body is a failed request;
     const r = await fetchBlocksFrom(set, ids, validate, { mode: "bulk" });
     assert.equal(r.blocks.length, 3, JSON.stringify(opt));
     // overLength: nothing from the response is used; truncate: the complete first record is.
-    assert.equal(r.sources.get(broken.base) ?? 0, firstServed, JSON.stringify(opt));
-    assert.equal(r.sources.get(good.base), 3 - firstServed);
-    assert.equal(set.entry(broken.base).failures, 1);
+    // The rest comes from single GETs on the same relay; the next relay is not asked.
+    assert.equal(r.sources.get(broken.base), 3, JSON.stringify(opt));
+    assert.equal(broken.count(/^GET \/sbtp\/v1\/block\//), 3 - firstServed);
+    assert.deepEqual(good.hits, ["GET /sbtp/v1/info"], "the next relay is asked for no block");
+    assert.equal(set.entry(broken.base).failures, 0, "the GETs that followed succeeded");
     assert.equal(broken.count(/^POST/), 1, "a failed request is not repeated on that relay");
   }
+});
+
+test("batch route refused (405, 404, 400) with one relay: single GETs, remembered for the session (I-1)", { skip }, async () => {
+  const blocks = await Promise.all(Array.from({ length: 4 }, (_, i) => makeBlock(`r${i}`)));
+  const ids = blocks.map((b) => b.id);
+  for (const refuseBatch of [[405, "MethodNotAllowed"], [404, "NotFound"], [400, "InvalidParameter"], [400, "NoLength"]]) {
+    const relay = await fakeRelay({ refuseBatch });
+    for (const b of blocks) relay.add(b);
+    const set = new RelaySet([relay.base]);
+    const r = await fetchBlocksFrom(set, ids, validate, { mode: "bulk" });
+    assert.equal(r.blocks.length, 4, JSON.stringify(refuseBatch));
+    assert.equal(r.failed.length, 0);
+    assert.equal(r.partial, false);
+    assert.deepEqual(relay.hits.map((h) => h.replace(/[0-9a-f]{64}/, "<id>")), [
+      "GET /sbtp/v1/info", "POST /sbtp/v1/blocks n=4", ...ids.map(() => "GET /sbtp/v1/block/<id>"),
+    ]);
+    // The next bulk fetch goes straight to GETs: no POST, no /info.
+    const n = relay.hits.length;
+    const again = await fetchBlocksFrom(set, ids.slice(0, 2), validate, { mode: "bulk" });
+    assert.equal(again.blocks.length, 2);
+    assert.deepEqual(relay.hits.slice(n).map((h) => h.split("/").slice(0, 4).join("/")), [
+      "GET /sbtp/v1/block", "GET /sbtp/v1/block",
+    ]);
+  }
+  // A server error says nothing about the route: no fallback, the next relay is asked.
+  const busy = await fakeRelay({ refuseBatch: [503, "Busy"] });
+  const good = await fakeRelay();
+  for (const b of blocks) {
+    busy.add(b);
+    good.add(b);
+  }
+  const set = new RelaySet([busy.base, good.base]);
+  const r = await fetchBlocksFrom(set, ids, validate, { mode: "bulk" });
+  assert.equal(r.sources.get(good.base), 4);
+  assert.equal(busy.count(/^GET \/sbtp\/v1\/block\//), 0);
+  assert.equal(set.entry(busy.base).batchBroken, false);
+});
+
+test("cold start: a hostile relay listed first cannot hide a block an honest relay lists (M-1)", { skip }, async () => {
+  const root = await makeBlock("root");
+  const child = await makeBlock("child", [root.id]);
+  const x = await makeBlock("retraction", [child.id]);
+  // A lists X with no parents; B lists it with its true parent.
+  const hostile = await fakeRelay({ lie: new Map([[x.id, []]]) });
+  const honest = await fakeRelay();
+  for (const b of [root, child, x]) {
+    hostile.add(b);
+    honest.add(b);
+  }
+  const set = new RelaySet([hostile.base, honest.base]);
+  const d = await loadDescendants(set, root.id, { validate });
+  assert.deepEqual(new Set(d.members), new Set([child.id, x.id]));
+  assert.ok(d.blocks.has(x.id), "X is fetched and shown");
+  // The union of the claims makes a fetch only; a claim of a wrong parent shows nothing.
+  const stranger = await makeBlock("unrelated");
+  const liar = await fakeRelay({ lie: new Map([[stranger.id, [root.id]]]) });
+  for (const b of [root, child, stranger]) liar.add(b);
+  honest.add(stranger);
+  const d2 = await loadDescendants(new RelaySet([liar.base, honest.base]), root.id, { validate });
+  assert.ok(!d2.members.includes(stranger.id));
+  assert.ok(!d2.blocks.has(stranger.id));
+});
+
+test("view: a relay skipped for lacking read_api 2 leaves every item's replies incomplete (L-2)", { skip }, async () => {
+  const v2 = await fakeRelay();
+  const old = await fakeRelay({ readApi: null });
+  const { root, kids } = await family([v2, old], 3);
+  v2.add(await makeBlock("reply", [kids[0].id]));
+  const set = new RelaySet([v2.base, old.base]);
+  const v = await loadView(set, root.id, { validate });
+  assert.equal(v.grouped, true);
+  assert.equal(v.items.length, 3);
+  for (const i of v.items) {
+    assert.equal(i.complete, false, "the old relay was never asked about this item's children");
+    assert.ok(i.incompleteOn.includes(old.base));
+    assert.ok(i.completeOn.includes(v2.base));
+  }
+  // The old relay is still not asked for grandchildren.
+  assert.ok(!old.hits.some((h) => kids.some((k) => h.includes(`parent=${k.id}`))));
+  // A refresh does not turn them complete either.
+  const child = await makeBlock("new child", [root.id]);
+  v2.add(child);
+  old.add(child);
+  await refreshView(set, v, { validate });
+  assert.ok(v.items.every((i) => !i.complete));
+  // With the v2 relay alone, the same items are complete.
+  const alone = await loadView(new RelaySet([v2.base]), root.id, { validate });
+  assert.ok(alone.items.every((i) => i.complete));
 });
 
 test("batch: the overall bound counts each id of a batch; a relay without read_api gets GETs", { skip }, async () => {

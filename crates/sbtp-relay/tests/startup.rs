@@ -537,6 +537,42 @@ fn profiles_set_exactly_the_adr_values() {
     }
 }
 
+/// ADR 0051 rule 21 (security review 2026-11-21, L-1): `rate_block_burst` below 64 and
+/// `rate_query_burst` below 4 are refused, from the environment and the file, with a constraint
+/// error that names the setting and the minimum; the built-in defaults and every profile pass.
+#[test]
+fn bursts_below_the_largest_weight_are_refused() {
+    for (key, refused, accepted, min) in [
+        ("rate_block_burst", ["1", "63"], ["64", "65"], 64),
+        ("rate_query_burst", ["1", "3"], ["4", "5"], 4),
+    ] {
+        for v in refused {
+            for r in both(key, v) {
+                let e = r.expect_err(&format!("{key} = {v} accepted"));
+                assert!(
+                    matches!(&e, ConfigError::Constraint(m)
+                        if m.contains(&format!("{key} ({v}) must be at least {min}"))),
+                    "{e}"
+                );
+            }
+        }
+        for v in accepted {
+            for r in both(key, v) {
+                assert!(r.is_ok(), "{key} = {v}: {}", r.unwrap_err());
+            }
+        }
+    }
+    for name in ["small", "standard", "large"] {
+        let s = load(&[], &[("PROFILE", name)]).unwrap();
+        assert!(
+            s.rate_block_burst >= 64 && s.rate_query_burst >= 4,
+            "{name}"
+        );
+    }
+    let s = load(&[], &[]).unwrap();
+    assert!(s.rate_block_burst >= 64 && s.rate_query_burst >= 4);
+}
+
 /// ADR 0018 clarification M5: `rate_limit_max_clients >= 2 × max_connections` on the effective
 /// values, from every source; the refusal names both settings and their values. The built-in
 /// defaults and the three profiles satisfy it.
