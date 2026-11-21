@@ -144,6 +144,9 @@ pub struct Relay<I> {
     /// Tests: run by [`Relay::evict_locked`] right after each file deletion, under the lock.
     #[cfg(test)]
     after_evict: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Tests: run by [`Relay::load`] before each move of a damaged file to quarantine.
+    #[cfg(test)]
+    before_quarantine: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl<I: IndexBackend + 'static> Relay<I> {
@@ -197,6 +200,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
             before_insert: Mutex::new(None),
             #[cfg(test)]
             after_evict: Mutex::new(None),
+            #[cfg(test)]
+            before_quarantine: Mutex::new(None),
         })
     }
 
@@ -846,6 +851,15 @@ impl<I: IndexBackend + 'static> Relay<I> {
             // The lock of `id`, as on `PUT`, on this rare path only: a `PUT` of the block never
             // sees the final name emptied by this move halfway through its decision.
             let _id = self.lock_id(id);
+            #[cfg(test)]
+            if let Some(f) = self
+                .before_quarantine
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                f();
+            }
             match self.store.quarantine(id, &bytes) {
                 Ok(Quarantine::Moved) => store::log_quarantined(Cause::Get, damage),
                 Ok(Quarantine::MovedUnsynced(e)) => {
@@ -857,7 +871,9 @@ impl<I: IndexBackend + 'static> Relay<I> {
             }
             return Ok(Loaded::Damaged);
         }
-        Ok(Loaded::Absent)
+        // Security review 2026-11-21 (archive copy), L-3: the file changed under the lock twice
+        // in a row; the block may well be held, so this is not "absent".
+        Ok(Loaded::Changed)
     }
 }
 
@@ -869,6 +885,8 @@ enum Loaded {
     Absent,
     /// A damaged file, moved to quarantine (or left in place when the move failed).
     Damaged,
+    /// The file changed during both decisions (a concurrent writer): undecided.
+    Changed,
 }
 
 /// The index entry of a stored block, at the relay clock.
@@ -1246,7 +1264,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 self.cache_loaded(&id, bytes.clone(), evicted);
                 Fetched::Served(bytes)
             }
-            Ok(Ok(Loaded::Absent | Loaded::Damaged)) => Fetched::Missing,
+            // `Changed` stays a `404` for a read: the client asks again.
+            Ok(Ok(Loaded::Absent | Loaded::Damaged | Loaded::Changed)) => Fetched::Missing,
             Ok(Err(())) | Err(_) => Fetched::Failed,
         }
     }
@@ -1288,7 +1307,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
             Ok(Ok(Loaded::Bytes(b))) => Copied::Bytes(b),
             Ok(Ok(Loaded::Absent)) => Copied::Absent,
             Ok(Ok(Loaded::Damaged)) => Copied::Damaged,
-            Ok(Err(())) | Err(_) => Copied::Retry,
+            // L-3: tried again later, never counted as missed.
+            Ok(Ok(Loaded::Changed) | Err(())) | Err(_) => Copied::Retry,
         }
     }
 
@@ -1453,6 +1473,50 @@ mod tests {
         assert!(!check(&[&"ab".repeat(32)]), "unquoted");
         assert!(!check(&[&format!("\"{}\"", "AB".repeat(32))]), "case");
         assert!(!check(&["\"x,\""]));
+    }
+
+    /// Security review 2026-11-21 (archive copy), L-3: a damaged file that changes under the
+    /// lock in both decisions of a load is not "absent" to the uploader: it is tried again
+    /// (`Copied::Retry`); a `GET` still answers `404`. Once the file stops changing, the
+    /// damaged file is moved to quarantine as before.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn a_file_changing_twice_is_retried_by_the_uploader() {
+        use crate::index::RedbIndex;
+        use crate::pool::IndexPool;
+        let dir = std::env::temp_dir().join(format!("sbtp-blocks-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = Settings::load(Vec::<std::ffi::OsString>::new(), Vec::new()).unwrap();
+        let index_file = dir.join("index.redb");
+        let index = Arc::new(RedbIndex::open(&index_file, 1 << 20).unwrap());
+        let pool = IndexPool::start(&index, &settings).unwrap();
+        let store = Store::open(&dir, index_file, settings.max_store_bytes).unwrap();
+        store::reconcile(&store, &*index).unwrap();
+        let relay = Arc::new(Relay::new(&settings, store, pool.handle()).unwrap());
+        let id = BlockId::from_bytes([0x5a; 32]);
+        let path = relay.store().path(&id);
+        std::fs::write(&path, b"damaged, first").unwrap();
+        // A concurrent writer replaces the damaged file before each move to quarantine.
+        let (writer, rounds) = (path.clone(), Arc::new(AtomicUsize::new(0)));
+        let counted = Arc::clone(&rounds);
+        *relay.before_quarantine.lock().unwrap() = Some(Box::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&writer, format!("damaged, round {n}")).unwrap();
+        }));
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Retry));
+        assert_eq!(rounds.load(Ordering::SeqCst), 2, "both decisions ran");
+        assert!(matches!(
+            Arc::clone(&relay).fetch(id).await,
+            Fetched::Missing
+        ));
+        // The writer stops: the damaged file goes to quarantine.
+        *relay.before_quarantine.lock().unwrap() = None;
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Damaged));
+        assert!(matches!(relay.read_for_copy(id).await, Copied::Absent));
+        drop(relay);
+        assert!(pool.shutdown().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR 0018 clarification M1: an orphan repair that the writer queue refuses (the relay is
