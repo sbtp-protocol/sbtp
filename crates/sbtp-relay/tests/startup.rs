@@ -1411,3 +1411,25 @@ fn ingest_settings() {
         "{e}"
     );
 }
+
+/// Security review 2026-11-21 L-1: with `peers` set, the blocking pool also counts the DNS
+/// lookups and cursor writes of replication, `replication_max_in_flight + 1` threads, in its
+/// default and in its lower bound.
+#[cfg(feature = "replication")]
+#[test]
+fn blocking_pool_counts_replication() {
+    let off = load(&[], &[]).unwrap();
+    assert_eq!(off.max_blocking_threads, 4 + 4 + 2);
+    let peers = [("PEERS", "https://relay.example")];
+    let on = load(&[], &peers).unwrap();
+    assert_eq!(on.max_blocking_threads, 4 + 4 + 2 + 1 + 1);
+    let on = load(&[], &[peers[0], ("REPLICATION_MAX_IN_FLIGHT", "4")]).unwrap();
+    assert_eq!(on.max_blocking_threads, 4 + 4 + 2 + 4 + 1);
+    let e = load(&[], &[peers[0], ("MAX_BLOCKING_THREADS", "11")]).unwrap_err();
+    assert!(
+        matches!(&e, ConfigError::Constraint(m) if m.contains("max_blocking_threads")),
+        "{e}"
+    );
+    assert!(load(&[], &[peers[0], ("MAX_BLOCKING_THREADS", "12")]).is_ok());
+    assert!(load(&[], &[("MAX_BLOCKING_THREADS", "10")]).is_ok());
+}

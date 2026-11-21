@@ -143,3 +143,92 @@ fn exempt_addresses_are_not_bounded() {
     // The other networks still have their own budget.
     assert_eq!(put_from(&relay, "198.51.100.1", &block(3_000)).status, 201);
 }
+
+/// Security review 2026-11-21 L-2 (ADR 0049 rule 6): the cap is checked after validation, so a
+/// block with a bad signature gets its `422` while the cap refuses new blocks with `503`.
+#[test]
+fn global_cap_comes_after_signature_check() {
+    let relay = start(&[
+        ("INGEST_BYTES_PER_HOUR", "1048576"),
+        ("MAX_STORE_BYTES", "4194304"),
+        ("DEMAND_LOW_WATER_PCT", "10"),
+        ("DEMAND_HIGH_WATER_PCT", "99"),
+    ]);
+    let mut capped = false;
+    for n in 0..40 {
+        let r = put_from(&relay, &format!("10.2.{n}.1"), &block(4_000 + n));
+        if r.status == 503 {
+            capped = true;
+            break;
+        }
+        assert_eq!(r.status, 201, "{n}");
+    }
+    assert!(capped, "the cap is active");
+    let mut bad = block(4_999);
+    *bad.last_mut().unwrap() ^= 1;
+    let r = put_from(&relay, "10.2.250.1", &bad);
+    assert_eq!(
+        (r.status, r.json()["error"].as_str().map(str::to_owned)),
+        (422, Some("InvalidSignature".to_owned()))
+    );
+    // A valid new block is still capped.
+    assert_eq!(put_from(&relay, "10.2.251.1", &block(5_000)).status, 503);
+}
+
+/// Security review 2026-11-21 M-1 (ADR 0049 rules 3 and 4): the group budget is checked once a
+/// `PUT` permit is held, so `PUT`s waiting in the queue have not passed it. With one permit, 30
+/// `PUT`s from one /24 queue behind a request that holds the permit while its body is late;
+/// once it is released they are checked one by one, and the group stores no more than its
+/// capacity (21,845 bytes: six blocks) plus the floor of rule 3 (`put_max_in_flight × 70,000`).
+/// Before the fix every queued request had passed the check and all 31 were stored.
+#[test]
+fn queued_puts_of_one_group_stay_within_the_share() {
+    let relay = start(&[
+        ("INGEST_BYTES_PER_HOUR", "1048576"),
+        ("PUT_MAX_IN_FLIGHT", "1"),
+        ("PUT_MAX_IN_FLIGHT_PER_CLIENT", "1"),
+        ("PUT_MAX_QUEUE", "64"),
+        ("QUEUE_TIMEOUT_MS", "10000"),
+        ("MAX_CONNECTIONS", "64"),
+    ]);
+    let head = |from: &str, len: usize| {
+        format!(
+            "PUT /sbtp/v1/block HTTP/1.1\r\nHost: relay.test\r\nX-Forwarded-For: {from}\r\n\
+             Content-Length: {len}\r\n\r\n"
+        )
+    };
+    let first = block(6_000);
+    let mut holder = relay.connect();
+    holder
+        .write_all(head("198.51.100.200", first.len()).as_bytes())
+        .unwrap();
+    // The holder takes the only permit and waits for its body.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let queued: Vec<_> = (0..30u32)
+        .map(|n| {
+            let body = block(6_001 + n);
+            let mut c = relay.connect();
+            c.write_all(head(&format!("198.51.100.{}", n + 1), body.len()).as_bytes())
+                .unwrap();
+            c.write_all(&body).unwrap();
+            c
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    holder.write_all(&first).unwrap();
+    assert_eq!(read_response(&mut holder).unwrap().status, 201);
+    let mut stored = 1u64;
+    for mut c in queued {
+        match read_response(&mut c).unwrap().status {
+            201 => stored += 1,
+            429 => {}
+            s => panic!("unexpected status {s}"),
+        }
+    }
+    // Quota cost of a small block: 4,224 bytes (see `only_the_flooding_network_gets_429`).
+    assert!(
+        stored * 4_224 <= 21_845 + 70_000,
+        "{stored} blocks stored from one /24"
+    );
+    assert_eq!(stored, 6, "checked one by one after the permit");
+}

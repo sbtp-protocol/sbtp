@@ -37,6 +37,20 @@ pub const ENV_PREFIX: &str = "SBTP_RELAY_";
 /// Environment variable naming the configuration file.
 pub const ENV_CONFIG: &str = "SBTP_RELAY_CONFIG";
 
+/// The least `max_blocking_threads`, also its default (ADR 0018 rule 19): the block readers, the
+/// `PUT` permits and 2 spare threads; when replication runs, also `replication_max_in_flight + 1`
+/// (security review 2026-11-21 L-1: the DNS lookups of its connections and its cursor writes wait
+/// on blocking threads, so a peer whose DNS answers slowly cannot take the threads of `GET` and
+/// `PUT`).
+fn blocking_floor(readers: u64, puts: u64, replication: bool, in_flight: u64) -> u64 {
+    let base = readers + puts + 2;
+    if replication {
+        base + in_flight + 1
+    } else {
+        base
+    }
+}
+
 /// Rule 35 estimates, in bytes. Replaced by measures after the Linux gate.
 const EST_BASELINE: u64 = 2_621_440;
 const EST_LARGEST_RESPONSE: u64 = 70 * 1024;
@@ -716,8 +730,6 @@ impl Settings {
             .clamp(1, 256);
         let worker_threads = *ints.worker_threads.get_or_insert(cpus);
         let v = |o: Option<u64>| o.unwrap_or_default(); // Every slot holds a value here.
-        let blocking_floor = v(ints.block_max_readers) + v(ints.put_max_in_flight) + 2;
-        let max_blocking_threads = *ints.max_blocking_threads.get_or_insert(blocking_floor);
 
         let mut other = |key: &'static str| {
             let raw = values.remove(key);
@@ -740,6 +752,12 @@ impl Settings {
         let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
         let demand_eviction = parse_bool(other("demand_eviction"), "demand_eviction")?;
         let peers = parse_peers(other("peers"))?;
+        let max_blocking_threads = *ints.max_blocking_threads.get_or_insert(blocking_floor(
+            v(ints.block_max_readers),
+            v(ints.put_max_in_flight),
+            !peers.is_empty() && cfg!(feature = "replication"),
+            v(ints.replication_max_in_flight),
+        ));
         let replication_allow_private = parse_bool(
             other("replication_allow_private"),
             "replication_allow_private",
@@ -1203,10 +1221,16 @@ impl Settings {
         self.check_replication()?;
         // Also checked when `max_blocking_threads` is left at its derived default, which can
         // exceed 512 (range "that sum to 512").
+        let floor = blocking_floor(
+            self.block_max_readers,
+            self.put_max_in_flight,
+            self.replication_on(),
+            self.replication_max_in_flight,
+        );
         c(
-            (self.block_max_readers + self.put_max_in_flight + 2..=512)
-                .contains(&self.max_blocking_threads),
-            "max_blocking_threads must be from block_max_readers + put_max_in_flight + 2 to 512",
+            (floor..=512).contains(&self.max_blocking_threads),
+            "max_blocking_threads must be from block_max_readers + put_max_in_flight + 2 (plus \
+             replication_max_in_flight + 1 when peers is set) to 512",
         )
     }
 

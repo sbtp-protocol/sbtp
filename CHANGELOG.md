@@ -180,6 +180,19 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- Pre-push security review 2026-11-21 of replication and ingest bounds
+  (`docs/security/2026-11-21-replication-ingest-pre-push.md`), `sbtp-relay`:
+  - the byte budget of a network group (ADR 0049) is checked once the `PUT` permit is held, still
+    before the body is read: `PUT`s waiting in the queue no longer pass it uncharged, which let one
+    group store about 5 times its share (M-1);
+  - with `peers` set, `max_blocking_threads` defaults to (and must be at least)
+    `block_max_readers + put_max_in_flight + 2 + replication_max_in_flight + 1`: the DNS lookups and
+    cursor writes of replication no longer take the blocking threads of `GET` and `PUT` (L-1);
+  - the global ingest cap is checked after the signature: a bad signature gets `422`, not `503`,
+    while the cap is active (ADR 0049 rule 6, L-2);
+  - replication refuses peer addresses in `64:ff9b:1::/48`, `192.0.0.0/24` and `198.18.0.0/15`, and
+    judges 6to4 and Teredo addresses by the IPv4 addresses they embed (I-1);
+  - a peer URL with userinfo is refused without printing the userinfo back (I-2).
 - Pre-push security review 2026-11-21 (`docs/security/2026-11-21-pre-push-eviction-fixes-web-0047.md`):
   - `sbtp-relay`: a demand pass no longer ends after one deletion when `PUT`s or index growth move
     the admission total during it; a deletion ends the pass only when it released no quota bytes

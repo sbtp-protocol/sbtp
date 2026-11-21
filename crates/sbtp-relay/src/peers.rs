@@ -35,7 +35,9 @@ impl PeerUrl {
     ///
     /// A text for the operator, naming what is wrong.
     pub fn parse(s: &str) -> Result<Self, String> {
-        let bad = |why: &str| format!("`{s}`: {why}");
+        // Security review 2026-11-21 I-2: a userinfo part is never printed back.
+        let shown = redact_userinfo(s);
+        let bad = |why: &str| format!("`{shown}`: {why}");
         let lower = s.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
         let (https, rest) = if lower == "https://" {
             (true, s.get(8..).unwrap_or_default())
@@ -228,6 +230,22 @@ fn is_loopback_host(h: &Host) -> bool {
     }
 }
 
+/// `s` with the userinfo of its authority, if any, replaced by `***` (security review 2026-11-21
+/// I-2): an error names the URL without its credentials.
+fn redact_userinfo(s: &str) -> String {
+    let start = s.find("://").map_or(0, |i| i + 3);
+    let rest = s.get(start..).unwrap_or_default();
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest.get(..end).and_then(|auth| auth.rfind('@')) {
+        Some(at) => format!(
+            "{}***{}",
+            s.get(..start).unwrap_or_default(),
+            rest.get(at..).unwrap_or_default()
+        ),
+        None => s.to_owned(),
+    }
+}
+
 /// ADR 0048 rule 14: whether a resolved address is refused by default: loopback, private
 /// (RFC 1918, RFC 4193), shared (RFC 6598, where some clouds serve metadata), link-local (cloud
 /// metadata addresses included), unspecified, multicast, broadcast or reserved. An IPv4-mapped
@@ -241,9 +259,24 @@ pub fn refused_address(ip: IpAddr) -> bool {
                 return refused_v4(v4);
             }
             let s = a.segments();
+            let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
             if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
                 let [.., hi, lo] = s;
-                return refused_v4(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+                return refused_v4(v4(hi, lo));
+            }
+            // Security review 2026-11-21 I-1. `64:ff9b:1::/48` (RFC 8215): local-use NAT64, whose
+            // mapping to IPv4 is the local network's choice, so it is refused outright.
+            if s[..3] == [0x64, 0xff9b, 1] {
+                return true;
+            }
+            // `2002::/16` (6to4, RFC 3056): judged by the IPv4 address in bits 16 to 47.
+            if s[0] == 0x2002 {
+                return refused_v4(v4(s[1], s[2]));
+            }
+            // `2001::/32` (Teredo, RFC 4380): judged by the server address (bits 32 to 63) and
+            // the client address (the last 32 bits, inverted); refused if either is.
+            if s[..2] == [0x2001, 0] {
+                return refused_v4(v4(s[2], s[3])) || refused_v4(v4(!s[6], !s[7]));
             }
             a.is_loopback()
                 || a.is_unspecified()
@@ -259,7 +292,7 @@ pub fn refused_address(ip: IpAddr) -> bool {
 }
 
 fn refused_v4(a: Ipv4Addr) -> bool {
-    let [o0, o1, ..] = a.octets();
+    let [o0, o1, o2, _] = a.octets();
     a.is_loopback()
         || a.is_private()
         || a.is_link_local()
@@ -270,6 +303,10 @@ fn refused_v4(a: Ipv4Addr) -> bool {
         || o0 == 0
         || (o0 == 100 && (o1 & 0xc0) == 64)
         || o0 >= 240
+        // Security review 2026-11-21 I-1: 192.0.0.0/24 IETF protocol assignments (RFC 6890),
+        // 198.18.0.0/15 benchmarking (RFC 2544).
+        || (o0 == 192 && o1 == 0 && o2 == 0)
+        || (o0 == 198 && (o1 & 0xfe) == 18)
 }
 
 /// `replication_start` (rule 9).
@@ -401,6 +438,15 @@ mod tests {
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
             "::10.0.0.1",
+            // Security review 2026-11-21 I-1.
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "64:ff9b:1::808:808",
+            "2002:a00:1::1",
+            "2002:a9fe:a9fe::",
+            "2001:0:808:808::f5ff:fffe",
+            "2001:0:a00:1::f7f7:f7f7",
         ] {
             assert!(refused_address(a.parse().unwrap()), "{a}");
         }
@@ -410,9 +456,34 @@ mod tests {
             "2001:db8::1",
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
+            "192.0.1.1",
+            "198.20.0.1",
+            "2002:808:808::1",
+            "2001:0:808:808::f7f7:f7f7",
         ] {
             assert!(!refused_address(a.parse().unwrap()), "{a}");
         }
+    }
+
+    /// Security review 2026-11-21 I-2: a URL with userinfo is refused, and the error never shows
+    /// the userinfo.
+    #[test]
+    fn userinfo_is_refused_and_never_printed() {
+        for s in [
+            "https://user:hunter2@relay.example",
+            "https://hunter2@relay.example/sbtp",
+            "http://user:hunter2@127.0.0.1:8080",
+            "ftp://user:hunter2@relay.example",
+            "https://a@b:hunter2@relay.example",
+        ] {
+            let e = PeerUrl::parse(s).unwrap_err();
+            assert!(!e.contains("hunter2") && !e.contains("user:"), "{e}");
+            assert!(e.contains("***@"), "{e}");
+        }
+        assert_eq!(
+            redact_userinfo("https://relay.example/a@b"),
+            "https://relay.example/a@b"
+        );
     }
 
     /// ADR 0048 rule 16: 723,077 bytes on `small`.

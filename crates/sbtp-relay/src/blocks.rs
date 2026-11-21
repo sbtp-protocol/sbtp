@@ -493,15 +493,16 @@ impl<I: IndexBackend + 'static> Relay<I> {
             }
             Settled::Create { replaced } => replaced,
         };
-        // ADR 0049 rule 6: a block that would be stored as new, after validation (C1 here, C2
-        // and C3 just below, before anything is written) and after the held check. A damaged
-        // file being replaced (ADR 0023 rule 8.7) belongs to a block this relay accepted before:
-        // it is not refused by the cap, and is charged only if it ends as a `201`.
+        // C2, C3 (ADR 0023 rule 8.6: the normal create path).
+        verify_once(checked, &mut verified)?;
+        // ADR 0049 rule 6: a block that would be stored as new, after validation (C1 to C3,
+        // before anything is written; security review 2026-11-21 L-2: a bad signature gets its
+        // `422`, not the cap's `503`) and after the held check. A damaged file being replaced
+        // (ADR 0023 rule 8.7) belongs to a block this relay accepted before: it is not refused by
+        // the cap, and is charged only if it ends as a `201`.
         if !replaced {
             self.check_cap(ticket)?;
         }
-        // C2, C3 (ADR 0023 rule 8.6: the normal create path).
-        verify_once(checked, &mut verified)?;
         let Some(valid) = verified else {
             return Err(Rejection::Internal);
         };
@@ -1012,8 +1013,15 @@ pub async fn put_block<I: IndexBackend + 'static>(
             return ApiError::rate_limited(1).into_response();
         }
     }
+    let permit = match relay.put.acquire().await {
+        Ok(p) => p,
+        Err(r) => return relay.shed(r, key.as_ref()),
+    };
     // ADR 0049 rules 1 to 5: the byte budgets of the request's network groups, before the body
-    // is read and before a `PUT` permit is taken. Only the requests of that group are refused.
+    // is read and once the `PUT` permit is held (security review 2026-11-21 M-1): only the
+    // `put_max_in_flight` requests holding a permit can have passed the check uncharged, which
+    // is what the floor of rule 3 assumes. A refused request gives its permit back at once. Only
+    // the requests of that group are refused.
     let ticket = match relay.ingest.check_groups(key) {
         Ok(t) => t,
         Err(limited) => {
@@ -1030,10 +1038,6 @@ pub async fn put_block<I: IndexBackend + 'static>(
             );
             return ApiError::rate_limited(limited.retry_after_s).into_response();
         }
-    };
-    let permit = match relay.put.acquire().await {
-        Ok(p) => p,
-        Err(r) => return relay.shed(r, key.as_ref()),
     };
     let bytes = match read_body(body, MAX_BLOCK_LEN, relay.body_timeout).await {
         Ok(b) => b,
