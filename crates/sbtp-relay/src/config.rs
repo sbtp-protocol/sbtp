@@ -17,6 +17,7 @@ use axum::http::HeaderValue;
 use crate::index;
 use crate::log::{ClientTag, Format, Level, Timestamp};
 use crate::peers::{PeerUrl, ReplicationStart};
+use zeroize::Zeroizing;
 
 /// `max_query_limit`: default and maximum, the index clamp (ADR 0012 rule 8, ADR 0018 rule 14).
 const MAX_QUERY_LIMIT: u64 = index::MAX_QUERY_LIMIT as u64;
@@ -48,8 +49,10 @@ pub const ENV_CONFIG: &str = "SBTP_RELAY_CONFIG";
 /// (security review 2026-11-21 L-1: the DNS lookups of its connections and its cursor writes wait
 /// on blocking threads, so a peer whose DNS answers slowly cannot take the threads of `GET` and
 /// `PUT`).
-fn blocking_floor(readers: u64, puts: u64, replication: bool, in_flight: u64) -> u64 {
-    let base = readers + puts + 2;
+/// ADR 0050: the archive copy's lanes resolve names and write their cursor on blocking threads
+/// too, so `mirror_max_in_flight + 1` is added the same way when it runs (`mirror` is 0 when off).
+fn blocking_floor(readers: u64, puts: u64, replication: bool, in_flight: u64, mirror: u64) -> u64 {
+    let base = readers + puts + 2 + if mirror > 0 { mirror + 1 } else { 0 };
     if replication {
         base + in_flight + 1
     } else {
@@ -76,6 +79,10 @@ const MIN_INGEST_BYTES_PER_HOUR: u64 = 1_048_576;
 /// One key of a per-client count table (`client::Counts`): a `(ClientKey, u32)` bucket of 24
 /// bytes, its control byte, and a table at most half full after growth. Not measured.
 const EST_CLIENT_COUNT_ENTRY: u64 = 64;
+/// ADR 0050 rule 27, estimates: one upload in flight (a block, the TLS and HTTP state), and the
+/// uploader's page of 64 identifiers.
+const EST_MIRROR_PER_REQUEST: u64 = 65_909 + 90_000;
+const EST_MIRROR_PAGE: u64 = 64 * 32;
 /// ADR 0021 rule 21: the log queue, 256 lines of at most 1,024 bytes.
 const LOG_QUEUE_BYTES: u64 = (crate::log::QUEUE_LINES * crate::log::MAX_LINE) as u64;
 
@@ -180,12 +187,16 @@ int_settings! {
     ingest_group_max: 64, 16_777_216, Some(1_024);
     ingest_group_share_pct: 1, 100, Some(25);
     ingest_group56_share_pct: 1, 100, Some(10);
+    // ADR 0050 rule 28: a profile row, then policy settings.
+    mirror_max_in_flight: 1, 64, Some(1);
+    mirror_request_timeout_ms: 1_000, 300_000, Some(30_000);
+    mirror_max_backoff_s: 1, 86_400, Some(3_600);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 26] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 27] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -216,6 +227,8 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 26] = [
     // ADR 0049 rule 14 (amends rule 37).
     ("ingest_bytes_per_hour", [2_147_483_648, 17_179_869_184]),
     ("ingest_group_max", [16_384, 131_072]),
+    // ADR 0050 rule 28 (amends rule 37).
+    ("mirror_max_in_flight", [4, 8]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -283,7 +296,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 16] = [
+const OTHER_KEYS: [&str; 27] = [
     "profile",
     "listen",
     "data_dir",
@@ -301,7 +314,52 @@ const OTHER_KEYS: [&str; 16] = [
     "replication_start",
     "replication_allow_private",
     "peer_ca_file",
+    // ADR 0050 rule 28.
+    "mirror_endpoint",
+    "mirror_bucket",
+    "mirror_region",
+    "mirror_prefix",
+    "mirror_url_style",
+    "mirror_access_key_ref",
+    "mirror_secret_key_ref",
+    "mirror_session_token_ref",
+    "mirror_info",
+    "mirror_public_url",
+    "mirror_allow_private",
 ];
+
+/// `mirror_url_style` (ADR 0050 rule 28).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlStyle {
+    /// `{endpoint}/{bucket}/{key}`, the default.
+    Path,
+    /// `{bucket}.{endpoint host}/{key}`.
+    Virtual,
+}
+
+impl UrlStyle {
+    /// The names, in the file and the environment.
+    pub const NAMES: &'static [&'static str] = &["path", "virtual"];
+
+    /// The name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Virtual => "virtual",
+        }
+    }
+
+    /// Parses a name.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "path" => Some(Self::Path),
+            "virtual" => Some(Self::Virtual),
+            _ => None,
+        }
+    }
+}
 
 /// An address block in CIDR notation (`192.0.2.0/24`, `2001:db8::/32`). Host bits must be zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -431,6 +489,7 @@ impl fmt::Display for CorsOrigins {
 /// Every relay setting, validated.
 #[derive(Clone, Debug)]
 #[allow(missing_docs)] // Each field is the setting of the same name, documented in its ADR.
+#[allow(clippy::struct_excessive_bools)] // One field per setting.
 pub struct Settings {
     // ADR 0019.
     pub profile: Profile,
@@ -527,6 +586,26 @@ pub struct Settings {
     pub ingest_group_share_pct: u64,
     /// The share of `R` of an IPv6 /56, in percent.
     pub ingest_group56_share_pct: u64,
+    // ADR 0050 rule 28.
+    /// The S3 API URL; `None` (the default) turns the archive copy off.
+    pub mirror_endpoint: Option<PeerUrl>,
+    pub mirror_bucket: String,
+    pub mirror_region: String,
+    /// Empty, or ending with `/`.
+    pub mirror_prefix: String,
+    pub mirror_url_style: UrlStyle,
+    /// Names of environment variables, never credentials (rule 22).
+    pub mirror_access_key_ref: String,
+    pub mirror_secret_key_ref: String,
+    pub mirror_session_token_ref: Option<String>,
+    /// Write the `/info` object of the read-only relay URL (rule 3).
+    pub mirror_info: bool,
+    /// The read-only relay URL that serves the bucket, for the check after a `412` (rule 9).
+    pub mirror_public_url: Option<PeerUrl>,
+    pub mirror_max_in_flight: u64,
+    pub mirror_request_timeout_ms: u64,
+    pub mirror_max_backoff_s: u64,
+    pub mirror_allow_private: bool,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -758,12 +837,46 @@ impl Settings {
         let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
         let demand_eviction = parse_bool(other("demand_eviction"), "demand_eviction")?;
         let peers = parse_peers(other("peers"))?;
+        let mirror_endpoint = parse_url(other("mirror_endpoint"), "mirror_endpoint")?;
         let max_blocking_threads = *ints.max_blocking_threads.get_or_insert(blocking_floor(
             v(ints.block_max_readers),
             v(ints.put_max_in_flight),
             !peers.is_empty() && cfg!(feature = "replication"),
             v(ints.replication_max_in_flight),
+            if mirror_endpoint.is_some() && cfg!(feature = "object-store") {
+                v(ints.mirror_max_in_flight)
+            } else {
+                0
+            },
         ));
+        let mirror_bucket = parse_text(other("mirror_bucket"), "mirror_bucket", "", valid_bucket)?;
+        let mirror_region = parse_text(
+            other("mirror_region"),
+            "mirror_region",
+            "us-east-1",
+            valid_region,
+        )?;
+        let mirror_prefix = parse_text(other("mirror_prefix"), "mirror_prefix", "", valid_prefix)?;
+        let mirror_url_style = parse_choice(
+            other("mirror_url_style"),
+            "mirror_url_style",
+            UrlStyle::parse,
+            UrlStyle::NAMES,
+        )?;
+        let mirror_access_key_ref =
+            parse_var_name(other("mirror_access_key_ref"), "mirror_access_key_ref")?
+                .unwrap_or_else(|| "SBTP_MIRROR_ACCESS_KEY_ID".to_owned());
+        let mirror_secret_key_ref =
+            parse_var_name(other("mirror_secret_key_ref"), "mirror_secret_key_ref")?
+                .unwrap_or_else(|| "SBTP_MIRROR_SECRET_ACCESS_KEY".to_owned());
+        let mirror_session_token_ref = parse_var_name(
+            other("mirror_session_token_ref"),
+            "mirror_session_token_ref",
+        )?;
+        let mirror_info = parse_bool(other("mirror_info"), "mirror_info")?;
+        let mirror_public_url = parse_url(other("mirror_public_url"), "mirror_public_url")?;
+        let mirror_allow_private =
+            parse_bool(other("mirror_allow_private"), "mirror_allow_private")?;
         let replication_allow_private = parse_bool(
             other("replication_allow_private"),
             "replication_allow_private",
@@ -862,6 +975,20 @@ impl Settings {
             ingest_group_max: v(ints.ingest_group_max),
             ingest_group_share_pct: v(ints.ingest_group_share_pct),
             ingest_group56_share_pct: v(ints.ingest_group56_share_pct),
+            mirror_endpoint,
+            mirror_bucket,
+            mirror_region,
+            mirror_prefix,
+            mirror_url_style: mirror_url_style.unwrap_or(UrlStyle::Path),
+            mirror_access_key_ref,
+            mirror_secret_key_ref,
+            mirror_session_token_ref,
+            mirror_info: mirror_info.unwrap_or(true),
+            mirror_public_url,
+            mirror_max_in_flight: v(ints.mirror_max_in_flight),
+            mirror_request_timeout_ms: v(ints.mirror_request_timeout_ms),
+            mirror_max_backoff_s: v(ints.mirror_max_backoff_s),
+            mirror_allow_private: mirror_allow_private.unwrap_or(false),
             sources,
         };
         s.check_constraints()?;
@@ -876,6 +1003,7 @@ impl Settings {
 
     /// The effective value of `setting` as logged, from the typed field. `block_ttl_ms` is 0 when
     /// eviction by age is disabled, as it is written in the file.
+    #[allow(clippy::too_many_lines)] // One arm per setting.
     fn value_text(&self, setting: &str) -> Option<String> {
         let cidrs = |l: &[Cidr]| l.iter().map(Cidr::to_string).collect::<Vec<_>>().join(", ");
         macro_rules! ints {
@@ -907,6 +1035,28 @@ impl Settings {
                             .map(|p| p.display().to_string())
                             .unwrap_or_default(),
                     ),
+                    // ADR 0050: whether the endpoint is set, not its URL (an account name may be
+                    // part of its host). No other mirror setting holds a secret (rule 22).
+                    "mirror_endpoint" => Some(
+                        if self.mirror_endpoint.is_some() { "set" } else { "" }.to_owned(),
+                    ),
+                    "mirror_bucket" => Some(self.mirror_bucket.clone()),
+                    "mirror_region" => Some(self.mirror_region.clone()),
+                    "mirror_prefix" => Some(self.mirror_prefix.clone()),
+                    "mirror_url_style" => Some(self.mirror_url_style.name().to_owned()),
+                    "mirror_access_key_ref" => Some(self.mirror_access_key_ref.clone()),
+                    "mirror_secret_key_ref" => Some(self.mirror_secret_key_ref.clone()),
+                    "mirror_session_token_ref" => {
+                        Some(self.mirror_session_token_ref.clone().unwrap_or_default())
+                    }
+                    "mirror_info" => Some(self.mirror_info.to_string()),
+                    "mirror_public_url" => Some(
+                        self.mirror_public_url
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    ),
+                    "mirror_allow_private" => Some(self.mirror_allow_private.to_string()),
                     _ => None,
                 }
             };
@@ -966,7 +1116,10 @@ impl Settings {
             ingest_bytes_per_hour,
             ingest_group_max,
             ingest_group_share_pct,
-            ingest_group56_share_pct
+            ingest_group56_share_pct,
+            mirror_max_in_flight,
+            mirror_request_timeout_ms,
+            mirror_max_backoff_s
         )
     }
 
@@ -1113,6 +1266,17 @@ impl Settings {
                     .into(),
             );
         }
+        // ADR 0050 rule 23.
+        if self.mirror_allow_private && self.mirror_endpoint.is_some() {
+            add(
+                "mirror_private",
+                "mirror_allow_private",
+                "mirror_allow_private = true: the endpoint and public URL names may resolve to \
+                 loopback, private and link-local addresses, cloud metadata included \
+                 (ADR 0050 rule 23)"
+                    .into(),
+            );
+        }
         w
     }
 
@@ -1153,6 +1317,7 @@ impl Settings {
 
     /// ADR 0018 rule 22 and ADR 0019 rules 5 and 28, on the effective values. The open-file limit
     /// is checked by [`Settings::check_open_files`].
+    #[allow(clippy::too_many_lines)] // A flat list, one block per constraint.
     fn check_constraints(&self) -> Result<(), ConfigError> {
         for (setting, bytes) in [
             ("index_cache_bytes", self.index_cache_bytes),
@@ -1247,6 +1412,7 @@ impl Settings {
             )));
         }
         self.check_replication()?;
+        self.check_mirror()?;
         // Also checked when `max_blocking_threads` is left at its derived default, which can
         // exceed 512 (range "that sum to 512").
         let floor = blocking_floor(
@@ -1254,12 +1420,66 @@ impl Settings {
             self.put_max_in_flight,
             self.replication_on(),
             self.replication_max_in_flight,
+            if self.mirror_on() {
+                self.mirror_max_in_flight
+            } else {
+                0
+            },
         );
         c(
             (floor..=512).contains(&self.max_blocking_threads),
             "max_blocking_threads must be from block_max_readers + put_max_in_flight + 2 (plus \
-             replication_max_in_flight + 1 when peers is set) to 512",
+             replication_max_in_flight + 1 when peers is set, plus mirror_max_in_flight + 1 \
+             when mirror_endpoint is set) to 512",
         )
+    }
+
+    /// ADR 0050 rules 22 and 28.
+    fn check_mirror(&self) -> Result<(), ConfigError> {
+        // Rule 28 (ADR 0048 rule 3, item 1): without the feature, every `mirror_*` setting keeps
+        // its default.
+        if !cfg!(feature = "object-store") {
+            let given: Vec<&'static str> = self
+                .sources
+                .iter()
+                .filter(|(n, src)| {
+                    n.starts_with("mirror_") && matches!(src, Source::File | Source::Env)
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            if given.is_empty() {
+                return Ok(());
+            }
+            // The defaults of this profile; no `mirror_*` setting is given there, so this
+            // check returns above for them.
+            let defaults = Self::finish(BTreeMap::from([(
+                "profile".to_owned(),
+                Raw::Env(self.profile.name().to_owned()),
+            )]))?;
+            for name in given {
+                if self.value_text(name) != defaults.value_text(name) {
+                    return Err(ConfigError::Invalid {
+                        setting: name,
+                        reason: "this build has no `object-store` feature; leave the mirror_* \
+                                 settings at their defaults"
+                            .into(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        if self.mirror_endpoint.is_some() && self.mirror_bucket.is_empty() {
+            return Err(ConfigError::Constraint(
+                "mirror_endpoint is set without mirror_bucket (ADR 0050 rule 28)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the archive copy runs: compiled in and `mirror_endpoint` set (ADR 0050 rule 26).
+    #[must_use]
+    pub fn mirror_on(&self) -> bool {
+        cfg!(feature = "object-store") && self.mirror_endpoint.is_some()
     }
 
     /// ADR 0048 rules 2, 3 and 15.
@@ -1360,6 +1580,20 @@ impl Settings {
                     self.replication_max_in_flight,
                     self.replication_max_peers,
                 )
+            } else {
+                0
+            },
+            // ADR 0050 rule 27: per upload in flight, a block and the TLS and HTTP state; the
+            // uploader's page; the root store, unless replication already counts it.
+            if self.mirror_on() {
+                self.mirror_max_in_flight
+                    .saturating_mul(EST_MIRROR_PER_REQUEST)
+                    .saturating_add(EST_MIRROR_PAGE)
+                    .saturating_add(if self.replication_on() {
+                        0
+                    } else {
+                        crate::peers::EST_ROOT_STORE
+                    })
             } else {
                 0
             },
@@ -1588,6 +1822,115 @@ fn parse_peers(r: Option<Raw>) -> Result<Vec<PeerUrl>, ConfigError> {
     Ok(out)
 }
 
+/// A relay URL setting (ADR 0048 rule 14, ADR 0050 rules 15 and 23); empty is `None`.
+fn parse_url(r: Option<Raw>, setting: &'static str) -> Result<Option<PeerUrl>, ConfigError> {
+    let Some(r) = r else {
+        return Ok(None);
+    };
+    let s = r.string(setting)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    PeerUrl::parse(&s)
+        .map(Some)
+        .map_err(|reason| ConfigError::Invalid { setting, reason })
+}
+
+/// A string setting checked by `valid`; `default` when not set.
+fn parse_text(
+    r: Option<Raw>,
+    setting: &'static str,
+    default: &str,
+    valid: fn(&str) -> Result<(), &'static str>,
+) -> Result<String, ConfigError> {
+    let Some(r) = r else {
+        return Ok(default.to_owned());
+    };
+    let s = r.string(setting)?;
+    valid(&s).map_err(|why| ConfigError::Invalid {
+        setting,
+        reason: format!("`{s}`: {why}"),
+    })?;
+    Ok(s)
+}
+
+/// ADR 0050 rule 28: empty (off) or 3 to 63 characters of `a-z 0-9 . -`.
+fn valid_bucket(s: &str) -> Result<(), &'static str> {
+    let shape = (3..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    if s.is_empty() || shape {
+        Ok(())
+    } else {
+        Err("a bucket name is 3 to 63 characters of a-z, 0-9, `.` and `-`")
+    }
+}
+
+/// ADR 0050 rule 28: 1 to 32 characters of `a-z 0-9 -`.
+fn valid_region(s: &str) -> Result<(), &'static str> {
+    if (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err("a region is 1 to 32 characters of a-z, 0-9 and `-`")
+    }
+}
+
+/// ADR 0050 rule 28: empty, or at most 256 characters of `A-Z a-z 0-9 / . _ -` ending with `/`.
+/// Also refused here: an empty, `.` or `..` segment (a leading `/` included), which a proxy or
+/// a CDN may normalise away, so that the object would not be found under the public URL.
+fn valid_prefix(s: &str) -> Result<(), &'static str> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    let chars = s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'));
+    let segments = s.strip_suffix('/').is_some_and(|inner| {
+        inner
+            .split('/')
+            .all(|g| !g.is_empty() && g != "." && g != "..")
+    });
+    if s.len() <= 256 && chars && segments {
+        Ok(())
+    } else {
+        Err(
+            "a prefix is at most 256 characters of A-Z, a-z, 0-9, `/`, `.`, `_` and `-`, \
+             ends with `/`, and has no empty, `.` or `..` segment",
+        )
+    }
+}
+
+/// ADR 0050 rule 22: the name of an environment variable, never a credential. The value is not
+/// repeated in the error: it may be a key written in the wrong setting. Empty is `None`.
+fn parse_var_name(r: Option<Raw>, setting: &'static str) -> Result<Option<String>, ConfigError> {
+    let Some(r) = r else {
+        return Ok(None);
+    };
+    let s = Zeroizing::new(r.string(setting)?);
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let shape = s.len() <= 64
+        && s.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if !shape || s.starts_with(ENV_PREFIX) {
+        return Err(ConfigError::Invalid {
+            setting,
+            reason: "must be the name of an environment variable (A-Z, 0-9 and `_`, at most 64 \
+                     characters, not starting with a digit or SBTP_RELAY_), never a credential \
+                     (ADR 0050 rule 22)"
+                .into(),
+        });
+    }
+    Ok(Some(s.to_string()))
+}
+
 /// A non-empty path.
 fn parse_path(r: &Raw, setting: &'static str) -> Result<PathBuf, ConfigError> {
     let s = r.string(setting)?;
@@ -1722,9 +2065,34 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 56 integer settings plus the 16 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
-        // 0046, 0048 and 0049.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 72);
+        // 59 integer settings plus the 27 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
+        // 0046, 0048, 0049 and 0050.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 86);
+    }
+
+    /// ADR 0050 rule 28: without `object-store`, a `mirror_*` setting given at its default is
+    /// accepted, any other value stops the start-up.
+    #[cfg(not(feature = "object-store"))]
+    #[test]
+    fn mirror_settings_without_the_feature() {
+        let load = |k: &str, v: &str| {
+            Settings::load(
+                Vec::<std::ffi::OsString>::new(),
+                vec![(format!("SBTP_RELAY_{k}").into(), v.into())],
+            )
+        };
+        assert!(load("MIRROR_INFO", "true").is_ok());
+        assert!(load("MIRROR_REGION", "us-east-1").is_ok());
+        for (k, v) in [
+            ("MIRROR_ENDPOINT", "https://s3.example"),
+            ("MIRROR_INFO", "false"),
+            ("MIRROR_MAX_IN_FLIGHT", "2"),
+        ] {
+            assert!(
+                matches!(load(k, v), Err(ConfigError::Invalid { setting, .. }) if setting.starts_with("mirror_")),
+                "{k}"
+            );
+        }
     }
 
     /// ADR 0044 rule 1: a field name of 1 to 64 token bytes, kept lowercase; the two address

@@ -800,17 +800,17 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// `id` after full validation (rule 1). A damaged file is moved to quarantine and answered as
     /// missing, also when the move fails (logged). `Err` is an I/O error while reading (`500`,
     /// rule 2).
-    fn load(&self, id: &BlockId) -> Result<Option<Bytes>, ()> {
+    fn load(&self, id: &BlockId) -> Result<Loaded, ()> {
         // ADR 0023 rule 7: decide again once if the file changed under the lock.
         for _ in 0..2 {
             let read = self.store.read(id).map_err(|e| {
                 store::log_store_failed(StoreOp::Read, &e);
             });
             let Some(bytes) = read? else {
-                return Ok(None);
+                return Ok(Loaded::Absent);
             };
             let Err(damage) = full_validation(&bytes, id) else {
-                return Ok(Some(Bytes::from(bytes)));
+                return Ok(Loaded::Bytes(Bytes::from(bytes)));
             };
             // The lock of `id`, as on `PUT`, on this rare path only: a `PUT` of the block never
             // sees the final name emptied by this move halfway through its decision.
@@ -824,10 +824,20 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 Ok(Quarantine::Changed) => continue,
                 Err(e) => store::log_store_failed(e.op, &e.error),
             }
-            return Ok(None);
+            return Ok(Loaded::Damaged);
         }
-        Ok(None)
+        Ok(Loaded::Absent)
     }
+}
+
+/// What [`Relay::load`] found under the final name of a block.
+enum Loaded {
+    /// The file passed full validation and R1.
+    Bytes(Bytes),
+    /// No file.
+    Absent,
+    /// A damaged file, moved to quarantine (or left in place when the move failed).
+    Damaged,
 }
 
 /// The index entry of a stored block, at the relay clock.
@@ -1123,6 +1133,20 @@ pub(crate) enum Fetched {
     Failed,
 }
 
+/// The outcome of [`Relay::read_for_copy`].
+#[cfg(feature = "object-store")]
+#[derive(Debug)]
+pub(crate) enum Copied {
+    /// The block, validated (ADR 0023 rules 10 and 11).
+    Bytes(Bytes),
+    /// No longer held (ADR 0050 rule 9, `mirror_missed_total`).
+    Absent,
+    /// Damaged, moved to quarantine (`mirror_damaged_total`).
+    Damaged,
+    /// No permit, an I/O error or a failed task: tried again later.
+    Retry,
+}
+
 impl<I: IndexBackend + 'static> Relay<I> {
     /// The read path of `GET /block` without its response (ADR 0023 rules 10 and 11): a cache hit
     /// takes no permit and verifies nothing; a miss takes a block-read permit, in which the file
@@ -1144,12 +1168,37 @@ impl<I: IndexBackend + 'static> Relay<I> {
         })
         .await;
         match loaded {
-            Ok(Ok(Some(bytes))) => {
+            Ok(Ok(Loaded::Bytes(bytes))) => {
                 self.cache_loaded(&id, bytes.clone(), evicted);
                 Fetched::Served(bytes)
             }
-            Ok(Ok(None)) => Fetched::Missing,
+            Ok(Ok(Loaded::Absent | Loaded::Damaged)) => Fetched::Missing,
             Ok(Err(())) | Err(_) => Fetched::Failed,
+        }
+    }
+
+    /// ADR 0050 rule 8: the read path of ADR 0023 for the archive copy. A cache hit is used; a
+    /// miss takes a block-read permit like a `GET`, but the block is not put in the cache: a walk
+    /// of the whole history must not push the blocks clients read out of it.
+    #[cfg(feature = "object-store")]
+    pub(crate) async fn read_for_copy(self: &Arc<Self>, id: BlockId) -> Copied {
+        if let Some(bytes) = self.cache.get(&id) {
+            return Copied::Bytes(bytes);
+        }
+        let Ok(permit) = self.read.acquire().await else {
+            return Copied::Retry;
+        };
+        let worker = Arc::clone(self);
+        let loaded = tokio::task::spawn_blocking(move || {
+            let _owned = permit;
+            worker.load(&id)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(Loaded::Bytes(b))) => Copied::Bytes(b),
+            Ok(Ok(Loaded::Absent)) => Copied::Absent,
+            Ok(Ok(Loaded::Damaged)) => Copied::Damaged,
+            Ok(Err(())) | Err(_) => Copied::Retry,
         }
     }
 

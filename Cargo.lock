@@ -1276,11 +1276,13 @@ dependencies = [
  "rustls-native-certs",
  "sbtp-core",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "toml",
  "tower",
  "tower-http",
+ "zeroize",
 ]
 
 [[package]]

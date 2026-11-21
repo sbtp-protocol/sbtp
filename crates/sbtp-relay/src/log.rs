@@ -200,6 +200,11 @@ events! {
     // are this implementation's).
     IngestCapped => "ingest_capped", Warn, Bounded;
     IngestCapEnded => "ingest_cap_ended", Info, Bounded;
+    // ADR 0050 rule 29 (adds rows to rule 7; the ADR names the two bounded events without a
+    // table, the levels and the start-up line are this implementation's).
+    Mirror => "mirror", Info, Startup;
+    MirrorFailed => "mirror_failed", Warn, Bounded;
+    MirrorPoisoned => "mirror_poisoned", Error, Bounded;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1185,6 +1190,16 @@ mod tests {
             assert!(adr0049.contains(&format!("`{name}`")), "{name}");
         }
         table.extend_from_slice(&ingest);
+        // ADR 0050 rule 29 names two events without a level table; the start-up line `mirror`
+        // is this implementation's.
+        table.push(("mirror", "info"));
+        let adr0050 =
+            include_str!("../../../docs/decisions/0050-object-storage-mirror-and-read-through.md");
+        let mirror = [("mirror_failed", "warn"), ("mirror_poisoned", "error")];
+        for (name, _) in mirror {
+            assert!(adr0050.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&mirror);
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))

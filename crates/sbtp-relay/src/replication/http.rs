@@ -137,17 +137,7 @@ impl Client {
         path: &str,
         ceiling: usize,
     ) -> Result<Reply, Fail> {
-        // A connection the peer closed between two requests (keep-alive bounds): one new one.
-        let usable = match conn.as_mut() {
-            Some(c) => !c.sender.is_closed() && c.sender.ready().await.is_ok(),
-            None => false,
-        };
-        if !usable {
-            *conn = Some(self.connect(peer).await?);
-        }
-        let Some(c) = conn.as_mut() else {
-            return Err(fail(Failed::Connect));
-        };
+        let c = self.ready(conn, peer).await?;
         let resp = c
             .sender
             .send_request(request(peer, path)?)
@@ -185,6 +175,66 @@ impl Client {
             502..=504 => failed(Failed::Unavailable),
             400..=499 => failed(Failed::Client),
             _ => failed(Failed::Server),
+        }
+    }
+
+    /// `conn` when it is open and ready, else a new connection stored in it. A connection the
+    /// peer closed between two requests (keep-alive bounds) is replaced once.
+    async fn ready<'c>(
+        &self,
+        conn: &'c mut Option<Conn>,
+        peer: &PeerUrl,
+    ) -> Result<&'c mut Conn, Fail> {
+        let usable = match conn.as_mut() {
+            Some(c) => !c.sender.is_closed() && c.sender.ready().await.is_ok(),
+            None => false,
+        };
+        if !usable {
+            *conn = Some(self.connect(peer).await?);
+        }
+        conn.as_mut().ok_or(fail(Failed::Connect))
+    }
+
+    /// One request of the archive copy (ADR 0050 rules 8 and 23) to `url`, over `conn` when it
+    /// is open: the whole exchange bounded by the client's timeout, the response body read up to
+    /// [`ERROR_CEILING`] and discarded; only the status is returned. A body over that bound
+    /// closes the connection, the status still counts. A `3xx` is returned, never followed.
+    ///
+    /// # Errors
+    ///
+    /// [`Fail`]: no response (connection, TLS, timeout, broken exchange). `conn` is closed.
+    #[cfg(feature = "object-store")]
+    pub async fn send_discard(
+        &self,
+        conn: &mut Option<Conn>,
+        url: &PeerUrl,
+        req: Request<Body>,
+    ) -> Result<StatusCode, Fail> {
+        let exchange = async {
+            let c = self.ready(conn, url).await?;
+            let resp = c
+                .sender
+                .send_request(req)
+                .await
+                .map_err(|_| fail(Failed::Invalid))?;
+            let status = resp.status();
+            let whole = read_bounded(resp.into_body(), ERROR_CEILING).await.is_ok();
+            Ok((status, whole))
+        };
+        let done = tokio::time::timeout(self.timeout, exchange)
+            .await
+            .unwrap_or(Err(fail(Failed::Timeout)));
+        match done {
+            Ok((status, whole)) => {
+                if !whole {
+                    *conn = None;
+                }
+                Ok(status)
+            }
+            Err(f) => {
+                *conn = None;
+                Err(f)
+            }
         }
     }
 

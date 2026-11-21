@@ -99,7 +99,7 @@ impl Replication {
             return Ok(None);
         }
         let tls = if s.peers.iter().any(PeerUrl::is_https) {
-            Some(Arc::new(client_config(s)?))
+            Some(Arc::new(client_config(s, "peers")?))
         } else {
             None
         };
@@ -207,7 +207,12 @@ fn read_pem(
 
 /// Rule 19: rustls, `ring`, TLS 1.3 only, the roots of `peer_ca_file` or of the operating
 /// system, hostname verification by the `WebPKI` verifier, no resumption, ALPN `http/1.1`.
-fn client_config(s: &Settings) -> Result<rustls::ClientConfig, ConfigError> {
+/// `user` names the setting that needs it in errors (`peers`, or `mirror_endpoint` for the
+/// archive copy of ADR 0050 rule 23).
+pub(crate) fn client_config(
+    s: &Settings,
+    user: &'static str,
+) -> Result<rustls::ClientConfig, ConfigError> {
     let (setting, certs) = if let Some(path) = &s.peer_ca_file {
         let certs = read_pem(path).map_err(|reason| ConfigError::Invalid {
             setting: "peer_ca_file",
@@ -218,14 +223,14 @@ fn client_config(s: &Settings) -> Result<rustls::ClientConfig, ConfigError> {
         // `rustls-native-certs`: `SSL_CERT_FILE` or `SSL_CERT_DIR` when set, else the platform
         // store (openssl-probe's file locations on Linux, Security.framework on macOS). Errors on
         // single certificates are ignored; what matters is that some root loads.
-        ("peers", rustls_native_certs::load_native_certs().certs)
+        (user, rustls_native_certs::load_native_certs().certs)
     };
     let mut roots = rustls::RootCertStore::empty();
     let (added, _) = roots.add_parsable_certificates(certs);
     if added == 0 {
         return Err(ConfigError::Invalid {
             setting,
-            reason: "no trust root could be loaded for the https peers from peer_ca_file or \
+            reason: "no trust root could be loaded for the https URLs from peer_ca_file or \
                      the operating system bundle (ADR 0048 rule 19)"
                 .into(),
         });
@@ -234,7 +239,7 @@ fn client_config(s: &Settings) -> Result<rustls::ClientConfig, ConfigError> {
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| ConfigError::Invalid {
-            setting: "peers",
+            setting: user,
             reason: "the TLS client could not be built".into(),
         })?
         .with_root_certificates(roots)

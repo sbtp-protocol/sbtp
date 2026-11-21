@@ -1106,6 +1106,69 @@ impl RedbIndex {
         Ok(())
     }
 
+    /// The values of `keys` in `meta`, `None` for an absent key (ADR 0050 rules 3 and 7: the
+    /// archive copy's cursor and the digest of the `/info` object it last wrote).
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    #[cfg(feature = "object-store")]
+    pub(crate) fn meta_values<const N: usize>(
+        &self,
+        keys: [&str; N],
+    ) -> Result<[Option<u64>; N], IndexError> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        let mut out = [None; N];
+        for (o, k) in out.iter_mut().zip(keys) {
+            *o = meta.get(k)?.map(|g| g.value());
+        }
+        Ok(out)
+    }
+
+    /// Records `pairs` in `meta` in one durable transaction (ADR 0050 rule 7).
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    #[cfg(feature = "object-store")]
+    pub(crate) fn set_meta_values(&self, pairs: &[(&str, u64)]) -> Result<(), IndexError> {
+        let _w = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            for (k, v) in pairs {
+                meta.insert(*k, *v)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The number of positions at or after `from`, counted up to `cap` (ADR 0050 rule 29, the
+    /// `mirror_lag_blocks` gauge). `O(min(count, cap))`.
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    #[cfg(feature = "object-store")]
+    pub(crate) fn count_from(&self, from: Position, cap: u64) -> Result<u64, IndexError> {
+        let txn = self.db.begin_read()?;
+        let blocks = txn.open_table(BLOCKS)?;
+        let mut n = 0;
+        for row in blocks.range(from.key()..)? {
+            row?;
+            n += 1;
+            if n >= cap {
+                break;
+            }
+        }
+        Ok(n)
+    }
+
     /// Closes the index at graceful shutdown and returns the error that dropping it would ignore
     /// (redb 4.5.0 `Database::close`). redb 4.6.0 also makes a pending non-durable commit durable
     /// here; the relay still calls [`IndexBackend::flush`] first, so that a failure to make the
