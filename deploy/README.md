@@ -188,6 +188,67 @@ Cloudflare rate limiting rule on `http.request.method eq "PUT" and http.request.
 "/sbtp/v1/block"`, counted per IP, of a few hundred requests per ten minutes, with the action
 "Block" for the rest of the period.
 
+## Replication
+
+A relay can copy blocks from other relays its operator chooses (ADR 0048, pull replication). It
+is compiled into the published binary and image, and **off** until `peers` is set: with the
+default settings nothing is contacted.
+
+```toml
+# Relays to copy from: absolute https URLs, without userinfo, query or fragment, at most
+# replication_max_peers (4 on small, 16 on standard, 64 on large). A peer is never added from
+# anything the relay receives.
+peers = ["https://relay-a.example", "https://relay-b.example/sbtp"]
+# `now` (default): copy what a peer stores from the first time it is seen (minus
+# replication_resync_margin_ms). `all`: its full history, for an archive relay.
+replication_start = "now"
+```
+
+Two operators who list each other hold the same blocks within one poll interval
+(`replication_poll_ms`, 10 s). A loop between relays is harmless: a block the relay holds is
+never fetched again. For each peer the relay walks `/query` with a cursor kept in its index,
+skips the blocks it holds and those below its `min_pow_difficulty` without fetching them,
+fetches the others with `GET` and `Sbtp-Replication: 1`, validates each as a `PUT` body (format,
+timestamp, proof of work, signature, and that it is the requested block) and stores it as a new
+block. A copy is not a read: the source does not count it as demand.
+
+- **Archive relay.** `block_ttl_ms = 0`, `demand_eviction = false` and
+  `replication_start = "all"`; size `max_store_bytes` for the history of every peer.
+- **Bounds** (profile rows): `replication_max_in_flight` requests at a time (1 on `small`),
+  `replication_blocks_per_min` (600) and `replication_bytes_per_hour` (256 MiB) for all peers
+  together, shared round robin. Every request has the body ceilings of ADR 0029 and a total time
+  limit (`replication_request_timeout_ms`, 30 s). The peer's `Retry-After` is obeyed; without it
+  the relay backs off exponentially up to `replication_max_backoff_s` (1 hour) and never gives a
+  peer up. These defaults stay well under a `small` peer's own allowances.
+- **Disk.** Replication stores nothing while the store is above `demand_high_water_pct` (90 %)
+  of `max_store_bytes` (`replication_paused`); the room above the mark stays for clients.
+  Replicated blocks are not charged to the ingest bounds of ADR 0049: replication has its own
+  budget.
+- **Minimum difficulty.** A relay with `peers` set refuses to start with `min_pow_difficulty`
+  above the network difficulty (16).
+- **Memory.** With replication on, the computed bound of `small` grows by 723,077 bytes (bound
+  under the 20 MB budget of `small` with every function on); it is logged at start-up (`memory_bound`).
+- **Trust roots.** `https` peers are verified with TLS 1.3 against the operating system store
+  (`rustls-native-certs`: `SSL_CERT_FILE` or `SSL_CERT_DIR` when set, else the usual bundle
+  files on Linux, `/etc/ssl/certs/ca-certificates.crt` in the image, and the system keychain on
+  macOS) or, when set, `peer_ca_file` (a PEM file of at most 4 MiB), which replaces it. A relay with an `https` peer and no root refuses to start. No redirect is followed.
+- **Private addresses.** A peer name that resolves to a loopback, private, shared (RFC 6598),
+  link-local (cloud metadata), unspecified, multicast or reserved address is not contacted,
+  unless the peer URL is that literal address or `replication_allow_private = true`. Names are
+  resolved for each connection and the checked address is the one connected to. `http` is
+  accepted for a loopback host only (tests).
+- **Logs and metrics** name a peer by its position in `peers`, never by its URL; the `peers`
+  setting line logs the number of peers. Counters: `replication_blocks_stored_total`,
+  `replication_bytes_total`, `replication_skipped_total{reason}` (`held`, `pow`, `invalid`,
+  `not_found`, `future`), `replication_requests_failed_total{status}`,
+  `replication_cursor_resets_total`, gauge `replication_paused`. Events:
+  `replication_peer_backoff`, `replication_paused`, `replication_cursor_reset`, rate-capped.
+
+**Firewall egress.** With `peers` set the relay makes outbound connections: allow TCP 443 (and
+any other port named in `peers`) to the peers' addresses, and DNS. Without `peers` it needs no
+egress at all; keep egress closed then. A host or Kubernetes network policy that allows egress
+only to the listed peers also covers the private-address rule above.
+
 ## Alerts
 
 The counters and gauges worth an alert on a public relay, with plain starting thresholds. They are

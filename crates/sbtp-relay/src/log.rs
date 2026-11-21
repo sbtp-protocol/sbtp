@@ -189,6 +189,13 @@ events! {
     // Security review 2026-11-21, I-4 (owner decision, ADR 0046 clarification): the progress of
     // the start-up migration of the demand tables, before the relay listens.
     DemandMigration => "demand_migration", Info, Startup;
+    // ADR 0048, "Metrics" (adds rows to rule 7; the ADR names the three bounded events without a
+    // table, the levels and the start-up line are this implementation's). Peers are named by
+    // their position in `peers`, never by URL.
+    Replication => "replication", Info, Startup;
+    ReplicationPeerBackoff => "replication_peer_backoff", Warn, Bounded;
+    ReplicationPaused => "replication_paused", Warn, Bounded;
+    ReplicationCursorReset => "replication_cursor_reset", Info, Bounded;
     // ADR 0049 rule 16 (adds two rows to rule 7; the ADR names them without a table, the levels
     // are this implementation's).
     IngestCapped => "ingest_capped", Warn, Bounded;
@@ -1156,6 +1163,20 @@ mod tests {
         // Security review 2026-11-21, I-4: named by the ADR 0046 clarification written alongside
         // this change; checked against the ADR text once it is merged.
         table.push(("demand_migration", "info"));
+        // ADR 0048, "Metrics", names three events without a level table; the start-up line
+        // `replication` is this implementation's.
+        table.push(("replication", "info"));
+        let adr0048 =
+            include_str!("../../../docs/decisions/0048-node-roles-replication-discovery.md");
+        let replication = [
+            ("replication_peer_backoff", "warn"),
+            ("replication_paused", "warn"),
+            ("replication_cursor_reset", "info"),
+        ];
+        for (name, _) in replication {
+            assert!(adr0048.contains(&format!("`{name}`")), "{name}");
+        }
+        table.extend_from_slice(&replication);
         // ADR 0049 rule 16 names two events without a level table: each must appear there.
         let adr0049 =
             include_str!("../../../docs/decisions/0049-ingest-bounds-against-disk-filling.md");

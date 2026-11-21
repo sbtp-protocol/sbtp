@@ -75,6 +75,30 @@ Initial public version. Pre-release software: no version is supported for produc
   `ingest_group_share_pct`, `ingest_group56_share_pct`; new counters and gauges `ingest_*`, events
   `ingest_capped` and `ingest_cap_ended`; `deploy/README.md` gains the ingest section, a CDN edge
   rule and the alerts of ADR 0049 rule 12. Computed `small` memory bound: 14,910,996 bytes.
+- `sbtp-relay`: pull replication built into the relay (ADR 0048 stage 1), default Cargo feature
+  `replication`, off at run time unless `peers` is set. Per peer the relay walks `/query` with a
+  cursor kept in a new index table (`replication_peers`), skips held blocks and identifiers below
+  `min_pow_difficulty` without fetching them, fetches the others with `Sbtp-Replication: 1`,
+  validates each as a `PUT` body plus R1 and stores it through the `PUT` storage step (never charged
+  to the ADR 0049 ingest bounds). `InvalidCursor` restarts the walk from the last complete page
+  minus `replication_resync_margin_ms`. Bounds: `replication_max_in_flight`,
+  `replication_blocks_per_min`, `replication_bytes_per_hour` (profile rows), round robin turns,
+  ADR 0029 body ceilings, a total time limit, the peer's `Retry-After`, exponential back-off, a
+  pause above the high-water mark. Outbound HTTP/1.1 with hyper's low-level client; TLS 1.3 with
+  rustls and `ring` against the operating system store (`rustls-native-certs`) or `peer_ca_file`; no redirect followed; resolved private, loopback and link-local
+  addresses refused unless `replication_allow_private`. New settings `peers`, `replication_start`,
+  `replication_allow_private`, `peer_ca_file`, `replication_max_peers`,
+  `replication_max_in_flight`, `replication_blocks_per_min`, `replication_bytes_per_hour`,
+  `replication_poll_ms`, `replication_request_timeout_ms`, `replication_max_backoff_s`,
+  `replication_resync_margin_ms`; counters `replication_*`; events `replication`,
+  `replication_peer_backoff`, `replication_paused`, `replication_cursor_reset`. New dependencies:
+  `rustls` 0.23.46, `tokio-rustls` 0.26.6, `rustls-native-certs` 0.8.5 and the hyper feature
+  `client`; through them `ring` 0.17.14, `rustls-webpki` 0.103.16, `rustls-pki-types` 1.15.1,
+  `untrusted` 0.9.0, `want` 0.3.2, `try-lock` 0.2.5, and per platform `openssl-probe` 0.2.2
+  (Linux), `security-framework` 3.7.0, `security-framework-sys` 2.17.0, `core-foundation` 0.10.1
+  (macOS), `schannel` 0.1.30 (Windows). Computed `small` memory bound with replication on:
+  15,634,073 bytes, under the 20 MB budget of every function on. `deploy/README.md` gains a
+  "Replication" section.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
 

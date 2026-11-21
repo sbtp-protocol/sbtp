@@ -35,7 +35,9 @@ tower-http = { version = "0.7.1", default-features = false, features = ["cors", 
 # ADR 0018 accept loop: hyper's HTTP/1.1 server builder (no HTTP/2: rule 27) and hyper-util's tokio
 # adapters. Both were already in the graph through axum. `hyper_util::server::conn::auto` is not
 # used: its feature `server-auto` forces HTTP/2 (and the `h2` crate) into the build.
-hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+# ADR 0048 rule 19: `client` adds `hyper::client::conn::http1` (no pool, no redirect following) for
+# the outbound replication client.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 http-body = "1.1.0"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
@@ -46,6 +48,16 @@ toml = { version = "1.1.8", default-features = false, features = ["std", "parse"
 # `accept` error classes (EMFILE, ENFILE, ENOBUFS, ENOMEM): constants only, no `unsafe`. Already in
 # the graph through tokio.
 libc = "0.2.191"
+# Outbound TLS of replication (ADR 0048 rule 19, ADR 0028 rule 54): rustls with the `ring` provider,
+# TLS 1.3 only (no `tls12`), no `aws_lc_rs`, no `logging`, no `prefer-post-quantum`. 0.23.46 is the
+# minimum for RUSTSEC-2026-0285, -0346 to -0349 (published 2026-10-14). The lock holds
+# `rustls-pki-types` 1.15.1 and `rustls-webpki` 0.103.16: 1.16.0 and 0.103.17 are younger than two
+# weeks (ADR 0028 rule 54); do not `cargo update` them before 2026-11-24 and 2026-11-26.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+# The operating system trust store of the replication client (ADR 0048 rule 19); `webpki-roots`
+# is not used.
+rustls-native-certs = "0.8.5"
 # Relay index backend (ADR 0013 rules 22 to 26). Exact pin, default features only (no `experimental-*`,
 # never `Builder::set_concurrency_mode()`). 4.6.0 is younger than two weeks: owner-approved exception of
 # 2026-11-18, see docs/security/dependency-exceptions.md and docs/security/2026-11-18-redb-4.6-exception.md.

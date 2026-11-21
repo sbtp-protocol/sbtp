@@ -789,7 +789,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 60, "one line per setting");
+    assert_eq!(lines.len(), 72, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1178,6 +1178,116 @@ fn small_profile_memory_bound_is_under_15_mb() {
     );
 }
 
+/// ADR 0048 rule 3, item 1: a build without the feature refuses `peers` at start-up.
+#[cfg(not(feature = "replication"))]
+#[test]
+fn peers_need_the_replication_feature() {
+    let e = err(&[], &[("PEERS", "https://relay.example")]);
+    assert!(
+        matches!(
+            e,
+            ConfigError::Invalid {
+                setting: "peers",
+                ..
+            }
+        ),
+        "{e}"
+    );
+    assert!(load(&[], &[("PEERS", "")]).is_ok());
+}
+
+/// ADR 0048 rule 16 and the owner's budget decision: `small` with replication on stays under
+/// 20,000,000 bytes, the "every function on" budget that replaced the 16 MB bound of rule 3; the
+/// terms count `replication_max_peers` peers and only when `peers` is not empty.
+#[cfg(feature = "replication")]
+#[test]
+fn small_profile_memory_bound_with_replication_is_under_20_mb() {
+    let off = Settings::load(Vec::<OsString>::new(), Vec::new()).unwrap();
+    let on = Settings::load(
+        Vec::<OsString>::new(),
+        env(&[("PEERS", "https://relay.example")]),
+    )
+    .unwrap();
+    assert_eq!(on.profile, Profile::Small);
+    assert!(on.replication_on());
+    assert!(!off.replication_on());
+    assert_eq!(on.memory_bound_bytes() - off.memory_bound_bytes(), 723_077);
+    assert!(
+        on.memory_bound_bytes() < 20_000_000,
+        "{}",
+        on.memory_bound_bytes()
+    );
+}
+
+/// ADR 0048 rule 15: the profile rows and the policy defaults.
+#[cfg(feature = "replication")]
+#[test]
+fn replication_settings_defaults_and_profiles() {
+    let s = load(&[], &[]).unwrap();
+    assert_eq!(s.peers.len(), 0);
+    assert_eq!(
+        s.replication_start,
+        sbtp_relay::peers::ReplicationStart::Now
+    );
+    assert!(!s.replication_allow_private);
+    assert_eq!(s.peer_ca_file, None);
+    assert_eq!(
+        (
+            s.replication_poll_ms,
+            s.replication_request_timeout_ms,
+            s.replication_max_backoff_s,
+            s.replication_resync_margin_ms
+        ),
+        (10_000, 30_000, 3_600, 3_600_000)
+    );
+    for (profile, rows) in [
+        ("small", [4, 1, 600, 256 << 20]),
+        ("standard", [16, 4, 3_000, 2 << 30]),
+        ("large", [64, 16, 12_000, 16 << 30]),
+    ] {
+        let s = load(&[], &[("PROFILE", profile)]).unwrap();
+        assert_eq!(
+            [
+                s.replication_max_peers,
+                s.replication_max_in_flight,
+                s.replication_blocks_per_min,
+                s.replication_bytes_per_hour
+            ],
+            rows,
+            "{profile}"
+        );
+    }
+    let s = load(
+        &[],
+        &[
+            (
+                "PEERS",
+                "HTTPS://Relay.Example:443/, https://[2001:db8::1]:8443/p",
+            ),
+            ("REPLICATION_START", "all"),
+        ],
+    )
+    .unwrap();
+    let peers: Vec<String> = s.peers.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        peers,
+        ["https://relay.example", "https://[2001:db8::1]:8443/p"]
+    );
+    assert_eq!(
+        s.replication_start,
+        sbtp_relay::peers::ReplicationStart::All
+    );
+    // The logged value is the number of peers, never a URL.
+    let logged: Vec<_> = s
+        .effective_values()
+        .filter(|(n, _, _)| *n == "peers")
+        .collect();
+    assert_eq!(logged[0].1, "2");
+    assert!(load(&[], &[("REPLICATION_START", "later")]).is_err());
+    assert!(load(&[], &[("REPLICATION_MAX_PEERS", "257")]).is_err());
+    assert!(load(&[], &[("REPLICATION_BYTES_PER_HOUR", "1000")]).is_err());
+}
+
 /// Environment pairs (`SBTP_RELAY_` left out).
 type Pairs = &'static [(&'static str, &'static str)];
 
@@ -1200,19 +1310,32 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
         &[("INGEST_BYTES_PER_HOUR", "0")],
         163_904,
     ),
+    // ADR 0048 rule 16: requests in flight, the root store and the peer state, when `peers` is
+    // not empty (TLS client included; server TLS stays off).
+    (
+        "replication",
+        &[("PEERS", "https://relay.example")],
+        &[("PEERS", "")],
+        723_077,
+    ),
 ];
 
 /// ADR 0048 budget: `small` with every function of [`FUNCTIONS`] on stays under 20,000,000 bytes,
 /// and each function adds exactly its stated share.
 #[test]
 fn small_profile_with_every_function_is_under_20_mb() {
-    let on: Vec<(&str, &str)> = FUNCTIONS
+    // A build without the `replication` feature refuses `peers` (ADR 0048 rule 3, item 1).
+    let functions: Vec<_> = FUNCTIONS
+        .iter()
+        .filter(|(name, ..)| cfg!(feature = "replication") || *name != "replication")
+        .collect();
+    let on: Vec<(&str, &str)> = functions
         .iter()
         .flat_map(|(_, on, _, _)| on.iter().copied())
         .collect();
     let all = load(&[], &on).unwrap().memory_bound_bytes();
     assert!(all < 20_000_000, "{all}");
-    for (name, _, off, share) in FUNCTIONS {
+    for (name, _, off, share) in functions {
         let mut without = on.clone();
         without.extend_from_slice(off);
         let without = load(&[], &without).unwrap().memory_bound_bytes();
