@@ -412,3 +412,40 @@ fn sighup_reloads_the_deny_list() {
     assert!(!log.contains(&hex(&id)[56..]), "a block_id in the log");
     assert!(!log.contains(MARKER));
 }
+
+/// Security review 2026-11-21 (archive copy), L-1: a value pasted into a `*_ref` setting
+/// instead of a variable name, which passes the name check, stops the start-up before any
+/// `setting` line: it appears in no line of the log.
+#[cfg(feature = "object-store")]
+#[test]
+fn a_value_in_a_ref_setting_is_never_logged() {
+    // Shaped like a variable name, as an identifier pasted by mistake would be.
+    const PASTED: &str = "PASTEDVALUEX7Q2Z9W4K8";
+    for setting in [
+        "MIRROR_ACCESS_KEY_REF",
+        "MIRROR_SECRET_KEY_REF",
+        "MIRROR_SESSION_TOKEN_REF",
+    ] {
+        let data = tmp_dir("e2e-ref");
+        let out = Command::new(env!("CARGO_BIN_EXE_sbtp-relay"))
+            .env_clear()
+            .env("SBTP_RELAY_LISTEN", "127.0.0.1:0")
+            .env("SBTP_RELAY_DATA_DIR", &data)
+            .env("SBTP_RELAY_MIRROR_ENDPOINT", "https://s3.example")
+            .env("SBTP_RELAY_MIRROR_BUCKET", "archive")
+            .env(format!("SBTP_RELAY_{setting}"), PASTED)
+            .env("SBTP_MIRROR_ACCESS_KEY_ID", "test-access")
+            .env("SBTP_MIRROR_SECRET_ACCESS_KEY", "test-secret")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{setting}: {log}");
+        assert!(log.contains("event=fatal"), "{setting}: {log}");
+        assert!(!log.contains("event=setting"), "{setting}: {log}");
+        for line in log.lines() {
+            assert!(!line.contains(PASTED), "{setting}: {line}");
+        }
+        assert!(!data.exists(), "nothing is opened");
+    }
+}

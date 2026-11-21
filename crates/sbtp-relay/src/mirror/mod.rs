@@ -317,14 +317,6 @@ impl Mirror {
             None
         };
         let info = s.mirror_info.then(|| Bytes::from(info_body(s)));
-        log::emit(
-            Event::Mirror,
-            &[
-                ("in_flight", Value::Int(s.mirror_max_in_flight)),
-                ("info", Value::Bool(info.is_some())),
-                ("verify", Value::Bool(s.mirror_public_url.is_some())),
-            ],
-        );
         Ok(Some(Self {
             target,
             creds,
@@ -340,6 +332,18 @@ impl Mirror {
                 max_backoff: Duration::from_secs(s.mirror_max_backoff_s),
             },
         }))
+    }
+
+    /// The start-up line `mirror` (ADR 0050 rule 29), written after the `setting` lines.
+    pub fn announce(&self, s: &Settings) {
+        log::emit(
+            Event::Mirror,
+            &[
+                ("in_flight", Value::Int(s.mirror_max_in_flight)),
+                ("info", Value::Bool(self.info.is_some())),
+                ("verify", Value::Bool(s.mirror_public_url.is_some())),
+            ],
+        );
     }
 
     /// Starts the uploader. The task ends when `stop` turns `true`, or if it panics: the caller

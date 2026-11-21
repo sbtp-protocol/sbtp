@@ -138,12 +138,16 @@ where
         log::client_tag_key().map_err(|e| StartError::Io("drawing the client tag key", e))?;
     }
     log::global().configure(&LogConfig::from_settings(&settings));
-    log_settings(&settings)?;
-    // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
-    let replication = prepare_replication(&settings)?;
-    // ADR 0050 rule 22: the credentials are read once, from the start-up environment.
+    // ADR 0050 rule 22: the credentials are read once, from the start-up environment. Security
+    // review 2026-11-21 (archive copy), L-1: before the `setting` lines, so that a `*_ref`
+    // setting holding a value instead of a variable name stops the start-up before it is
+    // logged.
     let mirror = prepare_mirror(&settings, &env_kept)?;
     drop(env_kept);
+    log_settings(&settings)?;
+    announce_mirror(mirror.as_ref(), &settings);
+    // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
+    let replication = prepare_replication(&settings)?;
     // ADR 0052 rule 4: an invalid or missing `deny_file` stops the start-up, before anything
     // is opened; the line number and a fixed reason only, never the line's content.
     let deny = Arc::new(deny::Deny::open(&settings).map_err(StartError::Config)?);
@@ -306,6 +310,21 @@ fn prepare_mirror(
     _: &[(OsString, OsString)],
 ) -> Result<Option<Mirrorer>, StartError> {
     Ok(None)
+}
+
+/// The start-up line of the archive copy, when prepared.
+fn announce_mirror(m: Option<&Mirrorer>, settings: &Settings) {
+    #[cfg(feature = "object-store")]
+    if let Some(m) = m {
+        m.announce(settings);
+    }
+    #[cfg(not(feature = "object-store"))]
+    {
+        let _ = settings;
+        if let Some(never) = m {
+            match *never {}
+        }
+    }
 }
 
 /// Starts the archive copy, when prepared; the task ends at the stop, or if it panics.
