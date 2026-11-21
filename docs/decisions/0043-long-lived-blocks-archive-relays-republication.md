@@ -1,7 +1,8 @@
 # 0043: Long-lived blocks: archive relays, re-publication, and a `PUT` of an expired block
 
 - Status: accepted (2026-11-20, owner)
-- Amended by: 0046 (rule 1: definition of an archive relay; the default `block_ttl_ms` is no longer 30 days)
+- Amended by: 0046 (rule 1: definition of an archive relay; the default `block_ttl_ms` is no longer 30 days); 0052 (rule 5: a re-submission follows a `404`
+  to a single `GET` or `HEAD`, never a `length = 0` batch record alone, and never a `451`)
 - Date: 2026-11-20
 - Questions: Q-24
 - Amends: ADR 0013 rules 13 and 15 (what "after eviction" means for a `PUT`, and what the

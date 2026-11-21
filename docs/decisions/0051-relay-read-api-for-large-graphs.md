@@ -4,6 +4,8 @@
   "Decisions of the project owner": batch weight `⌈N/4⌉`; a `POST` batch route; `/info` `read_api: 2`;
   `fields=parents` refused with `parent` for now; gateway newest first by ingestion order. A
   non-normative section "Fast first catch-up" is added at acceptance; it adds no rule
+- Amended by: 0052 (rule 2: a denied block is a `length = 0` record; such a record alone never triggers
+  a re-submission)
 - Date: 2026-11-21
 - Questions: Q-23 (requirements recorded, rule 30; not decided); Q-64 (partially resolved: omission,
   rules 36 to 38); opens Q-74, Q-75, Q-76 and Q-77

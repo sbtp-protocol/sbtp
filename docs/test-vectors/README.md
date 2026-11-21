@@ -26,6 +26,14 @@ cases, and the request weights. Cursors are opaque and relay-specific, so no vec
 scenarios name "the cursor of response k, parent j" symbolically. The case list is in ADR 0051, "Test vectors".
 Frozen only after the ADR is accepted, implemented and reviewed.
 
+Client conformance cases (planned, ADR 0053, accepted 2026-11-21; not generated, not frozen):
+`client-v1/` holds scripted exchanges between a client and a scripted relay, with a virtual clock: relay
+`/info`, client settings, the operation, the expected requests with their scripted responses, and the
+expected outcome. Block bodies come from `v1/`; cursor values are opaque fixtures. Each case names the
+rule it checks. The set includes the `denied` cases of ADR 0052 (rules 12 and 13). A manifest lists
+each file and its SHA-256, for consumers outside this repository. Frozen only after the security review
+has checked that each negative case discriminates its rule.
+
 Publication is the first time the set leaves this repository: a push to a remote, a release, or a copy
 handed to another implementation. A published set never changes; a format change then creates `v2/`.
 

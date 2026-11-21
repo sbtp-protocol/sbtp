@@ -2,6 +2,9 @@
 
 - Status: accepted (by the project owner, 2026-11-21), as proposed, with the starting values of
   rule 11: `publish_min_attempts` 5, `publish_min_wait` 24 hours, `publish_max_wait` 7 days
+- Amended by: 0052 (rule 3: a `451` is a final refusal, `refused`; rule 5: a block a relay denied is
+  not sent to that relay again automatically, only on a user action, and after `DeniedKey` no block of
+  that key is)
 - Date: 2026-11-21
 - Questions: none open; owner direction of 2026-11-21 (a block published to several relays is kept
   until each of them has it, not only the first)

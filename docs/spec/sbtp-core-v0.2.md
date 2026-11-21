@@ -225,7 +225,7 @@ the strict verification of §3.2, only the holder of the private key can produce
 ## 4. Dumb relay interface (HTTP)
 
 A dumb relay validates only binary conformance, its timestamp policy, the PoW and the signature, then
-stores the block without interpreting it.
+stores the block without interpreting it, unless its operator denies it (see "Denied blocks").
 
 The interface is defined on HTTP semantics (RFC 9110) and does not depend on an HTTP version. A public
 relay MUST be reachable over HTTPS. TLS, HTTP/2 and HTTP/3 MAY be terminated by a reverse proxy.
@@ -252,7 +252,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   2. timestamp policy: check P1 (§2.2);
   3. PoW difficulty on the `block_id`: check C1;
   4. Ed25519 signature: checks C2 and C3;
-  5. storage addressed by the `block_id`, without replacing a block already present (§3.4), within the
+  5. deny list: a block the relay's operator denies is not stored (see "Denied blocks");
+  6. storage addressed by the `block_id`, without replacing a block already present (§3.4), within the
      relay's storage quota.
 - Responses:
   - `201 Created`: the block is valid and the relay did not hold it, or held it expired (see
@@ -274,6 +275,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
     `200`. An expired block whose file the relay still holds MUST NOT get `507` because of the quota.
   - `503 Service Unavailable`: the relay is starting, stopping or at one of its own limits
     (`Unavailable`), see "Admission control".
+  - `451 Unavailable For Legal Reasons`: the block is valid and the relay's operator denies it
+    (`Denied`, or `DeniedKey` when its public key is denied). Nothing is stored. A denied block never
+    gets `200` or `201`. (ADR 0052)
 - A client MUST treat `200` and `201` as the same success. When concurrent requests carry the same new
   `block_id`, at most one gets `201`. (ADR 0004, ADR 0007, ADR 0008, ADR 0012, ADR 0013, ADR 0018,
   ADR 0043)
@@ -296,6 +300,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   `200`.
 - A relay MAY evict blocks, by age (`block_ttl_ms`) or by demand (`demand_eviction`), both published by
   `/info`. A `404` does not mean that the block does not exist. (ADR 0013, ADR 0046)
+- `451 Unavailable For Legal Reasons` (`Denied`): the relay's operator denies the block. The relay
+  answers it whether or not it holds the bytes, and never answers `304` for it. (ADR 0052)
 - A relay that copies blocks from another relay sends `Sbtp-Replication: 1` on its requests. A relay
   that evicts by demand MUST NOT count such a `GET` or `HEAD` as demand and MUST answer it with
   `Cache-Control: no-store` and `CDN-Cache-Control: no-store`; another relay SHOULD answer it with
@@ -314,7 +320,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   the relay closes the connection before it reads the body. (ADR 0051, clarification B1)
 - Response: `200`, `application/octet-stream`, `Cache-Control: no-store`. One record per requested
   identifier, in request order: `length` (u32, big-endian) then `length` bytes of the block.
-  `length = 0`: the block is not served. The relay serves only bytes it would serve with `GET /block`
+  `length = 0`: the block is not served. A denied block is a `length = 0` record (ADR 0052). The relay
+  serves only bytes it would serve with `GET /block`
   and MAY end the body after any complete record (at least one); the client requests the rest again. A
   relay MUST NOT start a record that brings the body above 1,048,576 bytes, nor once half of its
   request time limit has passed. (ADR 0051, clarification B3)
@@ -366,6 +373,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   absent member as `1`, and MUST NOT send `POST /blocks`, `order`, `fields`, a repeated `parent` or a
   per-parent cursor to a relay without `read_api` ≥ 2. The bounds of these routes (256 identifiers,
   1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051)
+- `deny_list`: boolean; `true` when the relay applies a deny list of its operator, whatever its
+  entries. A client MUST read an absent member as `false`. (ADR 0052)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
@@ -434,6 +443,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
   the parents they list: a hint can only add a fetch. (ADR 0051, clarification B8)
 - A request with no match gets `200` and an empty `block_ids`, an unknown `parent` included. A relay MUST
   NOT answer `404`.
+- A relay MUST NOT list a block it denies by `block_id`. A block denied by its public key MAY be
+  listed until the relay has marked it, and gets `451` on a fetch. A page MAY hold fewer than `limit`
+  identifiers, and `more` MAY be `true` when only denied blocks remain. (ADR 0052)
 - To read all children of a block, a client repeats the request with the returned `cursor` until `more`
   is `false`. Repeating it later returns the children stored since. A client MUST deduplicate by
   `block_id` and MUST fetch and validate each block (§3.4); the fetch can return `404`.
@@ -458,7 +470,7 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
 - Names: the §2.2 error names for F1 to F9, C1, C2 and C3; `TimestampTooFarInFuture` (P1);
   `BodyTooLarge` (`413`); `InvalidParameter`, `InvalidCursor` (`400`); `NotFound` (`404`);
   `MethodNotAllowed` (`405`); `RequestTimeout` (`408`); `RateLimited` (`429`); `Internal` (`500`);
-  `Unavailable` (`503`); `StorageFull` (`507`).
+  `Unavailable` (`503`); `StorageFull` (`507`); `Denied`, `DeniedKey` (`451`, ADR 0052).
 - A request that is not valid HTTP, or whose headers are too large, MAY be answered by the HTTP layer of
   the relay without this body. (ADR 0018)
 - Error responses carry `Cache-Control: no-store`. (ADR 0012, ADR 0023)
@@ -494,6 +506,28 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
   outside this interface. A client still does not follow it.
 - A relay that moves announces its new URL out of band; a reverse proxy at the old URL MAY forward to
   it. (ADR 0028, ADR 0030)
+
+### Denied blocks
+
+- A relay MAY apply a deny list set by its operator, by `block_id` or by the public key of the
+  header. It does not interpret payloads to apply it. The list is local configuration; it is not
+  published or exchanged.
+- For a denied block the relay answers `451` with `Cache-Control: no-store` and
+  `CDN-Cache-Control: no-store`, on `GET`, `HEAD` and `PUT`, and serves it as `length = 0` in a
+  batch. It does not state the ground, the requester or, on a read, whether the match is by block or
+  by key.
+- A client handles a `451` to a read as a block not served by that relay and MAY ask another relay.
+  It MUST NOT treat it as proof that the block is invalid or absent elsewhere.
+- A client that receives `451` for a block it publishes treats it as a final refusal by that relay,
+  continues with its other relays, and MUST NOT send that block to that relay again automatically.
+  After `DeniedKey` it MUST NOT send any block signed by that key to that relay automatically. A user
+  action MAY. A client MUST NOT create a new block automatically because of a `451`.
+- A re-submission after a missing block follows a `404` to a single `GET` or `HEAD`, never a
+  `length = 0` batch record alone.
+- A relay MUST NOT fetch, store or serve a block it denies through replication, read-through or any
+  other function, and MUST NOT deny a block because another relay or source denies it.
+- A deny list does not reach copies outside the relay: shared caches, object stores, other relays,
+  clients. (ADR 0052)
 
 ### Admission control
 
@@ -587,7 +621,8 @@ follows from §3.3, §3.4 and the subsections above.
 - A sender that mines once for several relays mines at `D_NET` or at the highest
   `min_pow_difficulty` among them, whichever is higher, each read within its maximum (see "Client
   bounds"); it does not mine for a relay above that maximum. (ADR 0045)
-- `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later. The
+- `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later,
+  except a block the relay denied (see "Denied blocks"). The
   client keeps it until each relay of its list has acknowledged it or is no longer pending for it (see
   "Client bounds").
 - The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
@@ -614,6 +649,16 @@ and follows from the subsections above. Estimates are in ADR 0051, "Fast first c
   recent for it, go to `POST /sbtp/v1/blocks` on a relay with `read_api` ≥ 2.
 - **Order.** Snapshot; `/info` of each relay; `asc` from `head`; the blocks of the current view by single
   `GET`; the rest of the delta from the bucket, then by batch; then grouped `asc` polls from `head`.
+
+### Client implementations (non-normative)
+
+Nothing in this subsection is a new rule. The project maintains a TypeScript client library (and
+later a Rust one, `sbtp-client`) that implements the client rules of this section: transport rules,
+`/info` and capability gating, walks, batch fetch, admission, completeness, publication, delivery
+state of own blocks and re-submission. Client libraries are conforming implementations, not part of
+this specification; where one differs from this specification, the specification applies. The client
+conformance cases are in `docs/test-vectors/` (`client-v1/`) and MAY be run by any client.
+(ADR 0053)
 
 ## 5. P2P synchronisation and gossip
 
