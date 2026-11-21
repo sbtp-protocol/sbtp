@@ -1,6 +1,9 @@
 # 0040: `sbtp:` URI scheme, JSON block view and discovery
 
 - Status: accepted (2026-11-20, owner)
+- Amended by: 0053, proposed (2026-11-21): clarifications S17 (a bad `relays` or `graph_gateways`
+  list in `/.well-known/sbtp` is absent), S18 (no redirect of `/.well-known/sbtp`) and S19 (rule 4:
+  the first 4 `relay` parameters are counted before invalid ones are ignored)
 - Date: 2026-11-20
 - Questions: none open before this ADR (owner request, machine and agent access to the graph); opens
   Q-62 and Q-63

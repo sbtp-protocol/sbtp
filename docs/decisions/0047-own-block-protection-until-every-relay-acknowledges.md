@@ -9,6 +9,9 @@
   2 and 4: a `451` to a presence check of an acknowledged block is an availability event; delivery
   stays `acknowledged`, the relay no longer counts as holding the block, the second bound of rule 4
   does not restart)
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (raised by ADR 0053 S4 and S7): amendments D2 (rule 3: every other `5xx` is transient) and
+  D3 (rules 2, 3 and 7: a `read_only` URL is not a publication target; a relay the block cannot
+  satisfy is `refused` without a request; a failed `/info` read is an attempt)
 - Date: 2026-11-21
 - Questions: none open; owner direction of 2026-11-21 (a block published to several relays is kept
   until each of them has it, not only the first)
@@ -199,6 +202,52 @@ and §4, "Denied blocks", after "MUST NOT send that block to that relay again au
 
 > When that relay had already acknowledged the block, the `451` changes the block's availability on
 > that relay, not its delivery: see "Client bounds".
+
+## Amendments D2 and D3 (2026-11-21, accepted by the project owner on 2026-11-21)
+
+Raised by the first TypeScript client (ADR 0053 clarifications S4 and S7). Both accepted.
+No wire format, relay interface or frozen vector set changes.
+
+- **D2. Other `5xx` (rule 3).** Every `5xx` status that rule 3 does not name (`501`, `505`, `506`,
+  `508`, `511` and any other) is transient: the state stays `pending` and the attempt counts toward
+  rule 4. *Reason:* a `5xx` reports a fault of the server or of a gateway in front of it, not of the
+  block's bytes. Rule 4 already bounds what a lasting fault costs; a final classification would let
+  one misconfigured proxy end the delivery of every block.
+- **D3. Relays the client does not send a block to (rules 2, 3 and 7).** Rule 3 classifies answers;
+  it did not say what happens when the client, by the rules of spec §4, sends no `PUT` at all. Such a
+  relay received no attempt and stayed `pending` until the second bound of rule 4.
+  - **`read_only` URL.** A relay whose last valid `/info` has `"read_only": true` (ADR 0050) is not a
+    publication target. It keeps no delivery state, does not protect a block and does not count for
+    rule 2. It stays in the relay list for reads. When a later `/info` no longer has
+    `"read_only": true`, the relay is handled as a relay added to the list (rule 7). When a relay
+    becomes `read_only`, its delivery states are deleted as under rule 6.
+  - **Local final refusal.** The client sets the state of a relay to `refused` without sending a
+    request when the answer is known and would not change on a repeat (rule 3): the block's
+    `block_id` does not meet that relay's `min_pow_difficulty` (the answer would be `400`
+    `InsufficientPow`; ADR 0045 rule 6), or the block's Version is not in that relay's
+    `block_versions` (the answer would be `400` `UnsupportedVersion`). A relay above the client's
+    maximum difficulty (ADR 0029 rule 13) is in the first case only when the block's `block_id`
+    does not meet its floor; otherwise it is an ordinary target. Rule 5 applies: when a later `/info`
+    makes the block acceptable, the client MAY send it; an acknowledgement sets `acknowledged`.
+  - **`/info` not read.** A failed request to `/info` of a relay, made before a `PUT` to it, counts
+    as an attempt toward the first bound of rule 4, as the `PUT` would have.
+
+  *Reason:* each of these relays would otherwise keep a block protected for up to `publish_max_wait`
+  (7 days by default) with no request that could deliver it.
+
+Spec change, applied on acceptance (2026-11-21): core spec §4, "Client bounds", after the bullet "A
+relay stops being pending for a block when…":
+
+> - Every `5xx` answer to a `PUT` is transient: the relay stays pending, within the bounds above.
+>   (ADR 0047, amendment D2)
+> - A `read_only` URL is not a target of publication and is never pending. A relay whose
+>   `min_pow_difficulty` the block's `block_id` does not meet, or whose `block_versions` lacks the
+>   block's Version, stops being pending without a request: the answer would be a final refusal. A
+>   failed `/info` request made before a `PUT` counts as an attempt. (ADR 0047, amendment D3)
+
+Test cases (`client-v1/`, planned): a `501` and a `511` to a `PUT` keep the relay pending; a
+`read_only` URL in the list never holds a block protected; a relay at difficulty 24 with a block of 20
+leading zero bits is `refused` with no request, and becomes a target again when its `/info` shows 16.
 
 ## Spec change on acceptance
 
