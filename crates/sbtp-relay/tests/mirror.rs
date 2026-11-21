@@ -462,7 +462,11 @@ fn failures_are_retried_and_never_skip_a_block() {
     );
     let (id, b) = block(b"retried");
     let (id2, b2) = block(b"after");
-    let node = Node::mirrored(&data, &s3, &[("MIRROR_MAX_BACKOFF_S", "1")]);
+    let node = Node::mirrored(
+        &data,
+        &s3,
+        &[("MIRROR_MAX_BACKOFF_S", "1"), ("MIRROR_MAX_IN_FLIGHT", "1")],
+    );
     assert_eq!(node.put(&b), 201);
     assert_eq!(node.put(&b2), 201);
     assert!(wait_until(Duration::from_secs(30), || s3
@@ -504,7 +508,7 @@ fn settings_and_credentials_are_checked() {
         .filter(|(n, _, _)| *n == "mirror_endpoint")
         .collect();
     assert_eq!(logged[0].1, "set");
-    for (profile, n) in [("small", 1), ("standard", 4), ("large", 8)] {
+    for (profile, n) in [("small", 4), ("standard", 4), ("large", 8)] {
         let s = load(&[("PROFILE", profile)]).unwrap();
         assert_eq!(s.mirror_max_in_flight, n, "{profile}");
     }

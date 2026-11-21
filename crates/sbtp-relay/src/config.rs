@@ -188,7 +188,9 @@ int_settings! {
     ingest_group_share_pct: 1, 100, Some(25);
     ingest_group56_share_pct: 1, 100, Some(10);
     // ADR 0050 rule 28: a profile row, then policy settings.
-    mirror_max_in_flight: 1, 64, Some(1);
+    // 4 on `small`, not ADR 0050's 1: one lane copied about 25 blocks/s against a LAN MinIO
+    // (36 ms per PUT), below a sustained 50 blocks/s of ingest; 4 kept the lag under 1 s.
+    mirror_max_in_flight: 1, 64, Some(4);
     mirror_request_timeout_ms: 1_000, 300_000, Some(30_000);
     mirror_max_backoff_s: 1, 86_400, Some(3_600);
 }

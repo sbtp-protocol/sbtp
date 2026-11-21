@@ -318,10 +318,12 @@ policy) backs off at that maximum. No block is skipped for a failure.
 - The bucket and its CDN must not answer `/sbtp/v1/` with a redirect, and CORS allows `GET` and
   `HEAD` from any origin, without credentials.
 
-**Bounds and memory.** `mirror_max_in_flight` uploads at a time (1 on `small`, 4 on `standard`, 8
+**Bounds and memory.** `mirror_max_in_flight` uploads at a time (4 on `small` and `standard`, 8
 on `large`), each bounded by `mirror_request_timeout_ms` (30 s); response bodies are read up to
-16 KiB and discarded. On `small` the memory bound grows by 157,957 bytes with replication also on,
-557,957 bytes without it (the TLS root store); it is logged at start-up (`memory_bound`).
+16 KiB and discarded. One lane copies about 25 blocks/s against a store 36 ms away; raise the
+setting when ingest is sustained above about 20 blocks/s per lane. On `small` the memory bound
+grows by 625,684 bytes with replication also on, 1,025,684 bytes without it (the TLS root store);
+it is logged at start-up (`memory_bound`).
 `mirror_allow_private = true` lets the endpoint name resolve to private addresses (a MinIO on the
 same network); the rule is that of `replication_allow_private`.
 
