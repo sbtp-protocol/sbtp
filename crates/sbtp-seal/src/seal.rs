@@ -9,7 +9,6 @@ use sbtp_core::{
     BlockId, SEALED_HPKE_INFO, SealedSigError, SealedSigMessage, SigningKey, sealed_sig_message,
     sealed_sig_message_len, sign_sealed, verify_sealed,
 };
-use sbtp_l2::cbor::{self, Value};
 use sbtp_l2::{Body, Edge, Enc, L2Error, Payload, Rel, Target, validate_l2_invariants};
 use zeroize::Zeroizing;
 
@@ -109,8 +108,8 @@ impl core::fmt::Debug for PrepareRequest<'_> {
 /// Sign [`PendingSeal::message`] with the private key of `from` (a pure Ed25519 signature,
 /// RFC 8032 §5.1), then pass the signature to [`PendingSeal::finish`]. The value is single use:
 /// `finish` consumes it, whatever its result. It is not `Clone`. It holds the ephemeral key of
-/// the outer block and a copy of `msg`; both are wiped on drop (`ed25519-dalek` `zeroize`,
-/// `Zeroizing`). Its `Debug` output shows the length of `msg` and the bucket only.
+/// the outer block, the plaintext (already encoded and padded, `sig` left blank) and the message
+/// to sign; all are wiped on drop (`ed25519-dalek` `zeroize`, `Zeroizing`). Its `Debug` output shows the length of `msg` and the bucket only.
 ///
 /// Single use is enforced by the type: a second `finish` does not compile.
 ///
@@ -130,8 +129,12 @@ pub struct PendingSeal {
     recipient_id: [u8; 32],
     tag: Tag,
     bucket: Bucket,
-    /// A copy of `msg`.
-    msg: Zeroizing<Vec<u8>>,
+    /// The plaintext, exactly `bucket.plaintext_len()` bytes: the item with 64 zero bytes in
+    /// place of `sig`, then the `0x00` padding (spec §5.3). Allocated once, never resized
+    /// (security review 2026-11-21, L-1).
+    plaintext: Zeroizing<Vec<u8>>,
+    /// Where `msg` and `sig` sit in `plaintext`.
+    layout: ItemLayout,
     /// The sealed signature message, `sealed_sig_message_len(msg.len())` bytes.
     message: Zeroizing<Vec<u8>>,
 }
@@ -139,10 +142,90 @@ pub struct PendingSeal {
 impl core::fmt::Debug for PendingSeal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PendingSeal")
-            .field("msg_len", &self.msg.len())
+            .field("msg_len", &self.layout.msg_len)
             .field("bucket", &self.bucket)
             .finish_non_exhaustive()
     }
+}
+
+/// `msg`, inside the plaintext. The error is not reachable: `layout` comes from the encoder.
+fn msg_in(plaintext: &[u8], layout: ItemLayout) -> Result<&[u8], SealError> {
+    let end = layout.msg_start.checked_add(layout.msg_len);
+    end.and_then(|end| plaintext.get(layout.msg_start..end))
+        .ok_or(SealError::Encoding(L2Error::Malformed))
+}
+
+/// The offsets of `msg` and `sig` in an encoded item.
+#[derive(Clone, Copy)]
+pub(crate) struct ItemLayout {
+    pub(crate) msg_start: usize,
+    pub(crate) msg_len: usize,
+    pub(crate) sig_start: usize,
+}
+
+/// A writer over a fixed buffer: never grows, never panics.
+struct Cursor<'b> {
+    buf: &'b mut [u8],
+    pos: usize,
+}
+
+impl Cursor<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), SealError> {
+        let end = self.pos.checked_add(bytes.len());
+        let dst = end
+            .and_then(|end| self.buf.get_mut(self.pos..end))
+            .ok_or(SealError::TooLong)?;
+        dst.copy_from_slice(bytes);
+        self.pos = self.pos.saturating_add(bytes.len());
+        Ok(())
+    }
+
+    /// A byte string head (major type 2) in its shortest form (spec §1.2).
+    fn bytes_head(&mut self, len: usize) -> Result<(), SealError> {
+        if let Ok(n) = u8::try_from(len) {
+            if n < 24 {
+                return self.put(&[0x40 | n]);
+            }
+            return self.put(&[0x58, n]);
+        }
+        if let Ok(n) = u16::try_from(len) {
+            self.put(&[0x59])?;
+            return self.put(&n.to_be_bytes());
+        }
+        let n = u32::try_from(len).map_err(|_| SealError::TooLong)?;
+        self.put(&[0x5a])?;
+        self.put(&n.to_be_bytes())
+    }
+}
+
+/// Encodes the item `{from, msg, sig}` into the start of `buf`, with `sig` left as 64 zero bytes,
+/// and returns where `msg` and `sig` are (spec §5.3). Deterministic profile (spec §1.2): a
+/// definite-length map whose keys are in bytewise order of their encodings (`"msg"` `0x63 6d`,
+/// `"sig"` `0x63 73`, `"from"` `0x64`), shortest heads. Checked byte for byte against
+/// `sbtp_l2::cbor::encode` by a test. The rest of `buf` is left as it is (the `0x00` padding).
+pub(crate) fn encode_item_into(
+    buf: &mut [u8],
+    from: &[u8; 32],
+    msg: &[u8],
+) -> Result<ItemLayout, SealError> {
+    let mut w = Cursor { buf, pos: 0 };
+    w.put(&[0xa3])?;
+    w.put(&[0x63, b'm', b's', b'g'])?;
+    w.bytes_head(msg.len())?;
+    let msg_start = w.pos;
+    w.put(msg)?;
+    w.put(&[0x63, b's', b'i', b'g'])?;
+    w.bytes_head(64)?;
+    let sig_start = w.pos;
+    w.put(&[0; 64])?;
+    w.put(&[0x64, b'f', b'r', b'o', b'm'])?;
+    w.bytes_head(32)?;
+    w.put(from)?;
+    Ok(ItemLayout {
+        msg_start,
+        msg_len: msg.len(),
+        sig_start,
+    })
 }
 
 /// The length of the item `{from, msg, sig}` in the deterministic profile (spec §5.3, §1.2): the
@@ -189,6 +272,7 @@ pub fn seal_prepare(
     // spec §5.2, §5.3: the item must fit the bucket; the smallest that fits by default. `sig`
     // has a fixed length, so the item length is known before signing.
     let item_len = item_len(request.msg.len()).ok_or(SealError::TooLong)?;
+    // An item over 65,535 bytes fits no bucket: the check below refuses it.
     let bucket = match request.bucket {
         Some(b) if b.plaintext_len() >= item_len => b,
         Some(_) => return Err(SealError::TooLong),
@@ -204,8 +288,14 @@ pub fn seal_prepare(
         return Err(SealError::EphemeralIsSender);
     }
 
+    // spec §5.3: one deterministic CBOR item, then `0x00` up to the bucket's plaintext length.
+    // One allocation of the final length; the item is written into it, nothing is resized, so
+    // no freed buffer ever holds `msg` (security review 2026-11-21, L-1).
+    let mut plaintext = Zeroizing::new(vec![0u8; bucket.plaintext_len()]);
+    let layout = encode_item_into(&mut plaintext, request.from, request.msg)?;
+
     // spec §5.3: the typed sealed message, bound to the outer key, `recipient_id`, the X25519
-    // key and `msg`. Both buffers are allocated once at their final length.
+    // key and `msg`. Allocated once at its final length.
     let sig_len = sealed_sig_message_len(request.msg.len()).ok_or(SealError::Signing)?;
     let mut message = Zeroizing::new(vec![0u8; sig_len]);
     sealed_sig_message(
@@ -224,7 +314,8 @@ pub fn seal_prepare(
         recipient_id: *request.recipient_id,
         tag: *request.tag,
         bucket,
-        msg: Zeroizing::new(request.msg.to_vec()),
+        plaintext,
+        layout,
         message,
     })
 }
@@ -269,7 +360,7 @@ impl PendingSeal {
             &self.outer_pubkey,
             &self.recipient_id,
             &self.recipient_x25519,
-            &self.msg,
+            msg_in(&self.plaintext, self.layout)?,
             &mut self.message,
         )?;
         sign_sealed(sender, &message).map_err(|_| SealError::Signing)
@@ -279,8 +370,9 @@ impl PendingSeal {
     ///
     /// Steps: `sig` is verified by `from` over the sealed message with criteria V1 to V6 of core
     /// spec §3.2, as the recipient will (spec §5.3 step 7): nothing is sealed with a bad
-    /// signature; the item `{from, msg, sig}` is encoded in the deterministic profile and padded
-    /// with `0x00` to the bucket's plaintext length (spec §5.3); HPKE base mode seals it with
+    /// signature; `sig` is written into the item `{from, msg, sig}` that [`seal_prepare`]
+    /// encoded in the deterministic profile and padded with `0x00` to the bucket's plaintext
+    /// length (spec §5.3); HPKE base mode seals the plaintext with
     /// `info` and `aad = PubKey ‖ tag` (spec §5.1); the outer payload is encoded and validated
     /// (spec §5.2).
     ///
@@ -290,16 +382,15 @@ impl PendingSeal {
     ///
     /// # Errors
     ///
-    /// [`SealError::SenderKey`], [`SealError::Signature`], [`SealError::Hpke`],
-    /// [`SealError::TooLong`] and [`SealError::Encoding`] (not reachable after a successful
-    /// prepare), [`SealError::Signing`] (not reachable).
+    /// [`SealError::SenderKey`], [`SealError::Signature`], [`SealError::Hpke`];
+    /// [`SealError::Encoding`] and [`SealError::Signing`] are not reachable.
     pub fn finish(mut self, sig: &[u8; 64], rng: &mut impl CryptoRng) -> Result<Sealed, SealError> {
         // spec §5.3 (step 7 on the recipient side): strict V1 to V6, before any sealing.
         let message = typed_message(
             &self.outer_pubkey,
             &self.recipient_id,
             &self.recipient_x25519,
-            &self.msg,
+            msg_in(&self.plaintext, self.layout)?,
             &mut self.message,
         )?;
         verify_sealed(&self.from, sig, &message).map_err(|e| match e {
@@ -308,23 +399,13 @@ impl PendingSeal {
             _ => SealError::Signing,
         })?;
 
-        // spec §5.3: one deterministic CBOR item, then `0x00` up to the bucket's plaintext length.
-        let item = Value::Map(vec![
-            ("from", Value::Bytes(&self.from)),
-            ("msg", Value::Bytes(&self.msg)),
-            ("sig", Value::Bytes(sig)),
-        ]);
-        // An item over 65,535 bytes is refused by the encoder: it fits no bucket either.
-        let mut plaintext = Zeroizing::new(cbor::encode(&item).map_err(|e| match e {
-            L2Error::PayloadTooLong => SealError::TooLong,
-            e => SealError::Encoding(e),
-        })?);
-        if plaintext.len() > self.bucket.plaintext_len() {
-            return Err(SealError::TooLong);
-        }
-        plaintext.resize(self.bucket.plaintext_len(), 0x00);
+        // spec §5.3: `sig` goes into its place in the already padded plaintext.
+        let end = self.layout.sig_start.checked_add(sig.len());
+        end.and_then(|end| self.plaintext.get_mut(self.layout.sig_start..end))
+            .ok_or(SealError::Encoding(L2Error::Malformed))?
+            .copy_from_slice(sig);
 
-        let payload = hpke_seal(&self, &plaintext, rng)?;
+        let payload = hpke_seal(&self, &self.plaintext, rng)?;
         Ok(Sealed {
             payload,
             ephemeral: self.ephemeral,

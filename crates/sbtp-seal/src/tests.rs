@@ -1080,3 +1080,36 @@ fn item_len_matches_the_encoder() {
         }
     }
 }
+
+// Review L-1: the item written in place into the bucket buffer is byte for byte the encoder's
+// (deterministic profile, spec §1.2), at every head size of `msg`, and it is followed by the
+// untouched `0x00` padding.
+#[test]
+fn in_place_item_matches_the_encoder() {
+    let from = [0x01; 32];
+    let sig = [0x02; 64];
+    for n in [0usize, 1, 23, 24, 255, 256, 1_000, 65_429 - 117] {
+        #[allow(clippy::cast_possible_truncation)]
+        let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let want = cbor::encode(&Value::Map(vec![
+            ("from", Value::Bytes(&from)),
+            ("msg", Value::Bytes(&body)),
+            ("sig", Value::Bytes(&sig)),
+        ]))
+        .unwrap();
+        let bucket = Bucket::smallest_for(want.len()).unwrap();
+        let mut buf = vec![0u8; bucket.plaintext_len()];
+        let layout = crate::seal::encode_item_into(&mut buf, &from, &body).unwrap();
+        assert_eq!(
+            &buf[layout.msg_start..layout.msg_start + layout.msg_len],
+            &body[..]
+        );
+        buf[layout.sig_start..layout.sig_start + 64].copy_from_slice(&sig);
+        assert_eq!(&buf[..want.len()], &want[..], "msg {n}");
+        assert!(buf[want.len()..].iter().all(|&b| b == 0));
+        assert_eq!(crate::seal::item_len(n), Some(want.len()));
+    }
+    // A buffer too small is an error, not a panic.
+    let mut small = [0u8; 100];
+    assert!(crate::seal::encode_item_into(&mut small, &from, &[0; 10]).is_err());
+}
