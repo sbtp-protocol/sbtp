@@ -2,11 +2,20 @@
 // receipt rule, own blocks after attachSignature and a full validation. Blocks are validated again
 // when read back (cheap, and a same-origin script could have edited the database).
 //
+// Own blocks carry a delivery state per relay of the list (ADR 0047, `delivery.js`): pending,
+// acknowledged, refused or given up. The store knows the relay list (`setRelays`), so that the
+// protection of rule 2 and the eviction order of rule 8 are decided in the same transaction as the
+// write. Records written before ADR 0047 (`acked`, `failedOn`) are read through the ADR's mapping and
+// rewritten in the new form by `setRelays` (called on start and on every change of the list).
+//
 // Running totals (count, bytes, pending own blocks) are kept in the `stats` store, updated in the
 // same transaction as every change, so a put reads one record; blockMeta is scanned only when the
-// budget is exceeded (eviction) or when the totals are missing (first use after the v2 upgrade).
+// budget is exceeded (eviction), when the relay list changes, or when the totals are missing.
+// `pending` counts the own blocks no relay of the list acknowledged (rule 2, first case): they are
+// never evicted, so their number is capped (`storeMaxPending`).
 
 import { LIMITS } from "./bounds.js";
+import { applyResults, newDelivery, protection, reconcile, UNACKNOWLEDGED } from "./delivery.js";
 import { planEviction } from "./eviction.js";
 import { tx } from "./idb.js";
 
@@ -18,45 +27,53 @@ export class StoreFull extends Error {
 }
 
 const TOTALS = "totals";
-/** Relay bases remembered per own block for a retry (`failedOn`). */
-const MAX_FAILED_ON = 2 * LIMITS.maxRelays;
-const isPending = (m) => m.own && !m.acked;
-
-function totalsOf(metas) {
-  return {
-    name: TOTALS,
-    count: metas.length,
-    bytes: metas.reduce((n, m) => n + m.size, 0),
-    pending: metas.filter(isPending).length,
-  };
-}
-
-async function readTotals(s) {
-  return (await s.stats.get(TOTALS)) ?? totalsOf(await s.blockMeta.getAll());
-}
 
 export class BlockStore {
-  constructor(db, limits = LIMITS) {
+  /** `bases`: the relay list; `now`: the clock (tests inject one). */
+  constructor(db, limits = LIMITS, { bases = [], now = Date.now } = {}) {
     this.db = db;
     this.limits = { maxBlocks: limits.storeMaxBlocks, maxBytes: limits.storeMaxBytes };
     this.maxPending = limits.storeMaxPending;
+    this.bounds = limits;
+    this.bases = [...bases];
+    this.now = now;
   }
 
-  /** Stores a validated block. `own`: created by the user (then `acked` starts false). */
+  #unacked(m, now) {
+    return protection(m, this.bases, now, this.bounds) === UNACKNOWLEDGED;
+  }
+
+  #totalsOf(metas, now) {
+    return {
+      name: TOTALS,
+      count: metas.length,
+      bytes: metas.reduce((n, m) => n + m.size, 0),
+      pending: metas.filter((m) => this.#unacked(m, now)).length,
+    };
+  }
+
+  async #readTotals(s, now) {
+    return (await s.stats.get(TOTALS)) ?? this.#totalsOf(await s.blockMeta.getAll(), now);
+  }
+
+  /** Stores a validated block. `own`: created by the user (then pending on every relay of the list). */
   async put(id, bytes, { own = false } = {}) {
     // A tight copy: a view over a larger buffer would persist the whole buffer (structured clone)
     // while the budget counts only `byteLength`.
     const copy = bytes.slice();
+    const now = this.now();
     // Read, plan and write in one transaction, so two tabs cannot both exceed the budget.
     return tx(this.db, ["blockMeta", "blockBytes", "stats"], "readwrite", async (s) => {
-      const totals = await readTotals(s);
+      const totals = await this.#readTotals(s, now);
       const existing = await s.blockMeta.get(id);
       if (existing) {
         if (own && !existing.own) {
-          existing.own = true; // a fetched copy of an own block: now protected until acknowledged
-          totals.pending += existing.acked ? 0 : 1;
+          // A fetched copy of an own block: now protected and sent to every relay of the list.
+          existing.own = true;
+          existing.delivery = newDelivery(this.bases);
+          totals.pending += 1;
         }
-        existing.accessed = Date.now();
+        existing.accessed = now;
         await s.blockMeta.put(existing);
         await s.stats.put(totals);
         return "present";
@@ -67,9 +84,11 @@ export class BlockStore {
       const size = copy.byteLength;
       if (totals.count + 1 > this.limits.maxBlocks || totals.bytes + size > this.limits.maxBytes) {
         const metas = await s.blockMeta.getAll();
-        const plan = planEviction(metas, { size, own }, this.limits);
-        if (!plan.accept) throw new StoreFull("local storage budget reached by unpublished own blocks");
+        const plan = planEviction(metas, { size, own }, this.limits, { bases: this.bases, now, limits: this.bounds });
+        if (!plan.accept) throw new StoreFull("local storage budget reached by own blocks still being delivered");
         const byId = new Map(metas.map((m) => [m.id, m]));
+        // A partly delivered block dropped by step 3 has its pending relays given up first (rule 8):
+        // its record goes with it, so nothing is left to update.
         for (const victim of plan.drop) {
           await s.blockMeta.delete(victim);
           await s.blockBytes.delete(victim);
@@ -77,7 +96,9 @@ export class BlockStore {
           totals.bytes -= byId.get(victim).size;
         }
       }
-      await s.blockMeta.put({ id, size, own, acked: false, accessed: Date.now() });
+      const meta = { id, size, own, accessed: now };
+      if (own) meta.delivery = newDelivery(this.bases);
+      await s.blockMeta.put(meta);
       await s.blockBytes.put({ id, bytes: copy });
       totals.count += 1;
       totals.bytes += size;
@@ -88,26 +109,52 @@ export class BlockStore {
   }
 
   /**
-   * Records one PUT round of an own block: `acked`, the relay bases that answered 200 or 201, and
-   * `failed`, the ones that did not. From the first acknowledgement the block may be evicted; the
-   * relays it failed on are kept in `failedOn` (at most `maxFailedOn`) so that it is sent to them
-   * again.
+   * Records one PUT round of an own block: `results` of `publishAll` (each `{ base, outcome, error }`).
+   * Acknowledgements, final refusals and transient failures update the relay's state (ADR 0047
+   * rule 3); a request not sent is not an attempt. Resolves with the new delivery record.
    */
-  recordPublish(id, acked, failed) {
+  recordPublish(id, results) {
+    const now = this.now();
     return tx(this.db, ["blockMeta", "stats"], "readwrite", async (s) => {
       const m = await s.blockMeta.get(id);
-      if (!m) return;
-      const failedOn = new Set(m.failedOn ?? []);
-      for (const b of acked) failedOn.delete(b);
-      for (const b of failed) failedOn.add(b);
-      m.failedOn = [...failedOn].slice(-MAX_FAILED_ON);
-      if (acked.length > 0 && !m.acked) {
-        const totals = await readTotals(s);
-        totals.pending -= isPending(m) ? 1 : 0;
-        m.acked = true;
+      if (!m || !m.own) return undefined;
+      const before = this.#unacked(m, now);
+      const next = { ...m, delivery: applyResults(m, results, this.bases, now, this.bounds) };
+      delete next.acked;
+      delete next.failedOn;
+      const after = this.#unacked(next, now);
+      if (before !== after) {
+        const totals = await this.#readTotals(s, now);
+        totals.pending += (after ? 1 : 0) - (before ? 1 : 0);
         await s.stats.put(totals);
       }
-      await s.blockMeta.put(m);
+      await s.blockMeta.put(next);
+      return next.delivery;
+    });
+  }
+
+  /**
+   * The relay list became `bases` (settings.js hook; also called on start). Every own block is
+   * reconciled (ADR 0047 rules 6 and 7) and migrated from the pre-ADR form; totals are recomputed.
+   */
+  setRelays(bases) {
+    this.bases = [...bases];
+    const now = this.now();
+    return tx(this.db, ["blockMeta", "stats"], "readwrite", async (s) => {
+      const metas = await s.blockMeta.getAll();
+      const out = [];
+      for (const m of metas) {
+        if (!m.own) {
+          out.push(m);
+          continue;
+        }
+        const next = { ...m, delivery: reconcile(m, this.bases, now, this.bounds) };
+        delete next.acked;
+        delete next.failedOn;
+        await s.blockMeta.put(next);
+        out.push(next);
+      }
+      await s.stats.put(this.#totalsOf(out, now));
     });
   }
 
@@ -120,8 +167,26 @@ export class BlockStore {
     return tx(this.db, ["blockMeta"], "readonly", (s) => s.blockMeta.getAll());
   }
 
+  /** Deletes one block at the user's request (not an eviction: ADR 0047 rule 9). */
+  delete(id) {
+    const now = this.now();
+    return tx(this.db, ["blockMeta", "blockBytes", "stats"], "readwrite", async (s) => {
+      const m = await s.blockMeta.get(id);
+      if (!m) return false;
+      const totals = await this.#readTotals(s, now);
+      totals.count -= 1;
+      totals.bytes -= m.size;
+      totals.pending -= this.#unacked(m, now) ? 1 : 0;
+      await s.blockMeta.delete(id);
+      await s.blockBytes.delete(id);
+      await s.stats.put(totals);
+      return true;
+    });
+  }
+
   /** Drops every fetched block (never own blocks, never keys). */
   clearFetched() {
+    const now = this.now();
     return tx(this.db, ["blockMeta", "blockBytes", "stats"], "readwrite", async (s) => {
       const kept = [];
       for (const m of await s.blockMeta.getAll()) {
@@ -132,7 +197,7 @@ export class BlockStore {
           await s.blockBytes.delete(m.id);
         }
       }
-      await s.stats.put(totalsOf(kept));
+      await s.stats.put(this.#totalsOf(kept, now));
     });
   }
 }

@@ -13,6 +13,9 @@
 //   obeyed (spec §4 "Admission control": no request to that relay before it has elapsed).
 
 import { LIMITS } from "./bounds.js";
+import {
+  classifyPut, deliveryOf, deliveryTargets, firstAck, PARTIAL, protection, putStatus, UNACKNOWLEDGED,
+} from "./delivery.js";
 import { checkRelayUrl, RelayRequestError } from "./http.js";
 import { InvalidResponse, NETWORK_POW_DIFFICULTY, Relay, RelayStatus } from "./relay.js";
 import { backoffMs, walk } from "./walk.js";
@@ -203,9 +206,13 @@ export async function publishDifficulty(set, explicit, { max = LIMITS.maxInfoDif
 
 /**
  * PUTs `bytes` to every relay of `targets` (default: all) in parallel. A relay backing off is not
- * contacted. Resolves with `{ results: [{ base, outcome, error }], acked, failed }`: `outcome` is
- * "created" (201), "stored" (200), "failed" or "backing-off"; `acked` and `failed` list bases.
- * The block counts as published when `acked` is not empty.
+ * contacted. Resolves with `{ results, acked, failed }`. Each result is
+ * `{ base, outcome, error, status, errorName, delivery }`: `outcome` is "created" (201), "stored"
+ * (200), "failed" or "backing-off"; `status` and `errorName` are the HTTP status and error name of a
+ * refusal (null without an HTTP answer); `delivery` is the class of ADR 0047 rule 3:
+ * "acknowledged", "transient" (the relay stays pending), "final" (refused) or "none" (not sent, not
+ * an attempt). `acked` and `failed` list bases. The block counts as published when `acked` is not
+ * empty.
  */
 export async function publishAll(set, bytes, { targets = set.bases, signal } = {}) {
   const t = new Set(targets);
@@ -223,6 +230,7 @@ export async function publishAll(set, bytes, { targets = set.bases, signal } = {
       return { base: e.base, outcome: "failed", error };
     }
   }));
+  for (const r of results) Object.assign(r, putStatus(r.error), { delivery: classifyPut(r) });
   const ok = (r) => r.outcome === "created" || r.outcome === "stored";
   return {
     results,
@@ -388,29 +396,34 @@ export async function walkAll(set, filter = {}, {
 }
 
 /**
- * The relays an own block is (re)sent to: every current relay while no relay acknowledged it, else
- * the current relays on which it failed. `meta.failedOn` lists bases.
+ * The relays an own block is (re)sent to (ADR 0047 rules 2, 5, 7; `delivery.js`): while no relay of
+ * the list acknowledged it, every relay of the list that did not refuse it for good; once one did,
+ * the relays still pending for it. `now` and `limits` set the bounds of rule 4.
  */
-export function retryTargets(meta, bases) {
-  if (!meta.own) return [];
-  if (!meta.acked) return [...bases];
-  const failed = new Set(meta.failedOn ?? []);
-  return bases.filter((b) => failed.has(b));
+export function retryTargets(meta, bases, { now = Date.now(), limits = LIMITS } = {}) {
+  return deliveryTargets(meta, bases, now, limits);
 }
 
 /**
- * Own blocks to send again, at most `max`: unacknowledged ones first (they hold storage), then the
- * ones that failed on some current relay. Resolves `[{ id, targets }]`.
+ * Own blocks to send again, at most `max`: those no relay of the list acknowledged first (they hold
+ * storage for good), then the partly delivered ones, oldest first acknowledgement first (closest to
+ * their bound). Resolves `[{ id, targets }]`.
  */
-export function retryPlan(metas, bases, max = LIMITS.storeMaxPending) {
+export function retryPlan(metas, bases, { max = LIMITS.storeMaxPending, now = Date.now(), limits = LIMITS } = {}) {
   const plan = [];
-  for (const pass of [false, true]) {
-    for (const m of metas) {
-      if (plan.length >= max) return plan;
-      if (!m.own || m.acked !== pass) continue;
-      const targets = retryTargets(m, bases);
-      if (targets.length > 0) plan.push({ id: m.id, targets });
-    }
+  const partial = [];
+  for (const m of metas) {
+    const p = protection(m, bases, now, limits);
+    if (p === UNACKNOWLEDGED) plan.push(m);
+    else if (p === PARTIAL) partial.push(m);
   }
-  return plan;
+  const ackTime = (m) => firstAck(deliveryOf(m, bases, now), bases) ?? now;
+  partial.sort((a, b) => ackTime(a) - ackTime(b));
+  const out = [];
+  for (const m of [...plan, ...partial]) {
+    if (out.length >= max) break;
+    const targets = deliveryTargets(m, bases, now, limits);
+    if (targets.length > 0) out.push({ id: m.id, targets });
+  }
+  return out;
 }

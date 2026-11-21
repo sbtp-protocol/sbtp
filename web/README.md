@@ -43,8 +43,12 @@ included), the deadline against a drip-fed body, redirects not followed (ADR 003
 hostile relays, fetch and traversal bounds (a diamond DAG of depth 40), the eviction plan, a Web Crypto
 signature through `attachSignature`, the poisoning of the module after a foreign exception, and several
 relays (`relays.test.mjs`: fake relays over loopback HTTP, one healthy, one answering 404, one hostile
-serving a wrong block, one slow past the deadline, one answering 429 with `Retry-After`). IndexedDB
-and the Worker are not available in Node: they were checked in headless Chrome.
+serving a wrong block, one slow past the deadline, one answering 429 with `Retry-After`), and the
+delivery state of own blocks (`delivery.test.mjs`, ADR 0047: each classification of a `PUT` answer, the
+attempt and time bounds with an injected clock, relay removal and addition, the eviction order, the
+migration of older records). IndexedDB and the Worker are not available in Node: the store is tested
+over an in-memory double (`tests/fake-idb.mjs`), and both were checked in headless Chrome before
+ADR 0047.
 
 ## Layout
 
@@ -53,6 +57,7 @@ and the Worker are not available in Node: they were checked in headless Chrome.
 | `src/wasm.js` | Loads `pkg/`, self-test, plain-object results, poisoning after a trap |
 | `src/keys.js` | Identity: non-extractable Web Crypto Ed25519 key in IndexedDB, signing |
 | `src/store.js`, `src/eviction.js`, `src/idb.js` | Local block store and its budget |
+| `src/delivery.js` | Per-relay delivery state of own blocks, protection and bounds (ADR 0047) |
 | `src/http.js` | The only `fetch()` call: redirect policy, deadline, bounded body read |
 | `src/relay.js` | `/info`, `PUT`/`GET /block`, `/query`, response checks, bounded fetch |
 | `src/relays.js`, `src/settings.js` | Several relays: publish to all, failover reads, merged walks, health; the saved list |
@@ -98,10 +103,39 @@ the budget check and the write are atomic across tabs; it works on the main thre
 (OPFS synchronous access is Worker-only); blocks are at most 65,909 bytes, a good fit for records. Two
 stores: `blockMeta` (small records, read for eviction) and `blockBytes`.
 
-Budget (ADR 0029 rule 12): 5,000 blocks and 64 MiB. Fetched blocks are evicted first (least recently
-used), then own blocks a relay acknowledged; never keys, never an own block no relay acknowledged with
-`200`/`201`. At most 200 such pending own blocks: beyond that, creating a block is refused. Only validated
-blocks are stored, and they are validated again when read back.
+Budget (ADR 0029 rule 12, ADR 0047 rule 8): 5,000 blocks and 64 MiB. Fetched blocks are evicted first
+(least recently used), then own blocks that are no longer protected (least recently used), then, only to
+store a new own block, partly delivered own blocks (oldest first acknowledgement first). Never keys,
+never an own block no relay of the list acknowledged with `200`/`201`, and a partly delivered block never
+gives way to a fetched block. At most 200 own blocks no relay acknowledged: beyond that, creating a block
+is refused. Only validated blocks are stored, and they are validated again when read back.
+
+### Delivery of own blocks (ADR 0047)
+
+Code: `src/delivery.js` (pure functions), persisted by `src/store.js`. Each own block keeps, per relay of
+the list, a state: `pending`, `acknowledged`, `refused` or `given up`, with the attempt count and first
+attempt time of a pending relay and the time of each acknowledgement.
+
+- **Protected** while no relay of the list acknowledged it, or while one did and another is still
+  pending.
+- **A `PUT` answer.** `201`/`200`: acknowledged. Transient (stays pending, counts as an attempt): no
+  response, a timeout or another failed request, `408`, `429`, `5xx` (`507` included),
+  `400 TimestampTooFarInFuture`. Final (refused): any other `400` (`InsufficientPow` included, or no
+  parseable error name), `413`, `422`, a `3xx`, any other `4xx`. A request not sent (the relay backing
+  off, or a cancelled operation) is not an attempt.
+- **Bounds** (`bounds.js`): a pending relay is given up after at least 5 attempts and at least 24 hours
+  since the first, and in any case 7 days after the block's first acknowledgement. A block no relay
+  acknowledged keeps its protection; its given-up relays are still tried, its refused ones are not.
+- **Relay list changes** (`settings.js` `onRelaysChange`, also on start and on a change made in another
+  tab): a removed relay's states are deleted, so a block only it held is protected again and sent to
+  the others; an added relay becomes pending only for the blocks protected at that moment, without
+  resetting the 7-day bound.
+- **Undeliverable own blocks.** A block no relay of the list holds and that every relay refused or was
+  given up on is listed in its own section, with "Add a relay", "Export" (the block's bytes as a file)
+  and "Delete".
+- **Records from before ADR 0047** (`acked`, `failedOn`) are read through the ADR's mapping (pending on
+  the relays of `failedOn`, or on every relay when not acknowledged; acknowledged on the others, at the
+  migration time) and rewritten in the new form on the first start. No IndexedDB version change.
 
 ## Relay access (ADR 0029, spec §4 "Client bounds")
 
@@ -155,10 +189,11 @@ falls back to `http://127.0.0.1:8080`. Code: `src/relays.js`.
   each bounded by 24 as for one relay (ADR 0029 rule 13). A relay asking for more is skipped (no mining
   for it, no `PUT`); a relay whose `/info` fails stays a target but sets no difficulty. An explicit
   difficulty reads no `/info`. The block is then sent to every target in parallel and the page shows
-  each relay's answer (`201`, `200`, or the error). It counts as published, and may be evicted, from the
-  first `200` or `201` (ADR 0029 rule 12); until then it stays pending. The relays it failed on are
-  kept with the block (`failedOn`), and "Publish pending blocks" sends it to them again, after the
-  blocks no relay acknowledged (at most 200 blocks per run).
+  each relay's answer (`201`, `200`, or the error). It counts as published from the first `200` or
+  `201`, but it stays protected locally until every relay of the list acknowledged it, refused it for
+  good or was given up (ADR 0047, "Delivery of own blocks" above). "Publish pending blocks" sends the
+  blocks no relay acknowledged to every relay that did not refuse them, then the partly delivered ones
+  to their pending relays (at most 200 blocks per run).
 - **Read.** A block is asked from the relays in order; a `404`, a failed request, a transient refusal or
   a block that fails `validateRequested` (R1 and full validation) moves on to the next relay. No relay is
   trusted: every block is validated whatever relay served it, and an invalid one is never stored. A block

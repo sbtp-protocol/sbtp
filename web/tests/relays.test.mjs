@@ -164,6 +164,9 @@ test("publish: one mining at the highest usable /info difficulty, hostile and sl
   assert.deepEqual(res.acked, [a.base, b.base]);
   assert.deepEqual(res.failed, [slow.base]);
   assert.deepEqual(res.results.map((r) => r.outcome), ["created", "failed", "created"]);
+  // ADR 0047 rule 3: status, error name and class per relay; a timeout keeps the relay pending.
+  assert.deepEqual(res.results.map((r) => r.delivery), ["acknowledged", "transient", "acknowledged"]);
+  assert.deepEqual(res.results.map((r) => r.status), [null, null, null]);
   assert.ok(!hostile.hits.some((h) => h.startsWith("PUT")), "no PUT to a skipped relay");
   const again = await publishAll(set, blk.bytes, { targets: [a.base] });
   assert.deepEqual(again.results.map((r) => r.outcome), ["stored"]);
@@ -322,7 +325,7 @@ test("fetch: bounded per operation, at most `concurrency` in flight in all", { s
   assert.ok(peak <= 3, `peak ${peak}`);
 });
 
-test("retry plan: pending blocks to every relay, partial ones to the relays that failed", () => {
+test("retry plan of records from before ADR 0047: pending blocks to every relay, partial ones to the relays that failed", () => {
   const bases = ["https://a.example.org", "https://b.example.org"];
   assert.deepEqual(retryTargets({ own: true, acked: false }, bases), bases);
   assert.deepEqual(retryTargets({ own: true, acked: true, failedOn: ["https://b.example.org", "https://gone.example.org"] }, bases), ["https://b.example.org"]);
@@ -335,7 +338,7 @@ test("retry plan: pending blocks to every relay, partial ones to the relays that
     { id: "v", own: true, acked: false },
   ];
   assert.deepEqual(retryPlan(metas, bases).map((p) => p.id), ["y", "v", "x"]);
-  assert.deepEqual(retryPlan(metas, bases, 2).map((p) => p.id), ["y", "v"]);
+  assert.deepEqual(retryPlan(metas, bases, { max: 2 }).map((p) => p.id), ["y", "v"]);
 });
 
 /** A relay double: `get` runs `onGet(id)` and resolves its result; every call is counted. */

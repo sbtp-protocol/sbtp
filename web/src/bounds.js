@@ -45,6 +45,16 @@ export const LIMITS = Object.freeze({
   /** Own blocks not yet acknowledged by a relay: they are never evicted, so their count is capped. */
   storeMaxPending: 200,
   /**
+   * Bounds on a relay still pending for an own block that another relay acknowledged (ADR 0047
+   * rule 4, starting values of rule 11): it is given up after at least `publishMinAttempts` PUT
+   * attempts AND at least `publishMinWaitMs` since the first of them, and in any case
+   * `publishMaxWaitMs` after the block's first acknowledgement. A block no relay acknowledged keeps
+   * its protection whatever these say (under `storeMaxPending`).
+   */
+  publishMinAttempts: 5,
+  publishMinWaitMs: 24 * 60 * 60 * 1000,
+  publishMaxWaitMs: 7 * 24 * 60 * 60 * 1000,
+  /**
    * Highest difficulty this client mines when it takes it from a relay's /info (rule 13). Same
    * value as cli-demo (MAX_RELAY_DIFFICULTY); the default difficulty itself is Q-28. A difficulty
    * the user types is not bound by it.

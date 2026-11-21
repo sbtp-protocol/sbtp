@@ -1,6 +1,7 @@
 // UI of index.html. Every value from a relay or a block is written with textContent, never as HTML.
 
 import { LIMITS } from "./bounds.js";
+import { describeDelivery, isStranded, PARTIAL, protection, UNACKNOWLEDGED } from "./delivery.js";
 import { formatTimestamp } from "./format.js";
 import { fromHex, isIdHex, toHex } from "./hex.js";
 import { deadline } from "./http.js";
@@ -10,7 +11,7 @@ import { mineInWorker } from "./miner.js";
 import {
   fetchBlocksFrom, fetchOne, publishAll, publishDifficulty, RelaySet, retryPlan, walkAll,
 } from "./relays.js";
-import { loadRelays, saveRelays } from "./settings.js";
+import { announceRelays, loadRelays, onRelaysChange, RELAYS_KEY, saveRelays } from "./settings.js";
 import { BlockStore } from "./store.js";
 import { traverse } from "./traverse.js";
 import { buildUnsignedBlock, loadSbtp, verifyFetched, verifySubmitted } from "./wasm.js";
@@ -35,7 +36,7 @@ function showRelays() {
 
 function onSaveRelays() {
   try {
-    relays = new RelaySet(saveRelays($("relays").value));
+    relays = new RelaySet(saveRelays($("relays").value, undefined, relays.bases));
     $("relays").value = relays.bases.join("\n");
     showRelays();
   } catch (e) {
@@ -43,10 +44,32 @@ function onSaveRelays() {
   }
 }
 
-/** One line per relay of a publishAll result. */
-const NAMES = { created: "201 created", stored: "200 already stored", "backing-off": "not sent" };
+/**
+ * The relay list changed (here or in another tab): the store reconciles the delivery states of own
+ * blocks (ADR 0047 rules 6 and 7) before the stranded blocks are shown again.
+ */
+onRelaysChange(async (next) => {
+  if (!store) return;
+  await store.setRelays(next);
+  await showStranded();
+}, (e) => fail("stranded-out", e));
+
+/** A change of the list saved by another tab of this origin. */
+globalThis.addEventListener?.("storage", (event) => {
+  if (event.key !== RELAYS_KEY) return;
+  const previous = relays.bases;
+  relays = new RelaySet(loadRelays());
+  $("relays").value = relays.bases.join("\n");
+  showRelays();
+  announceRelays(relays.bases, previous);
+});
+
+/** One line per relay of a publishAll result, with the class of ADR 0047 rule 3. */
+const NAMES = { created: "201 created", stored: "200 already stored", "backing-off": "not sent (backing off)" };
+const CLASSES = { transient: "will be sent again", final: "refused for good", none: "not an attempt" };
 const perRelay = (results) => results.map((r) =>
-  `  ${r.base}: ${NAMES[r.outcome] ?? "failed"}${r.error ? ` (${r.error.name}: ${r.error.message})` : ""}`).join("\n");
+  `  ${r.base}: ${NAMES[r.outcome] ?? `failed, ${CLASSES[r.delivery] ?? r.delivery}`}` +
+  `${r.error ? ` (${r.error.name}: ${r.error.message})` : ""}`).join("\n");
 
 /**
  * Asks the browser not to evict this origin's storage once a key exists: the identity cannot be
@@ -145,7 +168,7 @@ async function receive(bytes, idHex) {
 /** PUTs an own block to `targets` in parallel and records which relays acknowledged it. */
 async function publishTo(targets, id, bytes, signal) {
   const res = await publishAll(relays, bytes, { targets, signal });
-  await store.recordPublish(id, res.acked, res.failed);
+  await store.recordPublish(id, res.results);
   return res;
 }
 
@@ -184,7 +207,8 @@ async function onPublish() {
     const head = res.acked.length > 0
       ? `Published ${b.idHex} on ${res.acked.length} of ${relays.bases.length} relay(s); mined in ${ms} ms at difficulty ${d}.`
       : `${b.idHex} was mined in ${ms} ms but no relay acknowledged it: it is kept as pending.`;
-    const retry = res.failed.length > 0 ? "\n\"Publish pending blocks\" sends it again to the relays that failed." : "";
+    const retry = res.results.some((r) => r.delivery === "transient" || r.delivery === "none")
+      ? "\n\"Publish pending blocks\" sends it again to the relays still pending." : "";
     say("publish-out", `${head}\n${perRelay(res.results)}${skipped ? `\n${skipped}` : ""}${retry}`,
       res.acked.length > 0 && res.failed.length === 0 ? "ok" : "bad");
   } catch (e) {
@@ -199,13 +223,14 @@ async function onPublish() {
     $("cancel").disabled = true;
     $("publish").disabled = false;
     showRelays();
+    showStranded();
   }
 }
 
 /**
- * Sends own blocks again: those no relay acknowledged, to every relay; those that failed on some
- * relays, to those relays only (relays.js retryPlan, at most storeMaxPending blocks per run). Stops
- * when every relay is backing off.
+ * Sends own blocks again (ADR 0047): those no relay of the list acknowledged, to every relay that
+ * did not refuse them for good; partly delivered ones, to the relays still pending (relays.js
+ * retryPlan, at most storeMaxPending blocks per run). Stops when every relay is backing off.
  */
 async function onRepublish() {
   if (republishing) return;
@@ -227,7 +252,7 @@ async function onRepublish() {
         const bytes = await store.get(id);
         verifySubmitted(bytes, 0);
         const res = await publishTo(targets, id, bytes);
-        if (res.failed.length === 0) done += 1;
+        if (res.results.every((r) => r.delivery === "acknowledged" || r.delivery === "final")) done += 1;
         else {
           incomplete += 1;
           last = res.results.find((r) => r.error)?.error ?? last;
@@ -243,10 +268,11 @@ async function onRepublish() {
     republishing = false;
     $("republish").disabled = false;
     showRelays();
+    showStranded();
   }
   const why = stopped ?? last;
-  say("publish-out", `${plan.length} own block(s) to send: ${done} acknowledged by every relay asked, ` +
-    `${incomplete} still missing on some relay${stopped ? "; stopped" : ""}` +
+  say("publish-out", `${plan.length} own block(s) to send: ${done} answered for good by every relay asked, ` +
+    `${incomplete} still pending on some relay${stopped ? "; stopped" : ""}` +
     `${why ? ` (${why.name}: ${why.message})` : ""}.`, why ? "bad" : "ok");
 }
 
@@ -307,6 +333,81 @@ function onAncestors() {
   });
 }
 
+/** How far an own block is delivered (ADR 0047 rule 2), for the list of local blocks. */
+function ownNote(m) {
+  if (!m.own) return "fetched";
+  const now = Date.now();
+  if (isStranded(m, relays.bases, now)) return "own, UNDELIVERABLE (see above)";
+  const p = protection(m, relays.bases, now);
+  if (p === UNACKNOWLEDGED) return "own, PENDING: no relay acknowledged it";
+  if (p === PARTIAL) return "own, partly delivered: kept until every relay has it";
+  return "own, delivered";
+}
+
+/** Saves the bytes of one block as a file (the user keeps it; any client can publish it). */
+function exportBlock(id, bytes) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${id}.sbtp`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/**
+ * Own blocks that no relay of the list holds and that no relay is pending for: every relay refused
+ * them or was given up (ADR 0047 rule 9). Nothing automatic will deliver them.
+ */
+async function showStranded() {
+  if (!store) return;
+  const list = $("stranded");
+  list.replaceChildren();
+  try {
+    const now = Date.now();
+    const stranded = (await store.list()).filter((m) => isStranded(m, relays.bases, now));
+    if (stranded.length === 0) return say("stranded-out", "None: every own block is held by a relay or still pending.", "ok");
+    say("stranded-out", `${stranded.length} own block(s) that no relay of the list holds, and that every relay ` +
+      "refused or was given up on. Add a relay to the list above (it becomes a target of these blocks), " +
+      "export them to keep the bytes, or delete them.", "bad");
+    for (const m of stranded.slice(0, 100)) {
+      const div = document.createElement("div");
+      div.className = "block";
+      const head = document.createElement("div");
+      head.className = "mono muted";
+      head.textContent = `${m.id}\n${describeDelivery(m, relays.bases, now).join("\n")}`;
+      const add = document.createElement("button");
+      add.textContent = "Add a relay";
+      add.addEventListener("click", () => $("relays").focus());
+      const exp = document.createElement("button");
+      exp.textContent = "Export";
+      exp.addEventListener("click", async () => {
+        try {
+          const bytes = await store.get(m.id);
+          verifySubmitted(bytes, 0);
+          exportBlock(m.id, bytes);
+        } catch (e) {
+          fail("stranded-out", e);
+        }
+      });
+      const del = document.createElement("button");
+      del.textContent = "Delete";
+      del.addEventListener("click", async () => {
+        if (!confirm(`Delete own block ${m.id}? No relay of the list holds it: unless it was exported, it is lost.`)) return;
+        try {
+          await store.delete(m.id);
+          await showStranded();
+        } catch (e) {
+          fail("stranded-out", e);
+        }
+      });
+      div.append(head, add, exp, del);
+      list.append(div);
+    }
+  } catch (e) {
+    fail("stranded-out", e);
+  }
+}
+
 async function onLocal() {
   $("blocks").replaceChildren();
   try {
@@ -322,7 +423,7 @@ async function onLocal() {
         bad += 1;
         continue;
       }
-      renderBlock(b, m.own ? (m.acked ? "own, published" : "own, PENDING") : "fetched");
+      renderBlock(b, ownNote(m));
     }
     say("list-out", `${metas.length} local block(s); budget ${LIMITS.storeMaxBlocks} blocks, ` +
       `${LIMITS.storeMaxBytes / 2 ** 20} MiB (showing the 100 most recent, ${bytes} bytes)` +
@@ -336,7 +437,9 @@ async function main() {
   try {
     await loadSbtp();
     db = await openDb();
-    store = new BlockStore(db);
+    store = new BlockStore(db, LIMITS, { bases: relays.bases });
+    // Reconciles the delivery states with the list, and migrates records from before ADR 0047.
+    await store.setRelays(relays.bases);
     say("status", "sbtp-wasm loaded, self-test passed (ADR 0003 rule 16).", "ok");
     try {
       identity = await loadIdentity(db);
@@ -398,6 +501,8 @@ async function main() {
   $("browse-cancel").addEventListener("click", () => browsing?.abort());
   $("ancestors").addEventListener("click", onAncestors);
   $("local").addEventListener("click", onLocal);
+  $("stranded-check").addEventListener("click", showStranded);
+  showStranded();
   $("clear-fetched").addEventListener("click", async () => {
     await store.clearFetched();
     say("list-out", "Fetched blocks cleared; keys and own blocks kept.");
