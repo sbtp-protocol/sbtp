@@ -1,6 +1,6 @@
 [package]
 name = "sbtp-wasm"
-description = "WebAssembly bindings of sbtp-core for the PWA and the web client."
+description = "WebAssembly bindings of sbtp-core, the generic layer 2 grammar (sbtp-l2) and the sealed envelope (sbtp-seal)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

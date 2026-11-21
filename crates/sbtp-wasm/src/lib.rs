@@ -1,6 +1,8 @@
-//! WebAssembly bindings of `sbtp-core` (target `wasm32-unknown-unknown`).
+//! WebAssembly bindings of `sbtp-core` (target `wasm32-unknown-unknown`), plus, behind the
+//! features `l2` and `seal` (on by default), the generic layer 2 grammar of `sbtp-l2` and the
+//! sealed envelope of `sbtp-seal` (Q-78: one module, measured within the ADR 0048 budget).
 //!
-//! Every protocol rule runs in `sbtp-core`: this crate only moves bytes across the boundary.
+//! Every protocol rule runs in those crates: this crate only moves bytes across the boundary.
 //! Browsers MUST verify blocks through these bindings, not through a JS Ed25519 library or Web
 //! Crypto `verify`, which diverge from the strict criteria V1 to V6 (interop finding 2026-11-18,
 //! the roadmap (not published) Phase 3).
