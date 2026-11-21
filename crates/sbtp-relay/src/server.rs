@@ -276,9 +276,31 @@ pub fn accept_needs_backoff(e: &io::Error) -> bool {
     )
 }
 
+/// How the drain of [`serve`] ended (the `shutdown` line's `phase`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drain {
+    /// Every connection finished: no request handler runs any more.
+    Drained,
+    /// The drain deadline passed with connections still open.
+    Deadline,
+    /// A second stop signal cut the drain.
+    Forced,
+}
+
+impl Drain {
+    /// Whether every request handler had ended when [`serve`] returned. After `Deadline` or
+    /// `Forced`, handlers left may still record demands until the runtime is dropped, so the
+    /// stop is not clean for ADR 0046 rule 13 (security review 2026-11-21, L-3).
+    #[must_use]
+    pub fn complete(self) -> bool {
+        self == Self::Drained
+    }
+}
+
 /// Serves `app` on `listener` until `stop` signals, then stops accepting, lets each connection
 /// finish its request (hyper graceful shutdown), and returns once every connection is closed,
 /// after `request_timeout + RESPONSE_GRACE` at the latest, or at once on a second stop request.
+/// Returns how the drain ended.
 ///
 /// # Errors
 ///
@@ -288,7 +310,7 @@ pub async fn serve<S: StopSignal>(
     app: Router,
     limits: ConnLimits,
     mut stop: S,
-) -> io::Result<()> {
+) -> io::Result<Drain> {
     let permits = Arc::new(Semaphore::new(limits.max_connections as usize));
     let (stopping_tx, stopping) = watch::channel(false);
     let mut builder = http1::Builder::new();
@@ -387,14 +409,14 @@ pub async fn serve<S: StopSignal>(
     // second stop signal closes every connection now.
     let phase = tokio::select! {
         r = drain => match r {
-            Ok(_) => (Level::Info, "drained"),
-            Err(_) => (Level::Warn, "deadline"),
+            Ok(_) => (Level::Info, "drained", Drain::Drained),
+            Err(_) => (Level::Warn, "deadline", Drain::Deadline),
         },
-        () = stop.recv() => (Level::Warn, "forced"),
+        () = stop.recv() => (Level::Warn, "forced", Drain::Forced),
     };
     log::emit_at(phase.0, Event::Shutdown, &[("phase", Value::Str(phase.1))]);
     // The connection tasks left are dropped with the runtime, which closes their sockets.
-    Ok(())
+    Ok(phase.2)
 }
 
 struct Connection {

@@ -8,8 +8,12 @@
 //!
 //! A demand that cannot be recorded (the set is full, or a flush failed) is lost: it is counted
 //! (`demand_lost_total`) and demand eviction is suspended until `now + 2 × E` (rule 13). A start
-//! after an unclean shutdown suspends it the same way. The suspension end is one integer in
-//! memory; a later loss only moves it forward.
+//! after an unclean shutdown suspends it the same way, and so does a start with no demand history
+//! (security review 2026-11-21, M-1): the first start after the upgrade that added the demand
+//! tables or this record, and every start that turns `demand_eviction` from off to on, since
+//! reads were not recorded while it was off. The suspension end is one integer in memory; a later
+//! loss only moves it forward. A clean shutdown writes it to the index and the next start restores
+//! it (L-1), so that a clean restart does not cancel a running suspension ([`StartState`]).
 //!
 //! The table is open addressing with linear probing over `2 × demand_touch_max` slots (rounded up
 //! to a power of two), never resized, with removal by backward shift (no deletion marker), as the
@@ -200,6 +204,23 @@ impl Table {
     }
 }
 
+/// What the index says about the previous run, for the suspensions applied at start-up
+/// ([`Demand::start`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartState {
+    /// The previous run did not close the index cleanly (rule 13).
+    pub unclean: bool,
+    /// The start-up migration gave demand entries to at least one block (an index written before
+    /// ADR 0046): their `last_demand` is an acceptance time, not a demand (M-1).
+    pub migrated: bool,
+    /// The `demand_eviction` setting of the previous start, `None` when none was recorded (M-1).
+    pub previous: Option<bool>,
+    /// The index holds no block: a new index has no demand to protect.
+    pub empty: bool,
+    /// The suspension end written at the last clean close, `0` when none (L-1).
+    pub suspended_until: u64,
+}
+
 /// The demand state of a relay (ADR 0046 rules 9 to 14): the set, the suspension end, the
 /// flush request and the hysteresis of the watermarks (rule 5).
 #[derive(Debug)]
@@ -214,6 +235,10 @@ pub struct Demand {
     /// Rule 5: set when the store went above the high-water mark, cleared once at or below the
     /// low-water mark.
     draining: AtomicBool,
+    /// The last demand pass was stuck (`demand_stuck`): it could not make room. Cleared by a pass
+    /// that deletes a block, or once at or below the low-water mark (security review
+    /// 2026-11-21, L-4).
+    stuck: AtomicBool,
 }
 
 impl Demand {
@@ -250,6 +275,7 @@ impl Demand {
             flush_requested: AtomicBool::new(false),
             flush: Notify::new(),
             draining: AtomicBool::new(false),
+            stuck: AtomicBool::new(false),
         })
     }
 
@@ -323,43 +349,115 @@ impl Demand {
     /// Rule 13: `n` demands could not be recorded at `now`. Counted; demand eviction suspended
     /// until `now + 2 × E`.
     pub fn lost(&self, n: u64, now: u64) {
+        static LOG: Throttle = Throttle::new();
         metrics::demand_lost(n);
-        self.suspend(now.saturating_add(self.epoch_ms.saturating_mul(2)), "lost");
+        if let Some(fields) = self.suspend(self.two_epochs(now), now, "lost") {
+            log::throttled(&LOG, Event::DemandSuspended, &fields, None);
+        }
     }
 
     /// Rule 13: a start after an unclean shutdown, at `now`.
     pub fn unclean_start(&self, now: u64) {
-        if self.enabled {
-            self.suspend(
-                now.saturating_add(self.epoch_ms.saturating_mul(2)),
-                "unclean_start",
+        self.start(
+            &StartState {
+                unclean: true,
+                previous: Some(true),
+                ..StartState::default()
+            },
+            now,
+        );
+    }
+
+    /// The suspensions of a start at `now` (rule 13; security review 2026-11-21, M-1 and L-1),
+    /// each logged once as `demand_suspended` with its `cause`: `unclean_start`; `no_history`
+    /// (the migration ran, or no `demand_eviction` value was recorded, on an index that holds
+    /// blocks); `enabled` (`demand_eviction` was off at the previous start); `restored` (the
+    /// suspension written at the last clean close has not ended). Nothing with demand eviction
+    /// off. The first three suspend until `now + 2 × E`: a demand made before this start may
+    /// have gone unrecorded, and two epochs cover it (rule 13).
+    pub fn start(&self, s: &StartState, now: u64) {
+        if !self.enabled {
+            return;
+        }
+        let two = self.two_epochs(now);
+        let mut causes: Vec<(u64, &'static str)> = Vec::with_capacity(4);
+        if s.unclean {
+            causes.push((two, "unclean_start"));
+        }
+        if s.migrated || (s.previous.is_none() && !s.empty) {
+            causes.push((two, "no_history"));
+        } else if s.previous == Some(false) {
+            causes.push((two, "enabled"));
+        }
+        if s.suspended_until > now {
+            causes.push((s.suspended_until, "restored"));
+        }
+        for (until, cause) in causes {
+            // Once per start and cause: not throttled, so that every cause is seen.
+            let _ = self.suspend(until, now, cause);
+            log::emit(
+                Event::DemandSuspended,
+                &[
+                    ("cause", Value::Str(cause)),
+                    ("duration_ms", Value::Int(until.saturating_sub(now))),
+                ],
             );
         }
     }
 
-    fn suspend(&self, until: u64, cause: &'static str) {
-        static LOG: Throttle = Throttle::new();
+    fn two_epochs(&self, now: u64) -> u64 {
+        now.saturating_add(self.epoch_ms.saturating_mul(2))
+    }
+
+    /// Moves the suspension end forward to `until`; the fields of the `demand_suspended` line
+    /// when it moved.
+    fn suspend(
+        &self,
+        until: u64,
+        now: u64,
+        cause: &'static str,
+    ) -> Option<[(&'static str, Value<'static>); 2]> {
         let before = self.suspended_until.fetch_max(until, Ordering::SeqCst);
         metrics::set_demand_suspended(true);
-        if until > before {
-            log::throttled(
-                &LOG,
-                Event::DemandSuspended,
-                &[
-                    ("cause", Value::Str(cause)),
-                    ("duration_ms", Value::Int(self.epoch_ms.saturating_mul(2))),
-                ],
-                None,
-            );
-        }
+        (until > before).then(|| {
+            [
+                ("cause", Value::Str(cause)),
+                ("duration_ms", Value::Int(until.saturating_sub(now))),
+            ]
+        })
     }
 
     /// Whether rule 13 suspends demand eviction at `now`; sets the `demand_suspended` gauge.
     #[must_use]
     pub fn suspended(&self, now: u64) -> bool {
-        let s = now < self.suspended_until.load(Ordering::SeqCst);
+        let s = self.suspended_at(now);
         metrics::set_demand_suspended(s);
         s
+    }
+
+    /// Whether rule 13 suspends demand eviction at `now`: one atomic load, nothing else (the
+    /// per-candidate check of a demand pass, security review 2026-11-21, L-2).
+    #[must_use]
+    pub fn suspended_at(&self, now: u64) -> bool {
+        now < self.suspended_until.load(Ordering::SeqCst)
+    }
+
+    /// ADR 0046 rule 8 (MAY) as narrowed by security review 2026-11-21, L-4: a `507` carries
+    /// `Retry-After` only while demand eviction is on, neither suspended at `now` nor stuck, so
+    /// that the next sweeper run can make room. The caller also checks the high-water mark.
+    #[must_use]
+    pub fn retry_after_useful(&self, now: u64) -> bool {
+        self.enabled && !self.suspended_at(now) && !self.stuck()
+    }
+
+    /// Whether the last demand pass was stuck.
+    #[must_use]
+    pub fn stuck(&self) -> bool {
+        self.stuck.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_stuck(&self, on: bool) {
+        self.stuck.store(on, Ordering::Relaxed);
     }
 
     /// The end of the current suspension, Unix milliseconds (0: none yet).
@@ -403,8 +501,12 @@ impl Demand {
         self.draining.load(Ordering::Relaxed)
     }
 
+    /// Sets the draining state; at or below the low-water mark (`false`), a stuck pass is over.
     pub(crate) fn set_draining(&self, on: bool) {
         self.draining.store(on, Ordering::Relaxed);
+        if !on {
+            self.set_stuck(false);
+        }
     }
 }
 
@@ -506,6 +608,118 @@ mod tests {
         assert!(d.is_empty());
         assert_eq!(d.lock().slots.capacity(), 0);
         d.unclean_start(0);
+        d.start(
+            &StartState {
+                previous: Some(false),
+                suspended_until: 99,
+                ..StartState::default()
+            },
+            0,
+        );
         assert!(!d.suspended(1));
+        assert!(!d.retry_after_useful(1));
+    }
+
+    /// Security review 2026-11-21, M-1 and L-1: the start-up suspensions, each `2 × E` from the
+    /// start except a restored one, which keeps its end; none on a new index or a plain restart.
+    #[test]
+    fn start_suspensions() {
+        let at = |s: StartState| {
+            let d = Demand::new(&settings(&[])).unwrap();
+            let e = d.epoch_ms();
+            d.start(&s, 10 * e);
+            (d.suspended_until(), e)
+        };
+        let base = StartState {
+            previous: Some(true),
+            ..StartState::default()
+        };
+        let (until, e) = at(base);
+        assert_eq!(until, 0, "a plain restart");
+        assert_eq!(
+            at(StartState {
+                previous: None,
+                empty: true,
+                ..base
+            })
+            .0,
+            0,
+            "a new index"
+        );
+        let two = 12 * e;
+        for s in [
+            StartState {
+                unclean: true,
+                ..base
+            },
+            StartState {
+                migrated: true,
+                ..base
+            },
+            StartState {
+                previous: None,
+                ..base
+            },
+            StartState {
+                previous: None,
+                migrated: true,
+                empty: true,
+                ..base
+            },
+            StartState {
+                previous: Some(false),
+                ..base
+            },
+            StartState {
+                previous: Some(false),
+                empty: true,
+                ..base
+            },
+        ] {
+            assert_eq!(at(s).0, two, "{s:?}");
+        }
+        // Restored: kept when later than the others, ignored once ended.
+        assert_eq!(
+            at(StartState {
+                suspended_until: 13 * e,
+                ..base
+            })
+            .0,
+            13 * e
+        );
+        assert_eq!(
+            at(StartState {
+                unclean: true,
+                suspended_until: 11 * e,
+                ..base
+            })
+            .0,
+            two
+        );
+        assert_eq!(
+            at(StartState {
+                suspended_until: 10 * e,
+                ..base
+            })
+            .0,
+            0,
+            "ended at the start"
+        );
+    }
+
+    /// Security review 2026-11-21, L-4: `Retry-After` is useful only while demand eviction is
+    /// neither suspended nor stuck.
+    #[test]
+    fn retry_after_only_when_room_can_come() {
+        let d = Demand::new(&settings(&[])).unwrap();
+        let e = d.epoch_ms();
+        assert!(d.retry_after_useful(e));
+        d.set_stuck(true);
+        assert!(!d.retry_after_useful(e));
+        d.set_stuck(false);
+        d.lost(1, e);
+        assert!(d.suspended_at(e) && !d.retry_after_useful(e));
+        assert!(!d.retry_after_useful(3 * e - 1));
+        assert!(d.retry_after_useful(3 * e));
     }
 }

@@ -186,6 +186,9 @@ events! {
     DemandEvicted => "demand_evicted", Info, Bounded;
     DemandStuck => "demand_stuck", Warn, Bounded;
     DemandSuspended => "demand_suspended", Warn, Bounded;
+    // Security review 2026-11-21, I-4 (owner decision, ADR 0046 clarification): the progress of
+    // the start-up migration of the demand tables, before the relay listens.
+    DemandMigration => "demand_migration", Info, Startup;
 }
 
 /// A field value (rule 4: integers are numbers, flags are booleans as `truncated` of rule 17,
@@ -1146,6 +1149,9 @@ mod tests {
             assert!(adr0046.contains(&format!("`{name}`")), "{name}");
         }
         table.extend_from_slice(&demand);
+        // Security review 2026-11-21, I-4: named by the ADR 0046 clarification written alongside
+        // this change; checked against the ADR text once it is merged.
+        table.push(("demand_migration", "info"));
         let ours: Vec<(&str, &str)> = Event::ALL
             .iter()
             .map(|e| (e.name(), e.level().name()))
