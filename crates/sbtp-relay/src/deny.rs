@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -151,9 +151,33 @@ impl List {
     ///
     /// The first invalid line, or a read error ([`Reason::Unreadable`]).
     pub fn parse(r: impl Read, max_entries: usize) -> Result<Self, Invalid> {
+        Self::parse_sized(r, max_entries, (0, 0))
+    }
+
+    /// [`List::parse`] into maps allocated first for `sized` (`block` and `key` entries), so
+    /// that a reload does not grow them entry by entry (deny review L-3: no growth transient,
+    /// the peak stays within `2 × N × 80`). `sized` is a hint, from [`count_entries`]: a file
+    /// that changed between the two reads is still parsed correctly.
+    ///
+    /// # Errors
+    ///
+    /// As [`List::parse`]; [`Reason::OutOfMemory`] when the first allocation fails.
+    pub fn parse_sized(
+        r: impl Read,
+        max_entries: usize,
+        sized: (usize, usize),
+    ) -> Result<Self, Invalid> {
         let mut r = BufReader::with_capacity(READ_BUFFER, r);
         let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
         let mut list = Self::default();
+        let oom = Invalid {
+            line: 0,
+            reason: Reason::OutOfMemory,
+        };
+        let blocks = sized.0.min(max_entries);
+        let keys = sized.1.min(max_entries.saturating_sub(blocks));
+        list.blocks.try_reserve(blocks).map_err(|_| oom)?;
+        list.keys.try_reserve(keys).map_err(|_| oom)?;
         let mut n: u64 = 0;
         loop {
             line.clear();
@@ -282,6 +306,35 @@ impl List {
     pub fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.keys.keys()
     }
+}
+
+/// The first read of a reload (deny review L-3): the number of lines that start like a `block`
+/// and like a `key` entry, duplicates included, each at most `max_entries`. Reads as the parser
+/// does, through one bounded line buffer; it stops at the first line too long or a read error,
+/// which the parse then reports.
+#[must_use]
+pub fn count_entries(r: impl Read, max_entries: usize) -> (usize, usize) {
+    let mut r = BufReader::with_capacity(READ_BUFFER, r);
+    let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
+    let (mut blocks, mut keys) = (0usize, 0usize);
+    loop {
+        line.clear();
+        let Ok(read) = (&mut r)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+        else {
+            break;
+        };
+        if read == 0 || line.strip_suffix(b"\n").unwrap_or(&line).len() > MAX_LINE_BYTES {
+            break;
+        }
+        if line.starts_with(b"block ") {
+            blocks = blocks.saturating_add(1).min(max_entries);
+        } else if line.starts_with(b"key ") {
+            keys = keys.saturating_add(1).min(max_entries);
+        }
+    }
+    (blocks, keys)
 }
 
 /// `<kind> <hex>[ <action>]`, single spaces, nothing else (rule 3).
@@ -551,7 +604,12 @@ fn read_file_then(
     if !meta.is_some_and(|m| m.is_file()) {
         return (Err(whole(Reason::Unreadable)), stamp);
     }
-    let parsed = match List::parse(&file, max_entries) {
+    // Deny review L-3: count first, then parse into maps of that size, from the start again.
+    let sized = count_entries(&file, max_entries);
+    if (&file).seek(io::SeekFrom::Start(0)).is_err() {
+        return (Err(whole(Reason::Unreadable)), stamp);
+    }
+    let parsed = match List::parse_sized(&file, max_entries, sized) {
         Ok(list) => list,
         Err(e) => return (Err(e), stamp),
     };
@@ -986,6 +1044,40 @@ mod tests {
         assert!(deny.changed());
         assert_eq!(deny.reload(), Reload::Loaded);
         assert!(deny.check(&id(B), None).is_some());
+    }
+
+    /// Deny review L-3: the counting read sizes both maps, so the parse never grows them; a
+    /// hint smaller or larger than the file is still parsed correctly.
+    #[test]
+    fn maps_are_sized_by_the_counting_read() {
+        let many: String = (0..=99u8)
+            .map(|n| format!("block {}\nkey {}\n", hex32(n), hex32(n)))
+            .collect();
+        let text = format!("# comment\n{many}");
+        assert_eq!(count_entries(text.as_bytes(), 1_000), (100, 100));
+        assert_eq!(count_entries(text.as_bytes(), 150), (100, 100));
+        assert_eq!(count_entries(text.as_bytes(), 50), (50, 50));
+        let sized = count_entries(text.as_bytes(), 1_000);
+        let l = List::parse_sized(text.as_bytes(), 1_000, sized).unwrap();
+        let (b, k) = (l.blocks.capacity(), l.keys.capacity());
+        assert!(b >= 100 && k >= 100);
+        let grown = List::parse(text.as_bytes(), 1_000).unwrap();
+        assert_eq!(l, grown);
+        // Capacities did not move past the first allocation.
+        let again = List::parse_sized(text.as_bytes(), 1_000, sized).unwrap();
+        assert_eq!((again.blocks.capacity(), again.keys.capacity()), (b, k));
+        for hint in [(0, 0), (1, 1), (500, 500)] {
+            assert_eq!(
+                List::parse_sized(text.as_bytes(), 1_000, hint).unwrap(),
+                grown
+            );
+        }
+        assert_eq!(
+            List::parse_sized(text.as_bytes(), 150, sized)
+                .unwrap_err()
+                .reason,
+            Reason::TooManyEntries
+        );
     }
 
     /// The public key of a block is read from its header.
