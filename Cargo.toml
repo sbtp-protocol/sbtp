@@ -65,10 +65,15 @@ rustls-native-certs = "0.8.5"
 # 2026-11-18, see docs/security/dependency-exceptions.md and docs/security/2026-11-18-redb-4.6-exception.md.
 # Needs Rust 1.90.
 redb = "=4.6.0"
-# SHA-256 of the archive copy's signed payload and of AWS Signature Version 4, and HMAC-SHA256
-# over it by RFC 2104 (ADR 0050 rule 25; no `hmac` crate). Already in Cargo.lock through
-# ed25519-dalek; 0.11.0 published 2026-03-25. No default features (no `alloc`, no `oid`).
+# SHA-256 of the archive copy's signed payload and of AWS Signature Version 4 (ADR 0050 rule 25).
+# Already in Cargo.lock through ed25519-dalek; 0.11.0 published 2026-03-25. No default features
+# (no `alloc`, no `oid`).
 sha2 = { version = "0.11.0", default-features = false }
+# HMAC-SHA256 of AWS Signature Version 4 (ADR 0050 rule 25). Exact pin on the version already in
+# Cargo.lock through hkdf (hpke, sbtp-seal); 0.13.0 published 2026-03-29, reviewed in
+# docs/security/2026-11-20-hpke-dependency.md. Shares `digest` 0.11 with `sha2`. It has no default
+# features; `zeroize` is left off so that no lock edge moves.
+hmac = { version = "=0.13.0", default-features = false }
 
 # CLI (examples/cli-demo)
 # Blocking HTTP/1.1 client. No default features: no TLS (rustls, ring, webpki-roots), no gzip, no

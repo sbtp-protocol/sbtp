@@ -1,47 +1,22 @@
-//! AWS Signature Version 4 for one signed request with a signed payload (ADR 0050 rule 25), over
-//! `sha2`: canonical request, string to sign, signing key derivation, and HMAC-SHA256 by
-//! RFC 2104 (no extra crate). Tested with the RFC 4231 vectors and the published examples of the
-//! S3 API reference ("Signature Calculations for the Authorization Header").
+//! AWS Signature Version 4 for one signed request with a signed payload (ADR 0050 rule 25):
+//! canonical request, string to sign and signing key derivation, with HMAC-SHA256 from the
+//! `hmac` crate over `sha2`. Tested with the RFC 4231 vectors and the published
+//! examples of the S3 API reference ("Signature Calculations for the Authorization Header").
 
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-/// The SHA-256 block size, in bytes (RFC 2104 `B`).
-const BLOCK: usize = 64;
-
-/// HMAC-SHA256 (RFC 2104). The padded key blocks are wiped after use.
+/// HMAC-SHA256 (RFC 2104).
 #[must_use]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut k = Zeroizing::new([0u8; BLOCK]);
-    let mut hashed = Zeroizing::new([0u8; 32]);
-    let key = if key.len() > BLOCK {
-        hashed.copy_from_slice(&Sha256::digest(key));
-        hashed.as_slice()
-    } else {
-        key
+    // HMAC accepts a key of any length, so `new_from_slice` never fails; should it ever, the
+    // all-zero tag fails closed (the store rejects the signature) instead of panicking.
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
+        return [0; 32];
     };
-    if let Some(head) = k.get_mut(..key.len()) {
-        head.copy_from_slice(key);
-    }
-    let mut pad = Zeroizing::new([0u8; BLOCK]);
-    for (p, b) in pad.iter_mut().zip(k.iter()) {
-        *p = b ^ 0x36;
-    }
-    let inner = Sha256::new()
-        .chain_update(*pad)
-        .chain_update(data)
-        .finalize();
-    for (p, b) in pad.iter_mut().zip(k.iter()) {
-        *p = b ^ 0x5c;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(
-        &Sha256::new()
-            .chain_update(*pad)
-            .chain_update(inner)
-            .finalize(),
-    );
-    out
+    mac.update(data);
+    mac.finalize().into_bytes().into()
 }
 
 /// Lowercase hexadecimal.
