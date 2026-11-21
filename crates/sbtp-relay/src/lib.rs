@@ -14,6 +14,7 @@
 // TODO(1c): disk watermark, `/metrics`.
 
 pub mod api;
+pub mod batch;
 pub mod blocks;
 pub mod cache;
 pub mod client;

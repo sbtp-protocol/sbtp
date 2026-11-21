@@ -1,5 +1,6 @@
-//! `GET /sbtp/v1/query?parent=&since=&limit=&cursor=` (spec §4; ADR 0012 rules 5 to 15 and 32;
-//! ADR 0013 rules 3, 5 and 14; ADR 0018 rules 12 to 14 and 30; ADR 0024).
+//! `GET /sbtp/v1/query?parent=&since=&limit=&cursor=&fields=` (spec §4; ADR 0012 rules 5 to 15
+//! and 32; ADR 0013 rules 3, 5 and 14; ADR 0018 rules 12 to 14 and 30; ADR 0024; ADR 0051 rules
+//! 13 and 14).
 //!
 //! The query string is read as received, not percent-decoded: every accepted value is plain
 //! ASCII from a fixed set, so a `%` or a `+` is malformed. Nothing a client sent is logged.
@@ -14,7 +15,7 @@ use sbtp_core::BlockId;
 
 use crate::config::Settings;
 use crate::error::ApiError;
-use crate::index::{IndexBackend, MAX_QUERY_LIMIT, Page, Position};
+use crate::index::{IndexBackend, Listing, MAX_QUERY_LIMIT, Order, Page, Position, QueryPlan};
 use crate::log::{self, Event, Throttle, Value};
 use crate::metrics::{self, IndexReadOp, Refused};
 use crate::pool::IndexHandle;
@@ -22,6 +23,9 @@ use crate::store::{decode_hex, encode_hex, parse_hex_id, push_hex};
 
 /// ADR 0012 rule 5: `limit` when the request has none.
 pub const DEFAULT_LIMIT: u64 = 100;
+
+/// ADR 0051 rule 14: the page size bound with `fields=parents`.
+pub const MAX_FIELDS_LIMIT: u64 = 200;
 
 /// ADR 0012 rule 5: the length bound of a `cursor`.
 const MAX_CURSOR_CHARS: usize = 128;
@@ -33,7 +37,7 @@ const CURSOR_CHARS: usize = 40;
 /// Why a `/query` request was refused with `400`, one variant per rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryError {
-    /// ADR 0012 rule 5: a parameter that is not one of the four, or a pair without `=`.
+    /// ADR 0012 rule 5: a parameter that is not one of those of spec §4, or a pair without `=`.
     UnknownParameter,
     /// ADR 0012 rule 5: a parameter given twice.
     RepeatedParameter,
@@ -45,6 +49,10 @@ pub enum QueryError {
     MalformedLimit,
     /// ADR 0012 rule 5: `cursor` is not 1 to 128 characters of `A-Z a-z 0-9 - _`.
     MalformedCursor,
+    /// ADR 0051 rule 13: `fields` is not `parents`.
+    MalformedFields,
+    /// ADR 0051 rule 14: `fields` with `parent`.
+    FieldsWithParent,
     /// ADR 0012 rule 9, ADR 0013 rule 5, ADR 0024 rule 7: a well-formed cursor this relay did not
     /// issue for its current index epoch.
     UnrecognisedCursor,
@@ -57,7 +65,8 @@ impl QueryError {
         let invalid = ApiError::invalid_parameter;
         match self {
             Self::UnknownParameter => invalid().with_message(
-                "unknown query parameter; the parameters are parent, since, limit and cursor",
+                "unknown query parameter; the parameters are parent, since, limit, cursor, order \
+                 and fields",
             ),
             Self::RepeatedParameter => invalid().with_message("a query parameter is repeated"),
             Self::MalformedParent => {
@@ -69,6 +78,8 @@ impl QueryError {
             Self::MalformedLimit => invalid().with_message("limit must be a decimal integer >= 1"),
             Self::MalformedCursor => invalid()
                 .with_message("cursor must be 1 to 128 characters of A-Z, a-z, 0-9, - and _"),
+            Self::MalformedFields => invalid().with_message("fields must be parents"),
+            Self::FieldsWithParent => invalid().with_message("fields is not allowed with parent"),
             Self::UnrecognisedCursor => ApiError::invalid_cursor(),
         }
     }
@@ -85,6 +96,8 @@ pub struct Params<'a> {
     pub limit: Option<u64>,
     /// `cursor`, as received.
     pub cursor: Option<&'a str>,
+    /// `fields=parents` (ADR 0051 rule 13).
+    pub fields: Option<bool>,
 }
 
 /// Parses a raw query string (ADR 0012 rule 5). An absent or empty query has no parameter.
@@ -111,20 +124,26 @@ pub fn parse_params(query: Option<&str>) -> Result<Params<'_>, QueryError> {
                     .ok_or(QueryError::MalformedSince)?,
             )?,
             "limit" => set(&mut p.limit, parse_limit(value)?)?,
-            "cursor" => {
-                let ok = (1..=MAX_CURSOR_CHARS).contains(&value.len())
-                    && value
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
-                if !ok {
-                    return Err(QueryError::MalformedCursor);
-                }
-                set(&mut p.cursor, value)?;
-            }
+            "cursor" => set(&mut p.cursor, cursor_syntax(value)?)?,
+            "fields" if value == "parents" => set(&mut p.fields, true)?,
+            "fields" => return Err(QueryError::MalformedFields),
             _ => return Err(QueryError::UnknownParameter),
         }
     }
+    // ADR 0051 rule 14.
+    if p.fields.is_some() && p.parent.is_some() {
+        return Err(QueryError::FieldsWithParent);
+    }
     Ok(p)
+}
+
+/// ADR 0012 rule 5: 1 to 128 characters of `A-Z a-z 0-9 - _`.
+fn cursor_syntax(value: &str) -> Result<&str, QueryError> {
+    let ok = (1..=MAX_CURSOR_CHARS).contains(&value.len())
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    ok.then_some(value).ok_or(QueryError::MalformedCursor)
 }
 
 fn set<T>(slot: &mut Option<T>, value: T) -> Result<(), QueryError> {
@@ -169,35 +188,87 @@ fn cursor_bytes(epoch: u64, at: Position) -> [u8; 20] {
     raw
 }
 
-/// The body of one page (ADR 0012 rule 10: exactly `block_ids`, `cursor` and `more`), written
-/// into one buffer of its exact size: no intermediate string per identifier or JSON value (code
-/// review finding 7 of milestone 1c-a). Every value is hexadecimal or a boolean, so nothing needs
-/// escaping.
+/// The body of one page (ADR 0012 rule 10: `block_ids`, `cursor` and `more`; ADR 0051 rule 13:
+/// `parents` and `lens` with `fields=parents`), written into one buffer of its exact size: no
+/// intermediate string per identifier or JSON value (code review finding 7 of milestone 1c-a).
+/// Every value is hexadecimal, a number or a boolean, so nothing needs escaping. Members are in
+/// alphabetical order.
 #[must_use]
 pub fn page_body(epoch: u64, page: &Page) -> Vec<u8> {
-    const HEAD: &[u8] = br#"{"block_ids":["#;
-    const MID: &[u8] = br#"],"cursor":""#;
-    let tail: &[u8] = if page.more {
-        br#"","more":true}"#
-    } else {
-        br#"","more":false}"#
-    };
-    // Each identifier is 64 characters in quotes, with a comma between two.
+    let mut out = Vec::with_capacity(page_len(page) + 2);
+    out.push(b'{');
+    push_page(&mut out, epoch, page);
+    out.push(b'}');
+    out
+}
+
+/// The bytes [`push_page`] writes for `page`.
+fn page_len(page: &Page) -> usize {
+    // `"block_ids":[` … `],"cursor":"` 40 `","more":false`.
     let ids = page.entries.len().saturating_mul(67).saturating_sub(1);
-    let mut out = Vec::with_capacity(HEAD.len() + ids + MID.len() + 40 + tail.len());
-    out.extend_from_slice(HEAD);
-    for (k, (_, id)) in page.entries.iter().enumerate() {
+    let mut n = 13 + ids + 12 + 40 + 9 + if page.more { 4 } else { 5 };
+    if !page.fields.is_empty() {
+        // `,"lens":[` … `],"parents":[` … `]`.
+        n += 9 + 2 + 11 + 1;
+        for (k, f) in page.fields.iter().enumerate() {
+            let sep = usize::from(k > 0);
+            n += sep + decimal_len(f.len);
+            n += sep + 2 + f.parents.len().saturating_mul(67).saturating_sub(1);
+        }
+    }
+    n
+}
+
+fn decimal_len(v: u32) -> usize {
+    v.checked_ilog10().map_or(1, |l| l as usize + 1)
+}
+
+/// The members of one page, without braces.
+fn push_page(out: &mut Vec<u8>, epoch: u64, page: &Page) {
+    out.extend_from_slice(br#""block_ids":["#);
+    push_ids(out, page.entries.iter().map(|(_, id)| id));
+    out.extend_from_slice(br#"],"cursor":""#);
+    push_hex(out, &cursor_bytes(epoch, page.next));
+    out.push(b'"');
+    if !page.fields.is_empty() {
+        out.extend_from_slice(br#","lens":["#);
+        for (k, f) in page.fields.iter().enumerate() {
+            if k > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(f.len.to_string().as_bytes());
+        }
+        out.push(b']');
+    }
+    out.extend_from_slice(if page.more {
+        br#","more":true"#
+    } else {
+        br#","more":false"#
+    });
+    if !page.fields.is_empty() {
+        out.extend_from_slice(br#","parents":["#);
+        for (k, f) in page.fields.iter().enumerate() {
+            if k > 0 {
+                out.push(b',');
+            }
+            out.push(b'[');
+            push_ids(out, f.parents.iter());
+            out.push(b']');
+        }
+        out.push(b']');
+    }
+}
+
+/// Identifiers as JSON strings separated by commas.
+fn push_ids<'a>(out: &mut Vec<u8>, ids: impl Iterator<Item = &'a BlockId>) {
+    for (k, id) in ids.enumerate() {
         if k > 0 {
             out.push(b',');
         }
         out.push(b'"');
-        push_hex(&mut out, id.as_bytes());
+        push_hex(out, id.as_bytes());
         out.push(b'"');
     }
-    out.extend_from_slice(MID);
-    push_hex(&mut out, &cursor_bytes(epoch, page.next));
-    out.extend_from_slice(tail);
-    out
 }
 
 /// The position of a cursor issued by [`encode_cursor`] under `epoch`.
@@ -308,18 +379,32 @@ pub async fn query<I: IndexBackend + 'static>(
         .map_or_else(Position::default, Position::at)
         .max(cursor.unwrap_or_default());
     // ADR 0012 rule 8: lowered to `max_query_limit`, not an error; the index clamps again (ADR
-    // 0018 rule 14).
-    let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(q.max_limit);
-    let limit = usize::try_from(limit).unwrap_or(MAX_QUERY_LIMIT);
-    let parent = p.parent;
+    // 0018 rule 14). ADR 0051 rule 14: at most 200 with `fields`.
+    let fields = p.fields.is_some();
+    let mut limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(q.max_limit);
+    if fields {
+        limit = limit.min(MAX_FIELDS_LIMIT);
+    }
+    let mut plan = QueryPlan {
+        listings: vec![Listing {
+            parent: p.parent,
+            cursor: None,
+        }],
+        order: Order::Asc,
+        lower: start,
+        limit: usize::try_from(limit).unwrap_or(MAX_QUERY_LIMIT),
+        fields,
+    };
     let (ttl, clock) = (q.block_ttl_ms, q.clock);
     let page = q
         .index
         .read(move |index| {
             // ADR 0013 rule 14 (security review L-1): the expiry bound is read when the page is
             // built, after the wait in the reader queue, not when the request arrived.
-            let from = start.max(expiry_floor(ttl, clock()));
-            index.query(parent.as_ref(), from, limit)
+            plan.lower = start.max(expiry_floor(ttl, clock()));
+            index
+                .read_query(&plan)
+                .map(|mut a| a.pages.pop().unwrap_or_default())
         })
         .await;
     if let Ok(r) = &page {
@@ -583,6 +668,7 @@ mod tests {
                 next: at(9),
                 entries,
                 more,
+                fields: Vec::new(),
             };
             let body = page_body(5, &page);
             assert_eq!(body.len(), body.capacity(), "sized exactly");
@@ -597,6 +683,67 @@ mod tests {
                 expected
             );
             assert_eq!(body, expected.to_string().into_bytes());
+        }
+    }
+
+    /// ADR 0051 rules 13 and 14: `parents` and `lens` aligned with `block_ids`, in one buffer of
+    /// its exact size; the worst case of 200 entries with 8 parents and the longest lengths stays
+    /// under the 131,072-byte ceiling of `/query` (ADR 0029).
+    #[test]
+    fn page_body_with_fields() {
+        use crate::index::EntryFields;
+        let at = |n| Position { received_at: 3, n };
+        let f = |len, parents: &[u8]| EntryFields {
+            len,
+            parents: parents.iter().map(|b| BlockId([*b; 32])).collect(),
+        };
+        let page = Page {
+            entries: vec![
+                (at(0), BlockId([1; 32])),
+                (at(1), BlockId([2; 32])),
+                (at(2), BlockId([3; 32])),
+            ],
+            next: at(3),
+            more: true,
+            fields: vec![f(118, &[]), f(9, &[1]), f(65_909, &[2, 1])],
+        };
+        let body = page_body(5, &page);
+        assert_eq!(body.len(), body.capacity(), "sized exactly");
+        let hex = |b: u8| BlockId([b; 32]).to_string();
+        let expected = serde_json::json!({
+            "block_ids": [hex(1), hex(2), hex(3)],
+            "cursor": encode_cursor(5, page.next),
+            "lens": [118, 9, 65_909],
+            "more": true,
+            "parents": [[], [hex(1)], [hex(2), hex(1)]],
+        });
+        assert_eq!(body, expected.to_string().into_bytes());
+        let worst = Page {
+            entries: (0..200).map(|n| (at(n), BlockId([7; 32]))).collect(),
+            next: at(200),
+            more: true,
+            fields: (0..200)
+                .map(|_| f(65_909, &[1, 2, 3, 4, 5, 6, 7, 8]))
+                .collect(),
+        };
+        let body = page_body(5, &worst);
+        assert_eq!(body.len(), body.capacity());
+        assert!(body.len() < 131_072, "{}", body.len());
+    }
+
+    #[test]
+    fn fields_parameter() {
+        assert_eq!(parse("fields=parents").unwrap().fields, Some(true));
+        assert_eq!(parse("fields=lens"), Err(QueryError::MalformedFields));
+        assert_eq!(parse("fields="), Err(QueryError::MalformedFields));
+        assert_eq!(
+            parse("fields=parents&fields=parents"),
+            Err(QueryError::RepeatedParameter)
+        );
+        let q = format!("fields=parents&parent={H}");
+        assert_eq!(parse(&q), Err(QueryError::FieldsWithParent));
+        for e in [QueryError::MalformedFields, QueryError::FieldsWithParent] {
+            assert_eq!(e.to_api().name(), "InvalidParameter");
         }
     }
 

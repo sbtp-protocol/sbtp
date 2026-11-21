@@ -137,8 +137,9 @@ impl AcceptFailures {
 /// rule 23 and clarification N2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestClass {
-    /// Every request that is not `put` or `query`: `GET /block`, `/info`, a CORS preflight on any
-    /// path, an unknown path, any other method on a known path.
+    /// Every request that is not `put` or `query`: `GET /block`, `POST /blocks` (with the weight
+    /// of [`request_weight`], ADR 0051 rule 7), `/info`, a CORS preflight on any path, an
+    /// unknown path, any other method on a known path.
     Block,
     /// `GET` or `HEAD` (which the router answers as `GET`) of `/sbtp/v1/query`.
     Query,
@@ -157,6 +158,43 @@ impl RequestClass {
             (&Method::GET | &Method::HEAD, "/sbtp/v1/query") => Self::Query,
             _ => Self::Block,
         }
+    }
+}
+
+/// ADR 0051 rule 7: the identifiers a batch is charged for when it has no usable
+/// `Content-Length` (64 tokens).
+const BATCH_UNKNOWN_IDS: u64 = 256;
+
+/// The tokens of `req` at admission (ADR 0018 rule 21, amended by ADR 0051 rules 7 and 26), from
+/// its method, path and headers only; [`crate::limiter::Limiter::take_tokens`] caps them at the
+/// burst of the bucket.
+///
+/// - `POST /sbtp/v1/blocks`: `⌈N / 4⌉` tokens of the `block` bucket, `N = ⌈Content-Length /
+///   32⌉`, at least 1; 64 when the request has no `Content-Length` or also a
+///   `Transfer-Encoding` (the handler refuses both, after this charge).
+/// - `/query`: `⌈N / 8⌉` tokens of the `query` bucket, `N` the number of `parent=` pairs of the
+///   raw query string (bounded by the request line), 1 when there is none.
+/// - Every other request: 1 token.
+#[must_use]
+pub fn request_weight<B>(req: &Request<B>) -> u64 {
+    match (req.method(), req.uri().path()) {
+        (&Method::POST, crate::batch::PATH) => {
+            let headers = req.headers();
+            let length = headers
+                .get(header::CONTENT_LENGTH)
+                .filter(|_| !headers.contains_key(header::TRANSFER_ENCODING))
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let ids = length.map_or(BATCH_UNKNOWN_IDS, |l| l.div_ceil(32));
+            ids.div_ceil(4).max(1)
+        }
+        (&Method::GET | &Method::HEAD, "/sbtp/v1/query") => {
+            let parents = req.uri().query().map_or(0, |q| {
+                q.split('&').filter(|p| p.starts_with("parent=")).count()
+            });
+            (parents as u64).div_ceil(8).max(1)
+        }
+        _ => 1,
     }
 }
 
@@ -508,10 +546,13 @@ fn admit(
             );
         }
     };
-    // (c) One token of `class`, for every class: `block`, `query` and `put` (ADR 0018 rules 21
+    // (c) The tokens of `class` (one, or the weight of ADR 0051), for every class: `block`, `query` and `put` (ADR 0018 rules 21
     // and 29). A request refused here is not counted in flight (ADR 0020 rule 25). A request
     // attributed to the overflow key is counted on it (rule 24).
-    let slot_key = match limiter.take(key, class) {
+    // ADR 0051 rules 7 and 26: a batch and a `/query` with several parents take their weight,
+    // from the head only, before the body is read.
+    let tokens = request_weight(req);
+    let slot_key = match limiter.take_tokens(key, class, tokens) {
         Ok(k) => k,
         Err(retry_after_s) => {
             refuse(
@@ -959,6 +1000,71 @@ mod tests {
         f.consecutive = 0; // a successful accept
         assert_eq!(f.failed(&other), Some(ACCEPT_BACKOFF));
         assert_eq!(f.failed(&listed), None, "2 failures in a row");
+    }
+
+    /// ADR 0051 rules 7 and 26 (the planned `weights.json`): `N` → tokens, before any cap.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn request_weights() {
+        let batch = |len: Option<&str>, te: bool| {
+            let mut b = Request::builder()
+                .method(Method::POST)
+                .uri("/sbtp/v1/blocks");
+            if let Some(l) = len {
+                b = b.header(header::CONTENT_LENGTH, l);
+            }
+            if te {
+                b = b.header(header::TRANSFER_ENCODING, "chunked");
+            }
+            request_weight(&b.body(()).unwrap())
+        };
+        for (n, tokens) in [
+            (1u64, 1),
+            (4, 1),
+            (5, 2),
+            (8, 2),
+            (9, 3),
+            (255, 64),
+            (256, 64),
+        ] {
+            assert_eq!(batch(Some(&(n * 32).to_string()), false), tokens, "{n}");
+        }
+        // Every batch of N ids takes at least N / 4 tokens: at most 4 blocks per token.
+        for n in 1..=256u64 {
+            assert!(n <= 4 * batch(Some(&(n * 32).to_string()), false), "{n}");
+        }
+        assert_eq!(batch(Some("0"), false), 1, "at least one token");
+        assert_eq!(batch(Some("33"), false), 1, "⌈33 / 32⌉ = 2 ids");
+        assert_eq!(batch(None, false), 64, "no Content-Length");
+        assert_eq!(batch(Some("32"), true), 64, "chunked");
+        assert_eq!(
+            batch(Some("99999999999"), false),
+            781_250_000,
+            "capped by the limiter"
+        );
+        let query = |q: &str| {
+            let r = Request::builder()
+                .uri(format!("/sbtp/v1/query{q}"))
+                .body(())
+                .unwrap();
+            request_weight(&r)
+        };
+        let parents = |n: usize| {
+            let q: Vec<String> = (0..n).map(|k| format!("parent={k}")).collect();
+            format!("?{}", q.join("&"))
+        };
+        assert_eq!(query(""), 1);
+        assert_eq!(query("?limit=5"), 1);
+        for (n, tokens) in [(1, 1), (8, 1), (9, 2), (16, 2), (26, 4), (32, 4), (33, 5)] {
+            assert_eq!(query(&parents(n)), tokens, "{n}");
+        }
+        assert_eq!(query("?cursor=parent=x"), 1, "only pairs named parent");
+        let other = Request::builder()
+            .method(Method::GET)
+            .uri("/sbtp/v1/block/00")
+            .body(())
+            .unwrap();
+        assert_eq!(request_weight(&other), 1);
     }
 
     /// ADR 0020 rule 23 and clarification N2: the class comes from the exact method and path.

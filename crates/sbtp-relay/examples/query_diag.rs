@@ -37,7 +37,9 @@ use std::time::Instant;
 
 use common::{Mix, now_ms};
 use sbtp_core::BlockId;
-use sbtp_relay::index::{FileState, IndexBackend, MAX_QUERY_LIMIT, Page, Position, RedbIndex};
+use sbtp_relay::index::{
+    FileState, IndexBackend, MAX_QUERY_LIMIT, Page, Position, QueryAnswer, QueryPlan, RedbIndex,
+};
 
 type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -396,6 +398,21 @@ impl IndexBackend for MemIndex {
             entries,
             next,
             more,
+            fields: Vec::new(),
+        })
+    }
+
+    /// This diagnosis measures `asc` pages only (ADR 0013 step 2): each listing is one
+    /// [`IndexBackend::query`] page; `order`, `fields` and `head` are not modelled.
+    fn read_query(&self, plan: &QueryPlan) -> Result<QueryAnswer, Infallible> {
+        let mut pages = Vec::with_capacity(plan.listings.len());
+        for l in &plan.listings {
+            let from = plan.lower.max(l.cursor.unwrap_or_default());
+            pages.push(self.query(l.parent.as_ref(), from, plan.limit)?);
+        }
+        Ok(QueryAnswer {
+            pages,
+            head: Position::default(),
         })
     }
 

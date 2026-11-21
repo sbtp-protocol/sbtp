@@ -16,11 +16,12 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use http_body::Body as _;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use crate::batch::{self, BatchState, post_blocks};
 use crate::blocks::{Relay, get_block, put_block};
 use crate::config::{CorsOrigins, Settings};
 use crate::error::{ApiError, panic_response};
@@ -31,7 +32,8 @@ use crate::query::{QueryState, query};
 use crate::server::{RequestClass, RequestClient};
 
 /// The routes of the relay, without middleware: `/info`, `PUT /sbtp/v1/block`,
-/// `GET /sbtp/v1/block/{block_id}` and `GET /sbtp/v1/query` over `relay` and its index.
+/// `GET /sbtp/v1/block/{block_id}`, `POST /sbtp/v1/blocks` and `GET /sbtp/v1/query` over `relay`
+/// and its index.
 pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I>>) -> Router {
     let info = Bytes::from(info_body(settings));
     let queries = Router::new()
@@ -39,6 +41,10 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
         .with_state(Arc::new(
             QueryState::new(settings, relay.index().clone()).with_clock(relay.clock()),
         ));
+    // ADR 0051 rules 1 to 12.
+    let batches = Router::new()
+        .route(batch::PATH, post(post_blocks::<I>))
+        .with_state(Arc::new(BatchState::new(settings, Arc::clone(&relay))));
     let blocks = Router::new()
         .route("/sbtp/v1/block", put(put_block::<I>))
         .route("/sbtp/v1/block/{id}", get(get_block::<I>))
@@ -67,6 +73,7 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
             }),
         )
         .merge(blocks)
+        .merge(batches)
         .merge(queries)
         .fallback(|| async { ApiError::not_found() })
 }
@@ -152,7 +159,7 @@ pub fn app<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I>>)
     layered(routes(settings, relay), settings)
 }
 
-/// ADR 0012 rules 23 to 27. No credentials, whatever the setting (rule 26): `allow_credentials` is
+/// ADR 0012 rules 23 to 27, ADR 0051 rule 11 (`POST`). No credentials, whatever the setting (rule 26): `allow_credentials` is
 /// never called.
 /// The origins were validated, lowercased and converted to header values by the settings loader.
 fn cors(origins: &CorsOrigins) -> CorsLayer {
@@ -162,7 +169,7 @@ fn cors(origins: &CorsOrigins) -> CorsLayer {
     };
     CorsLayer::new()
         .allow_origin(allow)
-        .allow_methods([Method::GET, Method::PUT])
+        .allow_methods([Method::GET, Method::PUT, Method::POST])
         .allow_headers([header::CONTENT_TYPE])
         .max_age(Duration::from_secs(86_400))
         .expose_headers([header::LOCATION, header::RETRY_AFTER])

@@ -1048,13 +1048,11 @@ mod tests {
         ) -> Result<Option<crate::index::Position>, IndexError> {
             self.inner.contains(id)
         }
-        fn query(
+        fn read_query(
             &self,
-            p: Option<&sbtp_core::BlockId>,
-            from: crate::index::Position,
-            n: usize,
-        ) -> Result<crate::index::Page, IndexError> {
-            self.inner.query(p, from, n)
+            plan: &crate::index::QueryPlan,
+        ) -> Result<crate::index::QueryAnswer, IndexError> {
+            self.inner.read_query(plan)
         }
         fn expired(
             &self,

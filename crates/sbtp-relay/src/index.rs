@@ -176,12 +176,76 @@ pub struct Candidates {
 /// One page of `/query` (ADR 0012 rule 10), before JSON encoding.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Page {
-    /// Entries in acceptance order.
+    /// Entries in the order of the request: acceptance order with `asc`, newest first with
+    /// `desc`.
     pub entries: Vec<(Position, BlockId)>,
-    /// Where the next page starts.
+    /// The gap the next page starts from (ADR 0051 rule 16): the position right after the last
+    /// entry with `asc`, the position of the last (oldest) entry with `desc`; the gap the page
+    /// started from when it is empty.
     pub next: Position,
     /// At least one more matching entry existed when the page was built.
     pub more: bool,
+    /// With `fields=parents` (ADR 0051 rule 13): per entry, aligned with `entries`, its length
+    /// and its Parents Hashes in header order. Empty otherwise.
+    pub fields: Vec<EntryFields>,
+}
+
+/// The header data of one entry that `fields=parents` adds (ADR 0051 rule 13), from its
+/// `blocks` row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryFields {
+    /// The block's length in bytes.
+    pub len: u32,
+    /// Its Parents Hashes, in header order (0 to 8).
+    pub parents: Vec<BlockId>,
+}
+
+/// The order of a `/query` walk (ADR 0051 rule 15): the relay's store order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Order {
+    /// Oldest first (the default).
+    #[default]
+    Asc,
+    /// Newest first.
+    Desc,
+}
+
+/// One listing of a `/query` request: the children of `parent`, or every block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The parent, `None` for every block.
+    pub parent: Option<BlockId>,
+    /// The gap the listing starts from (ADR 0051 rule 16), decoded; `None` for the start of the
+    /// order (the oldest position with `asc`, the newest gap with `desc`).
+    pub cursor: Option<Position>,
+}
+
+/// What one `/query` request reads (ADR 0051 rules 15 to 25).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryPlan {
+    /// 1 to 32 listings, in request order.
+    pub listings: Vec<Listing>,
+    /// The order of every listing.
+    pub order: Order,
+    /// The first position any listing may return: the later of `since` and the expiry bound
+    /// (ADR 0012 rule 9, ADR 0013 rule 14). With `asc` a listing starts at the later of it and
+    /// its cursor; with `desc` it ends the walk (ADR 0051 rule 17).
+    pub lower: Position,
+    /// Entries per listing, clamped to `1..=MAX_QUERY_LIMIT`.
+    pub limit: usize,
+    /// `fields=parents`: fill [`Page::fields`] for the listing of every block (ADR 0051 rule
+    /// 14: never with a parent).
+    pub fields: bool,
+}
+
+/// The answer to a [`QueryPlan`]: one page per listing, in order, and `head`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct QueryAnswer {
+    /// One page per listing.
+    pub pages: Vec<Page>,
+    /// ADR 0051 rule 18: the gap after the newest position the index held in this read
+    /// transaction (any parent); `Position::default()` when it held none.
+    pub head: Position,
 }
 
 /// Index errors: redb errors, plus a stored row that does not decode (corrupt index).
@@ -307,10 +371,11 @@ pub trait IndexBackend: Send + Sync + Sized {
     /// Backend errors.
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, Self::Error>;
 
-    /// One `/query` page from `from` (the later of `since` and the cursor, already raised to the
-    /// expiry bound), by `parent` or over every block, at most `limit` entries (ADR 0012 rules 6
-    /// to 14). `limit` is clamped to `1..=MAX_QUERY_LIMIT`, so `more = true` always comes with at
-    /// least one entry and a cursor that moved.
+    /// One `asc` `/query` page from `from` (the later of `since` and the cursor, already raised
+    /// to the expiry bound), by `parent` or over every block, at most `limit` entries (ADR 0012
+    /// rules 6 to 14): [`IndexBackend::read_query`] with one listing. `limit` is clamped to
+    /// `1..=MAX_QUERY_LIMIT`, so `more = true` always comes with at least one entry and a cursor
+    /// that moved.
     ///
     /// # Errors
     ///
@@ -320,7 +385,28 @@ pub trait IndexBackend: Send + Sync + Sized {
         parent: Option<&BlockId>,
         from: Position,
         limit: usize,
-    ) -> Result<Page, Self::Error>;
+    ) -> Result<Page, Self::Error> {
+        let plan = QueryPlan {
+            listings: vec![Listing {
+                parent: parent.copied(),
+                cursor: None,
+            }],
+            order: Order::Asc,
+            lower: from,
+            limit,
+            fields: false,
+        };
+        Ok(self.read_query(&plan)?.pages.pop().unwrap_or_default())
+    }
+
+    /// Every listing of one `/query` request in one read transaction (ADR 0051 rules 15 to 25),
+    /// with the `head` of that transaction (rule 18). `O(log n + limit)` per listing, forward or
+    /// backward (rule 20). `plan.limit` is clamped to `1..=MAX_QUERY_LIMIT`.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn read_query(&self, plan: &QueryPlan) -> Result<QueryAnswer, Self::Error>;
 
     /// Up to `max` positions strictly before `before`, oldest first, each with the `block_id` it
     /// holds (rule 15: the sweeper deletes the cache entry and the file of that block). `max` is
@@ -646,57 +732,90 @@ impl IndexBackend for RedbIndex {
             .map(|g| Position::from_key(g.value())))
     }
 
-    /// One page of `/query` from `from`, at most `limit` entries (ADR 0012 rules 6 to 10): the
-    /// children of `parent` if given, else every block. `O(log n + limit)` (ADR 0012 rule 14).
-    /// The caller passes `from` already raised to the expiry bound (ADR 0013 rule 14).
+    /// Every listing of one `/query` request (ADR 0012 rules 6 to 10, ADR 0051 rules 15 to 25)
+    /// in one read transaction: the children of each `parent`, or every block, forward or
+    /// backward, `O(log n + limit)` each (ADR 0012 rule 14, ADR 0051 rule 20), and `head`, from
+    /// the last key of `blocks`. The caller passes `lower` already raised to the expiry bound
+    /// (ADR 0013 rule 14).
     ///
     /// # Errors
     ///
     /// redb errors, `CorruptRow`.
-    fn query(
-        &self,
-        parent: Option<&BlockId>,
-        from: Position,
-        limit: usize,
-    ) -> Result<Page, IndexError> {
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+    fn read_query(&self, plan: &QueryPlan) -> Result<QueryAnswer, IndexError> {
+        let limit = plan.limit.clamp(1, MAX_QUERY_LIMIT);
+        let desc = plan.order == Order::Desc;
         let txn = self.db.begin_read()?;
-        let mut entries = Vec::with_capacity(limit);
-        let mut more = false;
-        if let Some(parent) = parent.map(BlockId::as_bytes) {
-            let edges = txn.open_table(EDGES)?;
-            let range =
-                edges.range((parent, from.received_at, from.n)..=(parent, u64::MAX, u32::MAX))?;
-            for item in range {
-                let (k, v) = item?;
-                if entries.len() == limit {
-                    more = true;
-                    break;
+        let blocks = txn.open_table(BLOCKS)?;
+        let head = blocks.last()?.map_or_else(Position::default, |(k, _)| {
+            Position::from_key(k.value()).next()
+        });
+        let mut edges = None;
+        let mut pages = Vec::with_capacity(plan.listings.len());
+        for listing in &plan.listings {
+            // ADR 0051 rules 16 and 17: `asc` reads forward from the later of the lower bound
+            // and the cursor; `desc` reads backward from the cursor (the newest gap without one)
+            // down to the lower bound. An empty interval reads nothing.
+            let (from, upper) = if desc {
+                (plan.lower, listing.cursor.unwrap_or(head))
+            } else {
+                (plan.lower.max(listing.cursor.unwrap_or_default()), head)
+            };
+            let mut entries = Vec::with_capacity(limit);
+            let mut fields = Vec::new();
+            let more = if desc && from >= upper {
+                false
+            } else if let Some(parent) = listing.parent.as_ref().map(BlockId::as_bytes) {
+                let edges = match &mut edges {
+                    Some(t) => t,
+                    None => edges.insert(txn.open_table(EDGES)?),
+                };
+                let push = |k: &redb::AccessGuard<'_, (&Id, u64, u32)>,
+                            v: &redb::AccessGuard<'_, &Id>| {
+                    let (_, received_at, n) = k.value();
+                    entries.push((Position { received_at, n }, BlockId(*v.value())));
+                    Ok(())
+                };
+                let lo = (parent, from.received_at, from.n);
+                if desc {
+                    let hi = (parent, upper.received_at, upper.n);
+                    walk(edges.range(lo..hi)?.rev(), limit, push)?
+                } else {
+                    walk(edges.range(lo..=(parent, u64::MAX, u32::MAX))?, limit, push)?
                 }
-                let (_, received_at, n) = k.value();
-                entries.push((Position { received_at, n }, BlockId(*v.value())));
-            }
-        } else {
-            let blocks = txn.open_table(BLOCKS)?;
-            for item in blocks.range(from.key()..)? {
-                let (k, v) = item?;
-                if entries.len() == limit {
-                    more = true;
-                    break;
+            } else {
+                let push = |k: &redb::AccessGuard<'_, (u64, u32)>,
+                            v: &redb::AccessGuard<'_, &[u8]>| {
+                    let row = v.value();
+                    let id = row.get(..32).and_then(|b| Id::try_from(b).ok());
+                    entries.push((
+                        Position::from_key(k.value()),
+                        BlockId(id.ok_or(IndexError::CorruptRow)?),
+                    ));
+                    if plan.fields {
+                        fields.push(entry_fields(row)?);
+                    }
+                    Ok(())
+                };
+                if desc {
+                    walk(blocks.range(from.key()..upper.key())?.rev(), limit, push)?
+                } else {
+                    walk(blocks.range(from.key()..)?, limit, push)?
                 }
-                let id = v.value().get(..32).and_then(|b| Id::try_from(b).ok());
-                entries.push((
-                    Position::from_key(k.value()),
-                    BlockId(id.ok_or(IndexError::CorruptRow)?),
-                ));
-            }
+            };
+            let next = match (desc, entries.last()) {
+                (false, Some((p, _))) => p.next(),
+                (false, None) => from,
+                (true, Some((p, _))) => *p,
+                (true, None) => upper,
+            };
+            pages.push(Page {
+                entries,
+                next,
+                more,
+                fields,
+            });
         }
-        let next = entries.last().map_or(from, |(p, _)| p.next());
-        Ok(Page {
-            entries,
-            next,
-            more,
-        })
+        Ok(QueryAnswer { pages, head })
     }
 
     /// Up to `max` positions strictly before `before`, oldest first (sweeper, rule 15).
@@ -1089,6 +1208,50 @@ impl<'t> Tables<'t> {
 }
 
 /// One `demand_migration` line (security review 2026-11-21, I-4): `phase`, then `fields`.
+/// Reads `range`, in the order it yields, into `push`: at most `limit` items. Returns whether
+/// one more item existed (`more`, ADR 0012 rule 10).
+fn walk<'a, K, V, R, F>(range: R, limit: usize, mut push: F) -> Result<bool, IndexError>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+    R: Iterator<
+        Item = Result<(redb::AccessGuard<'a, K>, redb::AccessGuard<'a, V>), redb::StorageError>,
+    >,
+    F: FnMut(&redb::AccessGuard<'a, K>, &redb::AccessGuard<'a, V>) -> Result<(), IndexError>,
+{
+    for (n, item) in range.enumerate() {
+        let (k, v) = item?;
+        if n == limit {
+            return Ok(true);
+        }
+        push(&k, &v)?;
+    }
+    Ok(false)
+}
+
+/// ADR 0051 rule 13: the length and the parents of a `blocks` row (`block_id` ‖ length ‖
+/// parents, written by [`RedbIndex`]'s insert from a validated block).
+fn entry_fields(row: &[u8]) -> Result<EntryFields, IndexError> {
+    let len = row
+        .get(32..ROW_HEAD)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .ok_or(IndexError::CorruptRow)?;
+    let rest = row.get(ROW_HEAD..).ok_or(IndexError::CorruptRow)?;
+    if rest.len() % 32 != 0 || rest.len() / 32 > usize::from(sbtp_core::layout::MAX_PARENTS) {
+        return Err(IndexError::CorruptRow);
+    }
+    let parents = rest
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|c| BlockId(*c))
+        .collect();
+    Ok(EntryFields {
+        len: u32::from_be_bytes(len),
+        parents,
+    })
+}
+
 fn migration_line(phase: &'static str, fields: &[(&'static str, Value<'_>)]) {
     let mut all = vec![("phase", Value::Str(phase))];
     all.extend_from_slice(fields);

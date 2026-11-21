@@ -16,7 +16,7 @@ use common::{
     settings, tmp_dir,
 };
 use sbtp_core::{BlockBuilder, BlockId, SigningKey};
-use sbtp_relay::index::{FileState, IndexBackend, IndexError, Page, Position, RedbIndex};
+use sbtp_relay::index::{FileState, IndexBackend, IndexError, Position, RedbIndex};
 use sbtp_relay::store::{Store, StoreError, Stored, TREE_CHARGE, cost, index_reserve, reconcile};
 
 const LIMIT: usize = sbtp_core::layout::MAX_BLOCK_LEN;
@@ -856,13 +856,11 @@ impl IndexBackend for SlowIndex {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.inner.contains(id)
     }
-    fn query(
+    fn read_query(
         &self,
-        parent: Option<&BlockId>,
-        from: Position,
-        limit: usize,
-    ) -> Result<Page, IndexError> {
-        self.inner.query(parent, from, limit)
+        plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
+        self.inner.read_query(plan)
     }
     fn expired(
         &self,

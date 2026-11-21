@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use common::{TestServer, get as http_get, put_block, settings, signed_block, tmp_dir};
 use sbtp_core::BlockId;
-use sbtp_relay::index::{FileState, IndexBackend, IndexError, Page, Position, RedbIndex};
+use sbtp_relay::index::{FileState, IndexBackend, IndexError, Position, RedbIndex};
 use sbtp_relay::log::{self, LogConfig};
 use sbtp_relay::metrics::{self, IndexReadOp};
 
@@ -74,13 +74,16 @@ impl IndexBackend for FailingQueries {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.0.contains(id)
     }
-    fn query(&self, p: Option<&BlockId>, from: Position, n: usize) -> Result<Page, IndexError> {
+    fn read_query(
+        &self,
+        plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
         match FAIL.load(Ordering::SeqCst) {
             1 => Err(IndexError::Db(redb::Error::Io(
                 std::io::Error::from_raw_os_error(EIO),
             ))),
             2 => Err(IndexError::CorruptRow),
-            _ => self.0.query(p, from, n),
+            _ => self.0.read_query(plan),
         }
     }
     fn expired(

@@ -19,7 +19,7 @@ use common::{
     Response, TestServer, get as http_get, now_ms as unix_ms, put_block as put, settings, tmp_dir,
 };
 use sbtp_core::{BlockBuilder, BlockId, SigningKey};
-use sbtp_relay::index::{FileState, IndexBackend, IndexError, Page, Position, RedbIndex};
+use sbtp_relay::index::{FileState, IndexBackend, IndexError, Position, RedbIndex};
 use sbtp_relay::metrics::{self, Damage};
 use sbtp_relay::store::{
     QUARANTINE_MAX_FILES, QUARANTINE_RETENTION_MS, Quarantine, Reconciled, Store, TREE_CHARGE,
@@ -722,8 +722,11 @@ impl IndexBackend for Recording {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.inner.contains(id)
     }
-    fn query(&self, p: Option<&BlockId>, from: Position, n: usize) -> Result<Page, IndexError> {
-        self.inner.query(p, from, n)
+    fn read_query(
+        &self,
+        plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
+        self.inner.read_query(plan)
     }
     fn expired(
         &self,
@@ -831,13 +834,11 @@ impl IndexBackend for FullIndex {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.inner.contains(id)
     }
-    fn query(
+    fn read_query(
         &self,
-        parent: Option<&BlockId>,
-        from: Position,
-        limit: usize,
-    ) -> Result<Page, IndexError> {
-        self.inner.query(parent, from, limit)
+        plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
+        self.inner.read_query(plan)
     }
     fn expired(
         &self,

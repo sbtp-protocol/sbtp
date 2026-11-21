@@ -40,6 +40,18 @@ Initial public version. Pre-release software: no version is supported for produc
   resource limits and admission control, structured logs and metrics, store integrity checks;
   distroless container image and reverse-proxy guidance in `deploy/`.
 - `sbtp-l2`: validation of the layer 2 grammar.
+- `sbtp-relay`, ADR 0051 stage 1 (read API for large graphs): `POST /sbtp/v1/blocks`, a batch read
+  of 1 to 256 raw identifiers (body of at most 8,192 bytes with `Content-Length`; chunked or
+  unannounced bodies get `400` and the connection closed), answered `no-store` with one
+  length-prefixed record per identifier in request order (`0` when not served), streamed one block
+  at a time through the read path of `GET /block`, ending after a complete record at 1 MiB, at
+  half of `request_timeout_ms` or when a later read is refused; it costs `⌈N / 4⌉` `block` tokens
+  at admission (64 without `Content-Length`, capped at the burst), counts each served block as
+  demand once per epoch, none with `Sbtp-Replication: 1` (which also gets `CDN-Cache-Control:
+  no-store`); CORS allows `POST`. `/query?fields=parents` adds `parents` and `lens` aligned with
+  `block_ids`, pages of at most 200, refused with `parent`. Counters `batch_requests_total`,
+  `batch_records_total{result}` and `batch_cut_total{reason}`; the route label
+  `/sbtp/v1/blocks`. `read_api` is not published yet (stage 2).
 - `sbtp-core`: the inner signature of a sealed payload (`l2-grammar.md` §5.3): typed builder
   `sealed_sig_message` (into a caller buffer, no allocation), `sign_sealed`, and `verify_sealed` with the
   strict criteria V1 to V6 (`SealedSigError`); the layer 2 registry constants `SEALED_HPKE_INFO`,

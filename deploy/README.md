@@ -513,6 +513,16 @@ documentation and source read through Context7 on 2026-11-20):
     and one upper tier, ADR 0046 rule 17); with more, turn demand eviction off. `/sbtp/v1/info`
     and `/sbtp/v1/query` are always bypassed: `/info` is `no-store`, and a cached `/query` page
     would hide new blocks.
+  - The batch read `POST /sbtp/v1/blocks` (ADR 0051) is never cached: write the cache rule on the
+    path `/sbtp/v1/block/` with its trailing slash (for example `starts_with(http.request.uri.path,
+    "/sbtp/v1/block/")` and `http.request.method eq "GET"`), never a prefix such as
+    `/sbtp/v1/block*`, which also matches `/sbtp/v1/blocks`. Cloudflare does not cache `POST`
+    anyway, and the relay answers it `no-store`; the rule keeps the batch out of "Eligible for
+    cache" whatever a later plan does. Its response is streamed (chunked, up to 1 MiB) and its
+    request is a raw binary body of at most 8,192 bytes with `Content-Length`: no WAF rule or
+    Transform Rule may buffer, rewrite or re-encode it. A batch costs the client `⌈N / 4⌉`
+    `block` tokens at the relay, so an edge rate limit on `/sbtp/v1/blocks`, if any, counts
+    requests, not blocks.
   - **Turning demand eviction on.** A relay that served blocks with `demand_eviction = false` sent
     a one-year shared lifetime, and the CDN may serve those entries for a year without asking the
     relay, so their demand never reaches it. Restart the relay with `demand_eviction = true` first,

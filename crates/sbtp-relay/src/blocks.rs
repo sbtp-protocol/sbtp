@@ -1100,33 +1100,73 @@ pub async fn get_block<I: IndexBackend + 'static>(
             .with_message("block_id must be 64 lowercase hexadecimal characters")
             .into_response();
     };
-    if let Some(bytes) = relay.cache.get(&id) {
-        return relay.block_response(bytes, &id, &headers);
-    }
-    let permit = match relay.read.acquire().await {
-        Ok(p) => p,
-        Err(r) => return relay.shed(r, None),
-    };
-    // Read before the file is: see `Relay::cache_loaded`.
-    let evicted = relay.evicted_generation(&id);
-    let worker = Arc::clone(&relay);
-    let loaded = tokio::task::spawn_blocking(move || {
-        let _owned = permit;
-        worker.load(&id)
-    })
-    .await;
-    match loaded {
-        Ok(Ok(Some(bytes))) => {
-            relay.cache_loaded(&id, bytes.clone(), evicted);
-            relay.block_response(bytes, &id, &headers)
-        }
-        Ok(Ok(None)) => ApiError::not_found().into_response(),
-        Ok(Err(())) => ApiError::internal().into_response(),
-        Err(e) => ApiError::from(e).into_response(),
+    match Arc::clone(&relay).fetch(id).await {
+        Fetched::Served(bytes) => relay.block_response(bytes, &id, &headers),
+        Fetched::Missing => ApiError::not_found().into_response(),
+        Fetched::Busy(r) => relay.shed(r, None),
+        Fetched::Failed => ApiError::internal().into_response(),
     }
 }
 
+/// The outcome of the read path of one block ([`Relay::fetch`]), shared by `GET /block` and the
+/// records of `POST /blocks` (ADR 0051 rule 5).
+#[derive(Debug)]
+pub(crate) enum Fetched {
+    /// The block, from the cache or from a file that passed full validation and R1 (ADR 0023
+    /// rules 10 and 11): `200`.
+    Served(Bytes),
+    /// Not held, or damaged and moved to quarantine: `404`.
+    Missing,
+    /// The block read queue is full or the wait expired: `503`.
+    Busy(Refused),
+    /// An I/O error while reading, or a failed blocking task: `500`.
+    Failed,
+}
+
 impl<I: IndexBackend + 'static> Relay<I> {
+    /// The read path of `GET /block` without its response (ADR 0023 rules 10 and 11): a cache hit
+    /// takes no permit and verifies nothing; a miss takes a block-read permit, in which the file
+    /// is read and fully validated as one job of the blocking threads, and is cached.
+    pub(crate) async fn fetch(self: Arc<Self>, id: BlockId) -> Fetched {
+        if let Some(bytes) = self.cache.get(&id) {
+            return Fetched::Served(bytes);
+        }
+        let permit = match self.read.acquire().await {
+            Ok(p) => p,
+            Err(r) => return Fetched::Busy(r),
+        };
+        // Read before the file is: see `Relay::cache_loaded`.
+        let evicted = self.evicted_generation(&id);
+        let worker = Arc::clone(&self);
+        let loaded = tokio::task::spawn_blocking(move || {
+            let _owned = permit;
+            worker.load(&id)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(Some(bytes))) => {
+                self.cache_loaded(&id, bytes.clone(), evicted);
+                Fetched::Served(bytes)
+            }
+            Ok(Ok(None)) => Fetched::Missing,
+            Ok(Err(())) | Err(_) => Fetched::Failed,
+        }
+    }
+
+    /// A demand of `id`, a held block just served (ADR 0046 rule 10), into the demand set.
+    pub(crate) fn served(&self, id: &BlockId) {
+        self.demand.touch(id, (self.clock)());
+    }
+
+    /// The `503` of a refused permit, counted and logged (throttled).
+    pub(crate) fn shed_response(&self, r: Refused) -> Response {
+        self.shed(r, None)
+    }
+
+    /// `body_timeout_ms` (ADR 0018 rule 24).
+    pub(crate) fn body_timeout(&self) -> Duration {
+        self.body_timeout
+    }
     /// The `200` of a held block, or the `304` when `request` holds a matching `If-None-Match`.
     /// Either is a demand of the block (ADR 0046 rule 10), recorded in the demand set, never in
     /// the index (rule 12).
@@ -1152,7 +1192,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
 }
 
 /// ADR 0048 rule 18: whether `request` carries `Sbtp-Replication: 1` (exactly `1`, any field line).
-fn is_replication(request: &HeaderMap) -> bool {
+pub(crate) fn is_replication(request: &HeaderMap) -> bool {
     request
         .get_all("sbtp-replication")
         .iter()

@@ -1,0 +1,404 @@
+//! ADR 0051 over real HTTP: the batch read `POST /sbtp/v1/blocks` (framing, missing blocks,
+//! the 1 MiB prefix, malformed bodies, weight at admission, `Sbtp-Replication`, CORS) and the
+//! `/query` additions (`fields=parents`).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+
+mod common;
+
+use std::io::Write;
+use std::net::TcpStream;
+
+use axum::Router;
+use common::{Response, TestServer, get, put_block, read_response, settings, signed_block};
+use sbtp_core::BlockId;
+
+fn start(pairs: &[(&str, &str)]) -> TestServer {
+    let mut all = vec![("MIN_POW_DIFFICULTY", "0")];
+    all.extend_from_slice(pairs);
+    TestServer::start(&settings(&all), Router::new())
+}
+
+/// Stores a block with `payload` and `parents`; its bytes and identifier.
+fn store(c: &mut TcpStream, payload: &[u8], parents: &[BlockId]) -> (Vec<u8>, BlockId) {
+    let bytes = signed_block(payload, parents);
+    let id = sbtp_core::parse(&bytes).unwrap().block_id();
+    let r = put_block(c, &bytes);
+    assert!(r.status == 201 || r.status == 200, "{}", r.status);
+    (bytes, id)
+}
+
+fn body_of(ids: &[BlockId]) -> Vec<u8> {
+    ids.iter().flat_map(|id| id.0).collect()
+}
+
+/// `POST /sbtp/v1/blocks` with `body` and extra header lines.
+fn batch(c: &mut TcpStream, body: &[u8], extra: &str) -> Response {
+    c.write_all(
+        format!(
+            "POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\n\
+             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n{extra}\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    c.write_all(body).unwrap();
+    read_response(c).unwrap()
+}
+
+/// The records of a batch body (rule 2); panics on a body that ends inside a record.
+fn records(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        let len = u32::from_be_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        assert!(len <= 65_909, "rule 2");
+        at += 4;
+        out.push(body[at..at + len].to_vec());
+        at += len;
+    }
+    assert_eq!(at, body.len(), "the body ends after a complete record");
+    out
+}
+
+fn unknown(n: u8) -> BlockId {
+    BlockId([n; 32])
+}
+
+/// Rules 1, 2 and 5: one record per identifier, in request order, the exact stored bytes, and
+/// `length = 0` for a block the relay does not hold; `200`, `application/octet-stream`,
+/// `no-store`; no `CDN-Cache-Control` outside replication.
+#[test]
+fn records_follow_the_request_order() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    let (a, ida) = store(&mut c, b"batch a", &[]);
+    let (b, idb) = store(&mut c, b"batch b", &[ida]);
+    let ids = [idb, unknown(1), ida, unknown(2)];
+    let r = batch(&mut c, &body_of(&ids), "");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("application/octet-stream"));
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("cdn-cache-control"), None);
+    assert_eq!(records(&r.body), vec![b, Vec::new(), a, Vec::new()]);
+    // Only unknown identifiers: still `200`, every record empty.
+    let r = batch(&mut c, &body_of(&[unknown(3)]), "");
+    assert_eq!((r.status, r.body.as_slice()), (200, &[0u8, 0, 0, 0][..]));
+    // Rule 10: `If-None-Match` is ignored.
+    let r = batch(
+        &mut c,
+        &body_of(&[ida]),
+        &format!("If-None-Match: \"{ida}\"\r\n"),
+    );
+    assert_eq!(r.status, 200);
+    // The connection stays usable.
+    assert_eq!(get(&mut c, "/sbtp/v1/info", "").status, 200);
+}
+
+/// Rule 1: an empty body, a length that is not a multiple of 32 and a duplicate get `400`
+/// `InvalidParameter`; more than 256 identifiers get `413` before the body is read; a request
+/// without `Content-Length`, or chunked, gets `400` and its connection is closed.
+#[test]
+fn malformed_bodies_are_refused() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    let (_, id) = store(&mut c, b"dup", &[]);
+    for body in [
+        Vec::new(),
+        vec![7u8; 33],
+        vec![7u8; 31],
+        body_of(&[id, unknown(9), id]),
+    ] {
+        let r = batch(&mut c, &body, "");
+        assert_eq!(r.status, 400, "{}", body.len());
+        assert_eq!(r.json()["error"], "InvalidParameter");
+    }
+    // 257 identifiers: `413` on the head alone.
+    let mut c = relay.connect();
+    c.write_all(
+        b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\nContent-Length: 8224\r\n\r\n",
+    )
+    .unwrap();
+    let r = read_response(&mut c).unwrap();
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (413, "BodyTooLarge".into())
+    );
+    assert!(common::is_closed(&mut c));
+    // Exactly 256: accepted.
+    let ids: Vec<BlockId> = (0..=255u8).map(|n| BlockId([n; 32])).collect();
+    let mut c = relay.connect();
+    let r = batch(&mut c, &body_of(&ids), "");
+    assert_eq!(r.status, 200);
+    assert_eq!(records(&r.body).len(), 256);
+    // No `Content-Length`.
+    let mut c = relay.connect();
+    c.write_all(b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+        .unwrap();
+    let r = read_response(&mut c).unwrap();
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, "InvalidParameter".into())
+    );
+    assert_eq!(r.header("connection"), Some("close"));
+    // Chunked, with a valid identifier inside: refused before the body is read.
+    let mut c = relay.connect();
+    c.write_all(
+        b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n",
+    )
+    .unwrap();
+    c.write_all(&id.0).unwrap();
+    c.write_all(b"\r\n0\r\n\r\n").unwrap();
+    let r = read_response(&mut c).unwrap();
+    assert_eq!(r.status, 400);
+    assert_eq!(r.header("connection"), Some("close"));
+}
+
+/// Rules 3 and 4: the relay never starts a record that would bring the body above 1,048,576
+/// bytes; the body is then a prefix of the full answer, with at least one record, and the client
+/// asks again for the rest.
+#[test]
+fn a_full_body_stops_at_one_mebibyte() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    let blocks: Vec<(Vec<u8>, BlockId)> = (0..17u8)
+        .map(|n| {
+            let mut payload = vec![n; 65_535];
+            payload[0] = n;
+            store(&mut c, &payload, &[])
+        })
+        .collect();
+    let len = blocks[0].0.len();
+    let fit = 1_048_576 / (4 + len);
+    assert!(fit < 17, "the request exceeds the ceiling");
+    let ids: Vec<BlockId> = blocks.iter().map(|b| b.1).collect();
+    let r = batch(&mut c, &body_of(&ids), "");
+    assert_eq!(r.status, 200);
+    assert!(r.body.len() <= 1_048_576);
+    let got = records(&r.body);
+    assert_eq!(got.len(), fit);
+    for (k, rec) in got.iter().enumerate() {
+        assert_eq!(rec, &blocks[k].0, "a prefix of the request, in order");
+    }
+    // The rest, asked again.
+    let r = batch(&mut c, &body_of(&ids[fit..]), "");
+    let rest = records(&r.body);
+    assert_eq!(rest.len(), 17 - fit);
+    assert_eq!(rest[0], blocks[fit].0);
+}
+
+/// Rule 9: a copy gets `Cache-Control: no-store` and `CDN-Cache-Control: no-store`.
+#[test]
+fn replication_requests_are_not_cached() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    let (a, ida) = store(&mut c, b"copy", &[]);
+    let r = batch(&mut c, &body_of(&[ida]), "Sbtp-Replication: 1\r\n");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("cdn-cache-control"), Some("no-store"));
+    assert_eq!(records(&r.body), vec![a]);
+}
+
+/// Rule 11: a preflight for `POST` from an allowed origin is answered with `POST` allowed.
+#[test]
+fn preflight_allows_post() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    let r = common::exchange(
+        &mut c,
+        "OPTIONS /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\nOrigin: https://app.example\r\n\
+         Access-Control-Request-Method: POST\r\n\
+         Access-Control-Request-Headers: content-type\r\n\r\n",
+    );
+    assert_eq!(r.status, 200);
+    let methods = r.header("access-control-allow-methods").unwrap();
+    assert!(
+        methods.contains("POST") && methods.contains("PUT"),
+        "{methods}"
+    );
+}
+
+/// Rule 7: `⌈N / 4⌉` tokens of the `block` bucket at admission, from `Content-Length`, before
+/// the body is read; 64 (capped at the burst) without `Content-Length`. With a burst of 10 and a
+/// refill of 1 per minute: five batches of 8 identifiers (2 tokens each) pass, the next request
+/// of the bucket gets `429`.
+#[test]
+fn weight_is_taken_at_admission() {
+    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let mut c = relay.connect();
+    let ids: Vec<BlockId> = (0..8u8).map(unknown).collect();
+    for k in 0..5 {
+        assert_eq!(batch(&mut c, &body_of(&ids), "").status, 200, "{k}");
+    }
+    let r = batch(&mut c, &body_of(&ids[..1]), "");
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (429, "RateLimited".into())
+    );
+
+    // A head without `Content-Length` takes the whole burst of a fresh client.
+    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let mut c = relay.connect();
+    c.write_all(b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut c).unwrap().status, 400);
+    let mut c = relay.connect();
+    assert_eq!(get(&mut c, "/sbtp/v1/info", "").status, 429);
+
+    // A batch heavier than what is left is refused whole before its body is read.
+    let relay = start(&[("RATE_BLOCK_BURST", "10"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let mut c = relay.connect();
+    let many: Vec<BlockId> = (0..36u8).map(unknown).collect(); // 9 tokens
+    assert_eq!(batch(&mut c, &body_of(&many), "").status, 200);
+    let mut c = relay.connect();
+    c.write_all(
+        b"POST /sbtp/v1/blocks HTTP/1.1\r\nHost: relay.test\r\nContent-Length: 256\r\n\r\n",
+    )
+    .unwrap();
+    let r = read_response(&mut c).unwrap();
+    assert_eq!(r.status, 429, "2 tokens needed, 1 left");
+    let mut c = relay.connect();
+    assert_eq!(
+        get(&mut c, "/sbtp/v1/info", "").status,
+        200,
+        "the last token"
+    );
+}
+
+/// Rule 7 and "Weights": the same tokens never buy more than 4 times the blocks single `GET`s
+/// would, while `rate_block_burst` is at least 64 (every profile: 200 to 600). With a burst of
+/// 64 and a refill of 1 per minute, single `GET`s serve 64 blocks; batches serve at most 256,
+/// whatever their sizes. Below a burst of 64 the cap of rule 7 lets a batch cost the whole
+/// burst only, so the ratio grows (shown last).
+#[test]
+fn batches_buy_at_most_four_times_the_single_gets() {
+    let burst = 64usize;
+    let pairs = [
+        ("RATE_BLOCK_BURST", "64"),
+        ("RATE_BLOCK_PER_MIN", "1"),
+        ("RATE_PUT_BURST", "1000"),
+        ("RATE_PUT_PER_MIN", "1000000"),
+    ];
+    let fresh = |pairs: &[(&str, &str)]| {
+        let relay = start(pairs);
+        let mut c = relay.connect();
+        let ids: Vec<BlockId> = (0..300u32)
+            .map(|n| store(&mut c, format!("ratio {n}").as_bytes(), &[]).1)
+            .collect();
+        (relay, ids)
+    };
+    let (relay, ids) = fresh(&pairs);
+    let mut c = relay.connect();
+    let mut single = 0;
+    for id in &ids {
+        match get(&mut c, &format!("/sbtp/v1/block/{id}"), "").status {
+            200 => single += 1,
+            429 => break,
+            s => panic!("{s}"),
+        }
+    }
+    assert_eq!(single, burst);
+    for size in [1usize, 3, 5, 64, 255, 256] {
+        let (relay, ids) = fresh(&pairs);
+        let mut c = relay.connect();
+        let mut served = 0;
+        'outer: for _ in 0..300 {
+            for chunk in ids.chunks(size) {
+                let r = batch(&mut c, &body_of(chunk), "");
+                if r.status == 429 {
+                    break 'outer;
+                }
+                assert_eq!(r.status, 200);
+                served += records(&r.body).iter().filter(|r| !r.is_empty()).count();
+            }
+        }
+        assert!(
+            served <= 4 * burst,
+            "size {size}: {served} blocks for {burst} tokens"
+        );
+        assert!(served >= burst, "size {size}: {served}");
+    }
+    // Rule 7 caps the weight at the burst: with a burst of 16, 256 identifiers cost 16 tokens.
+    let (relay, ids) = fresh(&[("RATE_BLOCK_BURST", "16"), ("RATE_BLOCK_PER_MIN", "1")]);
+    let mut c = relay.connect();
+    let r = batch(&mut c, &body_of(&ids[..256]), "");
+    assert_eq!(records(&r.body).len(), 256);
+    let mut c = relay.connect();
+    assert_eq!(get(&mut c, "/sbtp/v1/info", "").status, 429);
+}
+
+/// ADR 0051 rules 13 and 14: `fields=parents` adds `parents` and `lens`, aligned with
+/// `block_ids`; the page holds at most 200 entries; `fields` is refused with `parent` and with
+/// any other value.
+#[test]
+fn fields_parents_are_aligned() {
+    let relay = start(&[("RATE_PUT_BURST", "1000")]);
+    let mut c = relay.connect();
+    let (ra, a) = store(&mut c, b"root a", &[]);
+    let (rb, b) = store(&mut c, b"root b", &[]);
+    let (rc, cc) = store(&mut c, b"child", &[b, a]);
+    let r = get(&mut c, "/sbtp/v1/query?fields=parents", "");
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    let ids: Vec<String> = [a, b, cc].iter().map(ToString::to_string).collect();
+    assert_eq!(v["block_ids"], serde_json::json!(ids));
+    assert_eq!(
+        v["parents"],
+        serde_json::json!([[], [], [b.to_string(), a.to_string()]]),
+        "header order"
+    );
+    assert_eq!(v["lens"], serde_json::json!([ra.len(), rb.len(), rc.len()]));
+    // Pages of the walk stay aligned.
+    let r = get(&mut c, "/sbtp/v1/query?fields=parents&limit=2", "");
+    let v = r.json();
+    assert_eq!(v["block_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(v["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(v["lens"].as_array().unwrap().len(), 2);
+    assert_eq!(v["more"], true);
+    let next = format!(
+        "/sbtp/v1/query?fields=parents&limit=2&cursor={}",
+        v["cursor"].as_str().unwrap()
+    );
+    let v = get(&mut c, &next, "").json();
+    assert_eq!(v["block_ids"], serde_json::json!([cc.to_string()]));
+    assert_eq!(v["lens"], serde_json::json!([rc.len()]));
+    // Without `fields`, no extra member.
+    let v = get(&mut c, "/sbtp/v1/query", "").json();
+    assert!(v.get("parents").is_none() && v.get("lens").is_none(), "{v}");
+    for q in [
+        format!("fields=parents&parent={a}"),
+        format!("parent={a}&fields=parents"),
+        "fields=lens".to_owned(),
+        "fields=".to_owned(),
+        "fields=parents&fields=parents".to_owned(),
+    ] {
+        let r = get(&mut c, &format!("/sbtp/v1/query?{q}"), "");
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (400, "InvalidParameter".into()),
+            "{q}"
+        );
+    }
+}
+
+/// Rule 14: with `fields=parents` the page is at most 200 entries, whatever `limit`.
+#[test]
+fn fields_pages_are_capped_at_200() {
+    let relay = start(&[("RATE_PUT_BURST", "1000")]);
+    let mut c = relay.connect();
+    for n in 0..205u32 {
+        store(&mut c, format!("cap {n}").as_bytes(), &[]);
+    }
+    let v = get(&mut c, "/sbtp/v1/query?fields=parents&limit=1000", "").json();
+    assert_eq!(v["block_ids"].as_array().unwrap().len(), 200);
+    assert_eq!(v["lens"].as_array().unwrap().len(), 200);
+    assert_eq!(v["more"], true);
+    let v = get(&mut c, "/sbtp/v1/query?limit=1000", "").json();
+    assert_eq!(v["block_ids"].as_array().unwrap().len(), 205);
+}
