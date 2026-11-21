@@ -309,11 +309,18 @@ path prefix. The routes of this section are under it. (ADR 0030)
   `Content-Type: application/octet-stream`. An empty body, a length that is not a multiple of 32 or a
   duplicate gets `400` (`InvalidParameter`); a body over 8,192 bytes gets `413` (`BodyTooLarge`) before
   it is read. The request changes nothing and is safe to repeat.
+- A request without `Content-Length`, or with any `Transfer-Encoding`, is charged 64 tokens at
+  admission (see "Admission control"), then gets `400` (`InvalidParameter`) with `Connection: close`;
+  the relay closes the connection before it reads the body. (ADR 0051, clarification B1)
 - Response: `200`, `application/octet-stream`, `Cache-Control: no-store`. One record per requested
   identifier, in request order: `length` (u32, big-endian) then `length` bytes of the block.
   `length = 0`: the block is not served. The relay serves only bytes it would serve with `GET /block`
   and MAY end the body after any complete record (at least one); the client requests the rest again. A
-  relay MUST NOT start a record that brings the body above 1,048,576 bytes.
+  relay MUST NOT start a record that brings the body above 1,048,576 bytes, nor once half of its
+  request time limit has passed. (ADR 0051, clarification B3)
+- When the first record cannot be read, the relay answers as `GET /block` would (`503` when busy,
+  `500` on an I/O error). A later record that cannot be read ends the body before it. `length = 0`
+  means only that the block is not served, never an error. (ADR 0051, clarification B5)
 - The recipient checks each record as a requested block (§3.4, R1 against the identifier at that
   position). A `length` above 65,909 makes the response a failed request. A body that ends inside a
   record is a failed request; the complete records before it MAY be used.
@@ -321,6 +328,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
   `CDN-Cache-Control: no-store`. `If-None-Match` does not apply.
 - `GET /block` is the cacheable form. A client SHOULD use it for the blocks of a view and SHOULD use
   batches for walks and bulk fetches. A `read_only` URL has no batch route. (ADR 0051)
+- A shared cache MUST NOT store a batch response. A cache rule for blocks in front of a relay MUST
+  match the prefix `/sbtp/v1/block/` with its trailing slash, so that it never matches
+  `/sbtp/v1/blocks`. (ADR 0051, clarification B9)
 
 ### `GET /sbtp/v1/info`
 
@@ -410,12 +420,18 @@ path prefix. The routes of this section are under it. (ADR 0030)
   - `more`: `true` if at least one more matching block existed when the response was built.
   - `head`: always present, a cursor for the gap after the newest position held when the response was
     built. `asc` from `head` returns exactly the matching blocks stored since. (ADR 0051)
+  - An empty `desc` page returns as `cursor` the gap it started from: the cursor sent, or `head` when
+    the request had no cursor for that listing. (ADR 0051, clarification B4)
 - With two or more `parent`, the body is `{ "parents": [ {"parent", "block_ids", "cursor", "more"} … ],
   "head" }`, one entry per requested parent in request order, each with the meaning of a single-parent
   response. A grouped request is one index read. (ADR 0051)
 - A listing is complete when its `more` is `false`. A client that derives state from the absence of a
   block MUST use only complete listings, MUST NOT present a listing that ended with `more = true` as
   complete, and keeps `head` to poll the shown parents. (ADR 0051)
+- Over several relays, a listing is complete only when every relay of the client's list was asked and
+  returned a complete listing. A relay skipped because it lacks `read_api` ≥ 2 counts as not asked. A
+  client that merges `fields` hints from several relays MUST take, for each `block_id`, the union of
+  the parents they list: a hint can only add a fetch. (ADR 0051, clarification B8)
 - A request with no match gets `200` and an empty `block_ids`, an unknown `parent` included. A relay MUST
   NOT answer `404`.
 - To read all children of a block, a client repeats the request with the returned `cursor` until `more`
@@ -487,8 +503,11 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
   or in requests in flight. The relay answers before reading the body and SHOULD send `Retry-After` in
   seconds. A relay counts clients by address; an IPv6 /64, or the users of one shared address, are one
   client. A client SHOULD keep at most 8 requests in flight per relay. A `/query` request takes
-  `⌈N/8⌉` tokens of its bucket (`N` parents, 1 when absent) and a batch `⌈N/4⌉` (`N` identifiers),
-  capped at the burst, at admission. (ADR 0051) A relay MAY also bound the bytes
+  `⌈N/8⌉` tokens of its bucket (`N` parents, 1 when absent) and a batch `⌈N/4⌉` (`N` identifiers,
+  `⌈Content-Length / 32⌉`; at least 1 token, so that a `400` is never free), capped at the burst, at
+  admission. A relay MUST refuse at start-up a burst below 64 for batches and below 4 for `/query`, so
+  that the cap never buys more than 4 blocks or 8 parents per token. (ADR 0051, clarifications B2
+  and B6) A relay MAY also bound the bytes
   stored per hour from a network prefix (an IPv6 /56 or /48, an IPv4 /24); a `PUT` over that bound gets
   `429` before its body is read. (ADR 0049)
 - `503 Service Unavailable` (`Unavailable`): the relay is at one of its own limits, starting or
