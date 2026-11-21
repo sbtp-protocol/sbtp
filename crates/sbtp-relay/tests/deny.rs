@@ -504,3 +504,60 @@ fn invalid_file_stops_the_start_up() {
         assert!(!data.exists(), "nothing is opened");
     }
 }
+
+/// The block file of `id` under the relay's data directory (ADR 0025 rule 1).
+fn block_file(relay: &TestServer, id: &BlockId) -> PathBuf {
+    relay
+        .data
+        .join("blocks")
+        .join(format!("{:02x}", id.0[31]))
+        .join(format!("{id}.bin"))
+}
+
+/// Deny review L-2: a `purge` by key whose index removal did not happen (the file is gone, the
+/// entries are still there, as after a refused removal or a stop) is finished by the next pass,
+/// which judges the block by the key of its mark.
+#[test]
+fn a_purge_interrupted_after_the_deletion_is_finished() {
+    let (relay, file) = start("", &[]);
+    let mut c = relay.connect();
+    let b = block(18, b"purge interrupted", &[]);
+    store(&mut c, &b);
+    // The mark is written before any deletion; the deletion happens, the removal does not.
+    deny(&relay, &file, &format!("key {} hide\n", key_hex(18)));
+    assert!(relay.mark());
+    std::fs::remove_file(block_file(&relay, &b.1)).unwrap();
+    deny(&relay, &file, &format!("key {} purge\n", key_hex(18)));
+    assert!(relay.mark());
+    deny(&relay, &file, "");
+    assert!(listed(&mut c, "").is_empty(), "the entries were removed");
+    assert_eq!(put_block(&mut c, &b.0).status, 201);
+}
+
+/// Deny review L-2: a `purge` whose deletion fails keeps the block's mark, so it stays out of
+/// `/query`; the pass reports the failure, and a later pass finishes the purge.
+#[cfg(unix)]
+#[test]
+fn a_failed_purge_deletion_keeps_the_block_unlisted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (relay, file) = start("", &[]);
+    let mut c = relay.connect();
+    let b = block(19, b"purge refused", &[]);
+    store(&mut c, &b);
+    let shard = block_file(&relay, &b.1).parent().unwrap().to_path_buf();
+    let mode = |m| std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    // Root ignores the mode: nothing to test then.
+    if std::fs::write(shard.join("probe"), b"").is_ok() {
+        mode(0o700);
+        return;
+    }
+    deny(&relay, &file, &format!("key {} purge\n", key_hex(19)));
+    assert!(!relay.mark(), "the deletion failed");
+    assert!(listed(&mut c, "").is_empty(), "marked, hence not listed");
+    mode(0o700);
+    assert!(relay.mark());
+    deny(&relay, &file, "");
+    assert_eq!(get(&mut c, &path(&b.1), "").status, 404, "purged");
+    assert_eq!(listed(&mut c, ""), Vec::<String>::new());
+}

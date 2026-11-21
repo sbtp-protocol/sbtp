@@ -568,17 +568,36 @@ fn read_file_then(
 struct Pass {
     from: Position,
     pending: u64,
+    /// `purge` deletions that failed in this pass (deny review L-2).
+    failed: u64,
 }
 
-/// One run of the marking pass from `from`, at most `batch` held blocks, with `list`. Returns
-/// the next position and the number of blocks walked, `None` as position when the walk is done;
-/// `Err` when an index queue refused or a job failed (the run is tried again).
+/// What one run of the marking pass did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ran {
+    /// The next position, `None` when the walk is done.
+    pub next: Option<Position>,
+    /// The blocks walked.
+    pub walked: u64,
+    /// The `purge` deletions that failed; their blocks keep their entries and their mark, and
+    /// a later pass tries again.
+    pub failed: u64,
+}
+
+/// One run of the marking pass from `from`, at most `batch` held blocks, with `list`. `Err`
+/// when an index queue refused or a job failed (the run is tried again).
+///
+/// Deny review L-2: every key match, `purge` included, is marked before any file is deleted,
+/// and a block whose file is gone is judged by the key of its mark. A run tried again after a
+/// failed index removal, or a pass started again after a stop, therefore still finds the key,
+/// deletes nothing more and removes the entries. A block whose deletion fails keeps its mark,
+/// so it stays out of `/query`.
 pub(crate) fn mark_once<I: IndexBackend + 'static>(
     relay: &Relay<I>,
     list: &List,
     from: Position,
     batch: usize,
-) -> Result<(Option<Position>, u64), ()> {
+) -> Result<Ran, ()> {
     let Ok(Ok(page)) = relay
         .index()
         .read_blocking(move |i| i.query(None, from, batch))
@@ -586,64 +605,98 @@ pub(crate) fn mark_once<I: IndexBackend + 'static>(
         return Err(());
     };
     let walked = page.entries.len() as u64;
+    // The marks already written, read only when the list names a key.
+    let marked: Vec<Option<[u8; 32]>> = if list.has_keys() {
+        let ids: Vec<BlockId> = page.entries.iter().map(|(_, id)| *id).collect();
+        match relay.index().read_blocking(move |i| i.denied_keys(&ids)) {
+            Ok(Ok(keys)) => keys,
+            _ => return Err(()),
+        }
+    } else {
+        Vec::new()
+    };
     let mut marks = Vec::new();
-    let mut purged = Vec::new();
-    for (at, id) in page.entries {
-        let _lock = relay.lock_id(&id);
-        // The stored file's key; a file that cannot be read is judged by its `block_id` only.
+    let mut to_purge = Vec::new();
+    for (n, (at, id)) in page.entries.iter().enumerate() {
+        let _lock = relay.lock_id(id);
+        // The stored file's key; else the key of its mark; else judged by `block_id` only.
         let key = relay
             .store()
-            .read(&id)
+            .read(id)
             .ok()
             .flatten()
-            .and_then(|b| pubkey_of(&b));
-        let (by_key, purge) = list.judge(&id, key.as_ref());
+            .and_then(|b| pubkey_of(&b))
+            .or_else(|| marked.get(n).copied().flatten());
+        let (by_key, purge) = list.judge(id, key.as_ref());
+        if let (true, Some(k)) = (by_key, key) {
+            marks.push((*id, k));
+        }
         if purge {
-            // Rule 14: as an eviction deletes, regardless of ADR 0046 rule 7. A failed deletion
-            // keeps the entries; the next pass tries again.
-            if relay.evict_locked(&id).is_ok() {
-                purged.push(at);
-            }
-        } else if let (true, Some(k)) = (by_key, key) {
-            marks.push((id, k));
+            to_purge.push((*at, *id));
         }
     }
-    relay.store().publish_gauges();
     if !marks.is_empty() {
         match relay.index().write_blocking(move |i| i.mark_denied(&marks)) {
             Ok(Ok(_)) => {}
             _ => return Err(()),
         }
     }
+    // Rule 14: as an eviction deletes, regardless of ADR 0046 rule 7. A file already gone is
+    // a deletion done (`Ok(None)`).
+    let mut purged = Vec::new();
+    let mut failed = 0u64;
+    for (at, id) in to_purge {
+        let _lock = relay.lock_id(&id);
+        if relay.evict_locked(&id).is_ok() {
+            purged.push(at);
+        } else {
+            failed += 1;
+        }
+    }
+    relay.store().publish_gauges();
     if !purged.is_empty() {
         match relay.index().write_blocking(move |i| i.remove(&purged)) {
             Ok(Ok(_)) => {}
             _ => return Err(()),
         }
     }
-    Ok((page.more.then_some(page.next), walked))
+    Ok(Ran {
+        next: page.more.then_some(page.next),
+        walked,
+        failed,
+    })
 }
 
-/// The whole marking pass with the list in force, run after run, on the calling thread (tests,
-/// the operator command).
+/// The whole marking pass with the list in force, run after run, on the calling thread (tests).
+/// `false` when a run failed or a `purge` deletion failed.
 pub fn mark_all<I: IndexBackend + 'static>(relay: &Relay<I>, batch: usize) -> bool {
     let Some(list) = relay.deny().list() else {
         return true;
     };
     let mut from = Position::default();
+    let mut failed = 0;
     loop {
         match mark_once(relay, &list, from, batch) {
-            Ok((Some(next), _)) => from = next,
-            Ok((None, _)) => return true,
+            Ok(ran) => {
+                failed += ran.failed;
+                match ran.next {
+                    Some(next) => from = next,
+                    None => return failed == 0,
+                }
+            }
             Err(()) => return false,
         }
     }
 }
 
+/// The wait before a pass whose `purge` deletions failed is started again (deny review L-2).
+const PURGE_RETRY: Duration = Duration::from_secs(300);
+
 /// The reload task (rule 4) and the marking pass (rules 9 and 14), until `stop` changes: a
 /// reload on [`Deny::request_reload`] and when the file changed (every `deny_reload_ms`), a run
-/// of the pass every [`PASS_PAUSE`] while one is due. Returns early only if a job panicked,
-/// which the caller treats as the end of a supervised task (ADR 0018 rule 37).
+/// of the pass every [`PASS_PAUSE`] while one is due, and a new pass [`PURGE_RETRY`] after one
+/// whose `purge` deletions failed. Returns early only if a job panicked, which the caller treats
+/// as the end of a supervised task (ADR 0018 rule 37).
 pub async fn run<I: IndexBackend + 'static>(
     relay: Arc<Relay<I>>,
     batch: usize,
@@ -654,8 +707,14 @@ pub async fn run<I: IndexBackend + 'static>(
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pass: Option<Pass> = None;
+    let mut again: Option<tokio::time::Instant> = None;
     loop {
+        if again.is_some_and(|t| t <= tokio::time::Instant::now()) {
+            again = None;
+            deny.pass_wanted.store(true, Ordering::Release);
+        }
         if deny.take_pass() {
+            again = None;
             let r = Arc::clone(&relay);
             let len = tokio::task::spawn_blocking(move || {
                 r.index()
@@ -668,13 +727,14 @@ pub async fn run<I: IndexBackend + 'static>(
             pass = Some(Pass {
                 from: Position::default(),
                 pending: len.unwrap_or(0),
+                failed: 0,
             });
         }
         metrics::set_deny_marking_pending(pass.as_ref().map_or(0, |p| p.pending));
-        let pause = if pass.is_some() {
-            PASS_PAUSE
-        } else {
-            Duration::MAX
+        let pause = match (&pass, again) {
+            (Some(_), _) => PASS_PAUSE,
+            (None, Some(t)) => t.saturating_duration_since(tokio::time::Instant::now()),
+            (None, None) => Duration::MAX,
         };
         let forced = tokio::select! {
             biased;
@@ -706,11 +766,18 @@ pub async fn run<I: IndexBackend + 'static>(
             return;
         };
         match ran {
-            Ok((Some(next), n)) => {
-                p.from = next;
-                p.pending = p.pending.saturating_sub(n);
+            Ok(ran) => {
+                p.failed = p.failed.saturating_add(ran.failed);
+                if let Some(next) = ran.next {
+                    p.from = next;
+                    p.pending = p.pending.saturating_sub(ran.walked);
+                } else {
+                    if p.failed > 0 {
+                        again = Some(tokio::time::Instant::now() + PURGE_RETRY);
+                    }
+                    pass = None;
+                }
             }
-            Ok((None, _)) => pass = None,
             Err(()) => tokio::time::sleep(PASS_RETRY).await,
         }
     }
