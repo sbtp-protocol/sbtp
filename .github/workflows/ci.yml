@@ -60,6 +60,14 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+      # `object-store` is not a default feature of the relay (ADR 0050 rule 26) but the published
+      # image is built with it (deploy/Dockerfile), so its code is linted and tested here too.
+      - name: Clippy (relay with object-store)
+        run: cargo clippy -p sbtp-relay --all-targets --features object-store --locked -- -D warnings
+
+      - name: Tests (relay with object-store)
+        run: cargo test -p sbtp-relay --features object-store --locked
+
       - name: sbtp-core without std (no_std)
         run: cargo build -p sbtp-core --no-default-features --locked
 
@@ -117,8 +125,10 @@ jobs:
 
       # The computed memory bound of ADR 0018 rule 35 on `small`: below 15,000,000 bytes with the
       # defaults, below 20,000,000 with every function enabled (crates/sbtp-relay/tests/startup.rs).
+      # Built with the features of deploy/Dockerfile, so the mirror terms of ADR 0050 rule 27 are
+      # counted as in the shipped image.
       - name: Memory bound of the small profile
-        run: cargo test -p sbtp-relay --test startup --locked -- small_profile_ --nocapture
+        run: cargo test -p sbtp-relay --features object-store --test startup --locked -- small_profile_ --nocapture
 
       # Upper bound of web/pkg/sbtp_wasm_bg.wasm (web/build.sh): the cargo output without its
       # custom sections, before wasm-bindgen and wasm-opt, which only shrink it.

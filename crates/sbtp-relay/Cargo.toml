@@ -27,11 +27,26 @@ libc.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
+# ADR 0050 rule 25: SHA-256 and HMAC-SHA256 for SigV4, compiled only with `object-store`.
+sha2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+# ADR 0050 rule 22: the archive copy's credentials are wiped on drop. Already in the graph.
+zeroize.workspace = true
 
 [features]
 # ADR 0048 rule 3: compiled into the published binary, off at run time unless `peers` is set.
 default = ["replication"]
 replication = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-native-certs"]
+# ADR 0050 rule 26: the archive copy. Not a default feature; the published image is built with
+# it, off at run time unless `mirror_endpoint` is set. It reuses the outbound HTTP and TLS
+# client of replication, hence `replication`.
+object-store = ["replication", "dep:sha2", "dep:hmac"]
+
+# The archive copy and replication benchmark (docs/benchmarks/2026-11-21-mirror-measurements.md).
+# It signs requests with the relay's own SigV4 code, hence the feature.
+[[example]]
+name = "mirror_bench"
+required-features = ["object-store"]
 
 [lints]
 workspace = true

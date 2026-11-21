@@ -26,6 +26,8 @@ pub mod ingest;
 pub mod limiter;
 pub mod log;
 pub mod metrics;
+#[cfg(feature = "object-store")]
+pub mod mirror;
 pub mod peers;
 pub mod pool;
 pub mod query;
@@ -94,6 +96,7 @@ impl From<IndexError> for StartError {
 /// # Errors
 ///
 /// [`StartError`]; the first error wins.
+#[allow(clippy::too_many_lines)] // The start-up order, in one place.
 pub fn run<A, E, S, T>(
     self_test: fn() -> Result<(), SelfTestError>,
     args: A,
@@ -124,6 +127,11 @@ where
         ],
     );
     self_test().map_err(StartError::SelfTest)?;
+    // Kept only for the credentials of ADR 0050 rule 22, then dropped.
+    #[cfg(feature = "object-store")]
+    let env_kept = env.clone();
+    #[cfg(not(feature = "object-store"))]
+    let env_kept: Vec<(OsString, OsString)> = Vec::new();
     let settings = Settings::load(args, env).map_err(StartError::Config)?;
     if settings.log_client_tag == log::ClientTag::Keyed {
         log::client_tag_key().map_err(|e| StartError::Io("drawing the client tag key", e))?;
@@ -132,6 +140,9 @@ where
     log_settings(&settings)?;
     // ADR 0048 rule 19: the trust roots are loaded once, before anything is opened.
     let replication = prepare_replication(&settings)?;
+    // ADR 0050 rule 22: the credentials are read once, from the start-up environment.
+    let mirror = prepare_mirror(&settings, &env_kept)?;
+    drop(env_kept);
 
     // Mode `0700` for what this creates (security review L-4); an existing directory is kept.
     store::dir_builder()
@@ -187,7 +198,14 @@ where
                 let relay = Arc::new(relay);
                 let kept = Arc::clone(&relay);
                 let app = api::app(&settings, Arc::clone(&relay));
-                let drain = serve(&settings, app, relay, replication, shutdown, on_listen);
+                let drain = serve(
+                    &settings,
+                    app,
+                    relay,
+                    (replication, mirror),
+                    shutdown,
+                    on_listen,
+                );
                 // L-1: written by the clean mark, restored at the next start.
                 let until = kept.demand().suspended_until();
                 drop(kept);
@@ -261,6 +279,55 @@ fn prepare_replication(settings: &Settings) -> Result<Option<Replicator>, StartE
 #[allow(clippy::unnecessary_wraps)] // The signature of the feature build.
 fn prepare_replication(_: &Settings) -> Result<Option<Replicator>, StartError> {
     Ok(None)
+}
+
+/// What [`serve`] starts beside the accept loop when the archive copy is on (ADR 0050 rule 26).
+#[cfg(feature = "object-store")]
+type Mirrorer = mirror::Mirror;
+#[cfg(not(feature = "object-store"))]
+type Mirrorer = std::convert::Infallible;
+
+#[cfg(feature = "object-store")]
+fn prepare_mirror(
+    settings: &Settings,
+    env: &[(OsString, OsString)],
+) -> Result<Option<Mirrorer>, StartError> {
+    mirror::Mirror::prepare(settings, env).map_err(StartError::Config)
+}
+
+#[cfg(not(feature = "object-store"))]
+#[allow(clippy::unnecessary_wraps)] // The signature of the feature build.
+fn prepare_mirror(
+    _: &Settings,
+    _: &[(OsString, OsString)],
+) -> Result<Option<Mirrorer>, StartError> {
+    Ok(None)
+}
+
+/// Starts the archive copy, when prepared; the task ends at the stop, or if it panics.
+#[allow(clippy::needless_pass_by_value)] // Moved into the task in the feature build.
+fn spawn_mirror(
+    m: Option<Mirrorer>,
+    relay: &Arc<Relay<RedbIndex>>,
+    stopped: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(feature = "object-store")]
+    return m.map(|m| m.spawn(Arc::clone(relay), stopped.clone()));
+    #[cfg(not(feature = "object-store"))]
+    {
+        let _ = (relay, stopped);
+        m.map(|never| match never {})
+    }
+}
+
+/// Waits for `h`, or forever when there is none.
+async fn ended(h: Option<&mut tokio::task::JoinHandle<()>>) {
+    match h {
+        Some(h) => {
+            let _ = h.await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Starts replication, when prepared; the task ends at the stop, or when a worker ends.
@@ -361,7 +428,7 @@ fn serve<S, T>(
     settings: &Settings,
     app: axum::Router,
     relay: Arc<Relay<RedbIndex>>,
-    replication: Option<Replicator>,
+    (replication, mirror): (Option<Replicator>, Option<Mirrorer>),
     shutdown: S,
     on_listen: impl FnOnce(SocketAddr),
 ) -> Result<server::Drain, StartError>
@@ -401,6 +468,8 @@ where
         // ADR 0048: replication runs beside the accept loop, like the sweeper; if it ends while
         // the relay serves (a worker panicked), the process exits (ADR 0018 rule 37).
         let mut replicator = spawn_replication(replication, &relay, &stopped);
+        // ADR 0050: the archive copy, likewise.
+        let mut mirrorer = spawn_mirror(mirror, &relay, &stopped);
         let mut sweeper = tokio::spawn(sweep::run(
             relay,
             std::time::Duration::from_millis(settings.sweep_interval_ms),
@@ -414,15 +483,13 @@ where
                 log::flush();
                 std::process::exit(pool::EXIT_THREAD_ENDED);
             }
-            () = async {
-                match replicator.as_mut() {
-                    Some(h) => {
-                        let _ = h.await;
-                    }
-                    None => std::future::pending().await,
-                }
-            } => {
+            () = ended(replicator.as_mut()) => {
                 log::emit(Event::Fatal, &[("msg", Value::Str("replication ended"))]);
+                log::flush();
+                std::process::exit(pool::EXIT_THREAD_ENDED);
+            }
+            () = ended(mirrorer.as_mut()) => {
+                log::emit(Event::Fatal, &[("msg", Value::Str("the archive copy ended"))]);
                 log::flush();
                 std::process::exit(pool::EXIT_THREAD_ENDED);
             }
@@ -430,6 +497,9 @@ where
         let _ = stop.send(true);
         let _ = sweeper.await;
         if let Some(h) = replicator {
+            let _ = h.await;
+        }
+        if let Some(h) = mirrorer {
             let _ = h.await;
         }
         // ADR 0046 rule 12: the last flush of the demand set, at a clean shutdown, after the

@@ -11,7 +11,8 @@
   separate module; replaces the 16 MB bound of `small` with replication on; the ADR 0013 binary gate
   becomes 8 MB and an image gate of 5 MB compressed is added; resolves Q-70 and Q-72; "Decisions of the
   project owner", item 7); 0050 (rule 18: a relay makes no fallback fetch for a request that carries
-  `Sbtp-Replication: 1`)
+  `Sbtp-Replication: 1`); 0050 amendment U3 (rule 3, item 2: the `small` bound with every function on
+  is 18,681,778 bytes, 1,318,222 bytes of margin)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)
@@ -96,9 +97,10 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
       to the bound of ADR 0018 rule 35 only when the function is on. With the default settings every
       function of this ADR and of ADR 0050 is off, and the 15 MB target of ADR 0019 rule 39 applies:
       14,910,996 bytes computed with ADR 0049. With every function on, the computed `small` bound is
-      18,188,451 bytes: the default bound, plus server TLS (ADR 0028 rule 36, 2,228,224), replication
-      (rule 16, 723,077) and ADR 0050 rule 27 (326,154, the root store counted once). The 1,811,549 bytes
-      under 20,000,000 are what later functions have; each later ADR states its terms and the new total.
+      18,681,778 bytes: the default bound, plus server TLS (ADR 0028 rule 36, 2,228,224), replication
+      (rule 16, 723,077) and ADR 0050 rule 27 (819,481, the root store counted once). The 1,318,222 bytes
+      under 20,000,000 are what later functions have (updated by ADR 0050 U3; was 18,188,451 bytes,
+      326,154 for ADR 0050 and 1,811,549 bytes of margin); each later ADR states its terms and the new total.
       The 60-second `VmHWM` runs replace the estimates. The packaged unit keeps `MemoryMax=128M` for
       `small` (ADR 0019 rule 37).
 

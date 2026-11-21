@@ -249,6 +249,110 @@ any other port named in `peers`) to the peers' addresses, and DNS. Without `peer
 egress at all; keep egress closed then. A host or Kubernetes network policy that allows egress
 only to the listed peers also covers the private-address rule above.
 
+## Archive copy to object storage
+
+A relay can copy every block it stores to an S3-compatible bucket (AWS S3, Cloudflare R2, MinIO
+and others; ADR 0050). The bucket's public URL, or a CDN in front of it, then serves
+`GET /sbtp/v1/block/{block_id}` and a static `/sbtp/v1/info` with `"read_only": true`: it is a
+read-only relay URL that can be listed like any relay. The relay's own storage, quota and
+eviction are unchanged; the bucket is an extra copy. Compiled into the published image (feature
+`object-store`) and **off** until `mirror_endpoint` is set.
+
+```toml
+# The S3 API endpoint (absolute https; http for a loopback host only) and the bucket.
+mirror_endpoint = "https://s3.us-east-1.amazonaws.com"   # R2: https://<account-id>.r2.cloudflarestorage.com
+mirror_bucket = "sbtp-archive"
+mirror_region = "us-east-1"          # `auto` for R2
+mirror_prefix = ""                   # or "net/" (ends with `/`): objects under net/sbtp/v1/
+mirror_url_style = "path"            # or "virtual" ({bucket}.{endpoint host})
+# Optional: the public URL of the bucket. After a `412` (the key exists) the relay fetches the
+# object there once and counts wrong bytes as `mirror_poisoned_total`.
+mirror_public_url = "https://archive.example"
+```
+
+**Credentials are never settings.** The relay reads the access key, the secret key and an
+optional session token from environment variables; the settings hold the variable **names**:
+`mirror_access_key_ref` (default `SBTP_MIRROR_ACCESS_KEY_ID`), `mirror_secret_key_ref` (default
+`SBTP_MIRROR_SECRET_ACCESS_KEY`) and `mirror_session_token_ref` (none by default). A value that is
+not a variable name, or that starts with `SBTP_RELAY_`, stops the start-up without being
+repeated; a named variable that is unset or empty stops it too. Give them through the service
+manager's secret mechanism (a Docker or Kubernetes secret exposed as environment variables, a
+systemd `LoadCredential`/`EnvironmentFile` readable by the relay user only), never in the
+configuration file. They are read once at start-up: rotation is a restart. They never appear in
+logs, `setting` lines, metrics or errors; the `mirror_endpoint` setting line logs `set`, not the
+URL.
+
+What the relay sends: one `PUT` per block to `{mirror_prefix}sbtp/v1/block/{block_id}`, signed
+with AWS Signature Version 4 (signed payload), with `If-None-Match: *` (the first write wins; an
+existing key is never overwritten), `Content-Type: application/octet-stream` and
+`Cache-Control: public, max-age=31536000, immutable`; and one `{mirror_prefix}sbtp/v1/info`
+object (`application/json`, `max-age=3600`) when its content changes (`mirror_info = false`
+turns it off: do so when the bucket has an expiry rule, which makes it no archive). It never
+sends `DELETE` or a listing. Uploads are off the request path: the relay walks its own index from
+a durable cursor, so a bucket outage only delays the copy; with demand eviction a block is lost to
+the bucket only after an outage of at least 3 × `demand_epoch_ms` (24 hours by default).
+`412` counts as done; `409`, `429`, `5xx` and network errors are retried with back-off up to
+`mirror_max_backoff_s` (1 hour); any other `4xx` or a `3xx` (bad credentials, missing bucket,
+policy) backs off at that maximum. No block is skipped for a failure. A block waiting out its
+back-off does not hold the others: the lanes copy up to 256 positions past the cursor, which
+stays at the oldest block not yet done.
+
+**Least privilege.**
+
+- The relay's credentials allow `s3:PutObject` on **both** `{prefix}sbtp/v1/block/*` and the exact
+  key `{prefix}sbtp/v1/info`, and nothing else: no `GetObject`, `ListBucket` or `DeleteObject`.
+  Prefer credentials with an expiry where the provider offers them. With the default empty prefix:
+
+  ```json
+  {"Version": "2012-10-17",
+   "Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": ["arn:aws:s3:::sbtp-archive/sbtp/v1/block/*",
+                               "arn:aws:s3:::sbtp-archive/sbtp/v1/info"]}]}
+  ```
+
+  A policy that covers only `sbtp/v1/block/*` makes the `/info` `PUT` fail: the relay logs
+  `mirror_failed` with `status=4xx` (usually `403`) and retries it at `mirror_max_backoff_s`;
+  block uploads are unaffected, but the bucket serves no `/info`, so clients do not learn
+  `read_only` from it (rule 4 of ADR 0050: they may still read blocks there).
+- On S3, a bucket policy denies a `PutObject` under `sbtp/v1/block/` without `If-None-Match`:
+
+  ```json
+  {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+   "Resource": "arn:aws:s3:::sbtp-archive/sbtp/v1/block/*",
+   "Condition": {"Null": {"s3:if-none-match": "true"}}}
+  ```
+
+- Public read (`s3:GetObject`, `Principal: *`) on the same two resources,
+  `{prefix}sbtp/v1/block/*` and `{prefix}sbtp/v1/info`, and nothing else. This is what readers
+  use, and what the poisoning check after a `412` uses: it fetches the block through
+  `mirror_public_url` without credentials, so the relay's own credentials need no `GetObject`.
+- R2 API tokens are read-write per bucket: use a token scoped to this one bucket, and a bucket
+  used for nothing else. MinIO: a policy with `s3:PutObject` on the prefix only.
+- One writer per bucket is recommended: a writer that uploads wrong bytes under a key makes that
+  block unavailable from the bucket (readers validate every block), and no honest writer can
+  replace them. Repair (validate and delete bad objects) is an operator task with other
+  credentials.
+- The bucket and its CDN must not answer `/sbtp/v1/` with a redirect, and CORS allows `GET` and
+  `HEAD` from any origin, without credentials.
+
+**Bounds and memory.** `mirror_max_in_flight` uploads at a time (4 on `small` and `standard`, 8
+on `large`), each bounded by `mirror_request_timeout_ms` (30 s); response bodies are read up to
+16 KiB and discarded. One lane copies about 25 blocks/s against a store 36 ms away; raise the
+setting when ingest is sustained above about 20 blocks/s per lane. On `small` the memory bound
+grows by 651,284 bytes with replication also on, 1,051,284 bytes without it (the TLS root store);
+it is logged at start-up (`memory_bound`).
+`mirror_allow_private = true` lets the endpoint name resolve to private addresses (a MinIO on the
+same network); the rule is that of `replication_allow_private`.
+
+**Logs and metrics.** Counters (served with `/metrics` once it exists, as those of replication;
+the `stats` line does not carry them yet) `mirror_uploaded_total`, `mirror_existing_total`,
+`mirror_failed_total{status}` (`3xx`, `4xx`, `5xx`, `network`), `mirror_missed_total` (evicted
+before its turn), `mirror_damaged_total`, `mirror_poisoned_total`; gauges `mirror_lag_blocks`
+(counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed` (status class and delay
+only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on `mirror_lag_ms` above
+`demand_epoch_ms` and on any `mirror_poisoned_total`. **Egress**: allow TCP 443 to the endpoint
+(and to `mirror_public_url`), and DNS.
+
 ## Alerts
 
 The counters and gauges worth an alert on a public relay, with plain starting thresholds. They are

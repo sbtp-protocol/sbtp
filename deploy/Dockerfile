@@ -21,8 +21,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY examples examples
 # The shipped profile (ADR 0013, "Build"): `--release`, the relay binary alone. Never
-# `--all-targets`, a test profile or the `vector-gen` feature.
-RUN cargo build --release --locked -p sbtp-relay --bin sbtp-relay \
+# `--all-targets`, a test profile or the `vector-gen` feature. One image with every function
+# compiled in (ADR 0048 rule 3, ADR 0050 rule 26): `object-store` on top of the defaults; each
+# function stays off until its settings are given.
+RUN cargo build --release --locked -p sbtp-relay --bin sbtp-relay --features object-store \
  && mkdir -p /out/data \
  && cp target/release/sbtp-relay /out/sbtp-relay \
  && chmod 0700 /out/data

@@ -825,7 +825,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 72, "one line per setting");
+    assert_eq!(lines.len(), 86, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1354,6 +1354,17 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
         &[("PEERS", "")],
         723_077,
     ),
+    // ADR 0050 rule 27: four uploads in flight (`small`) and the uploader's window; the root
+    // store is counted once, by replication, which is on in the "every function" set.
+    (
+        "mirror",
+        &[
+            ("MIRROR_ENDPOINT", "https://s3.example"),
+            ("MIRROR_BUCKET", "archive"),
+        ],
+        &[("MIRROR_ENDPOINT", "")],
+        4 * 155_909 + 4 * 64 * 96 + 64 * 48,
+    ),
 ];
 
 /// ADR 0048 budget: `small` with every function of [`FUNCTIONS`] on stays under 20,000,000 bytes,
@@ -1364,6 +1375,8 @@ fn small_profile_with_every_function_is_under_20_mb() {
     let functions: Vec<_> = FUNCTIONS
         .iter()
         .filter(|(name, ..)| cfg!(feature = "replication") || *name != "replication")
+        // Likewise `mirror_endpoint` without `object-store` (ADR 0050 rule 28).
+        .filter(|(name, ..)| cfg!(feature = "object-store") || *name != "mirror")
         .collect();
     let on: Vec<(&str, &str)> = functions
         .iter()
@@ -1375,7 +1388,14 @@ fn small_profile_with_every_function_is_under_20_mb() {
         let mut without = on.clone();
         without.extend_from_slice(off);
         let without = load(&[], &without).unwrap().memory_bound_bytes();
-        assert_eq!(all - without, *share, "{name}");
+        // ADR 0050 rule 27: the root store is counted once; with the mirror on, turning
+        // replication off leaves it with the mirror.
+        let share = if *name == "replication" && cfg!(feature = "object-store") {
+            share - sbtp_relay::peers::EST_ROOT_STORE
+        } else {
+            *share
+        };
+        assert_eq!(all - without, share, "{name}");
     }
 }
 

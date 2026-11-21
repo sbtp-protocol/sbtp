@@ -1267,6 +1267,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "blake3",
+ "hmac",
  "http-body",
  "hyper",
  "hyper-util",
@@ -1276,11 +1277,13 @@ dependencies = [
  "rustls-native-certs",
  "sbtp-core",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "toml",
  "tower",
  "tower-http",
+ "zeroize",
 ]
 
 [[package]]

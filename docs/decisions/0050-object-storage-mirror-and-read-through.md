@@ -5,6 +5,9 @@
   `fallback_sources` as a separate setting; `fallback_keep` on by default; one writer per bucket
   recommended. Rule 27 (memory) is replaced by the owner's budget decision: the outbound terms are added
   to the bound, and the block cache keeps its default
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21, after measurement
+  (`docs/benchmarks/2026-11-21-mirror-measurements.md`): amendments U1 to U3 below (rules 7, 27 and
+  28: `small` uploads 4 at a time, the uploader's window replaces the page barrier, new memory terms)
 - Date: 2026-11-21
 - Questions: Q-72 (opened here; resolved by the owner's budget decision, rule 27), Q-73 (opened:
   verification and repair of a shared bucket; stays open)
@@ -79,10 +82,17 @@ documentation):
    or read-through rule 15) to the bucket. The relay's local storage, quota and eviction are unchanged.
    Default: off.
 7. **Off the request path.** No `PUT` waits for the bucket. The uploader walks the relay's own index by
-   position (ADR 0013), from a durable cursor in `META` (`mirror_cursor`), in pages of 64 positions;
-   without a cursor it starts at the first position (the whole local history). The backlog is the set
-   of positions after the cursor: it lives on the relay's disk already and costs no memory. The cursor
-   is advanced, durably, after every block of a page is done.
+   position (ADR 0013), from a durable cursor in `META` (`mirror_cursor`), reading pages of 64
+   positions; without a cursor it starts at the first position (the whole local history). The backlog
+   is the set of positions after the cursor: it lives on the relay's disk already and costs no memory.
+   The `mirror_max_in_flight` lanes take blocks, in any order, from a **window** of at most 256
+   positions (four pages) that starts at the cursor; a page is read into the window when it has room
+   for it. The cursor is the lowest position whose block is not done: it never passes a block that is
+   not done. It is written durably at least once per 64 positions of progress and when the window
+   drains; after a restart, blocks done past the written cursor are sent again and end as `412`
+   (rule 9). A block waiting out its back-off (rule 9) stays in the window and holds no lane: the
+   other lanes go on within the window. (Amendment U2, accepted 2026-11-21; was: "in pages of 64 positions [...]
+   The cursor is advanced, durably, after every block of a page is done.")
 8. **Request.** For each block, the uploader reads the file through the read path of ADR 0023 (full
    validation and R1; a damaged file is not uploaded, it is counted and skipped) and sends a path-style
    (default) or virtual-hosted `PUT` signed with AWS Signature Version 4, with:
@@ -213,20 +223,23 @@ documentation):
 27. **Memory** (owner decision of 2026-11-21, replacing the proposed text, which took these terms from
     `block_cache_bytes`). New terms of ADR 0018 rule 35, estimates: per upload or fetch in flight,
     65,909 (block) + 90,000 (TLS and HTTP state); the root store, 400,000, counted once and shared with
-    replication when both are on; the uploader's page, 64 × 32; the negative cache,
-    `fallback_negative_max × 48`. The terms count only when the feature is compiled and the function is
+    replication when both are on; the uploader's window (rule 7), 256 × 96 + 64 × 48 = 27,648 (a slot
+    per position, and the page read into it; amendment U3, accepted 2026-11-21; was the page, 64 × 32); the
+    negative cache, `fallback_negative_max × 48`. The terms count only when the feature is compiled and the function is
     on (`mirror_endpoint` set, `fallback_sources` not empty); they are **added to the bound**. The block
     cache keeps its default (`block_cache_bytes`, 2 MiB on `small`) whether these functions are on or
-    off. On `small` with both functions on (one upload, one fetch, 256 negative entries):
-    2 × 155,909 + 400,000 + 2,048 + 12,288 = 726,154 bytes alone, 326,154 bytes when replication is
-    also on (the root store is already counted).
+    off. On `small` with both functions on (four uploads, one fetch, 256 negative entries; amendment
+    U3, accepted 2026-11-21; was one upload): 5 × 155,909 + 400,000 + 27,648 + 12,288 = 1,219,481 bytes alone,
+    819,481 bytes when replication is also on (the root store is already counted; the archive copy's
+    share is then 4 × 155,909 + 27,648 = 651,284, the read-through's 168,197).
 
     The owner accepts about 1 MB per enabled outbound function rather than a smaller block cache. The
     budget of ADR 0048 rule 3, item 2 (as amended on 2026-11-21) applies: `small` with the default
     settings stays under 15,000,000 bytes (these functions are off by default); `small` with every
     function on stays under 20,000,000 bytes. Computed on `small`: the default bound with ADR 0049,
     14,910,996 bytes; plus server TLS (ADR 0028 rule 36, 2,228,224), replication (ADR 0048 rule 16,
-    723,077) and this ADR (326,154): 18,188,451 bytes, 1,811,549 bytes under 20,000,000. That margin is
+    723,077) and this ADR (819,481): 18,681,778 bytes, 1,318,222 bytes under 20,000,000 (amendment U3,
+    accepted 2026-11-21; was 326,154 and 18,188,451 bytes, 1,811,549 under). That margin is
     what later functions (sync, streaming, chunks, OHTTP) have; each later ADR states its terms and the
     new total.
 
@@ -245,7 +258,7 @@ documentation):
     | `mirror_session_token_ref` | empty (none) | variable name | policy |
     | `mirror_info` | `true` | `true`, `false` | policy |
     | `mirror_public_url` | empty | read-only relay URL | policy |
-    | `mirror_max_in_flight` | 1 / 4 / 8 | 1 to 64 | profile row |
+    | `mirror_max_in_flight` | 4 / 4 / 8 (was 1 / 4 / 8, amendment U1, accepted 2026-11-21) | 1 to 64 | profile row |
     | `mirror_request_timeout_ms` | 30,000 | 1,000 to 300,000 | policy |
     | `mirror_max_backoff_s` | 3,600 | 1 to 86,400 | policy |
     | `mirror_allow_private` | `false` | `true`, `false` | policy |
@@ -316,6 +329,28 @@ fetch bounds and the negative cache against a client asking for random identifie
    function on; core `.wasm` under 200 KB gzip, with any MLS (group encryption) code in a separate
    module loaded on demand and budgeted on its own. This replaces the 16 MB bound of `small` with
    replication on (ADR 0048) and resolves Q-72.
+
+## Amendments (2026-11-21, accepted by the project owner on 2026-11-21)
+
+Measured on the reference relay (`docs/benchmarks/2026-11-21-mirror-measurements.md`): a fake store on
+loopback with added latency and injected failures, and a single-node S3-compatible store on a local
+network. No wire format, relay interface or test vector changes; rule 9 (back-off) is unchanged.
+
+- **U1. `mirror_max_in_flight` on `small` is 4 (rule 28).** One lane copies one block per store round
+  trip plus local work: about 25 blocks/s against a store at 36 ms p50. Under a sustained ingest of 50
+  blocks/s, the lag of one lane grew for the whole run (p50 66 s, p99 119 s); 4 lanes kept it under
+  1 s (p99 730 ms). `standard` (4) and `large` (8) are unchanged.
+- **U2. A window replaces the page barrier (rule 7).** With a cursor that moved only once every block
+  of a page was done, one slow or failing block held the page's other lanes idle, and a lane slept
+  through that block's back-off. With one `PUT` in three answered `503` and the back-off capped at
+  1 s, the copy rose from 9.4 to 51.6 blocks/s with the window. With the default cap of one hour the
+  block with the longest run of failures still holds the cursor, and the lanes can get at most four
+  pages past it (about 12 blocks/s against a store at 20 ms); lifting that would change rule 9, which this
+  amendment does not do.
+- **U3. Memory terms (rule 27).** Four uploads in flight on `small` instead of one, and the window
+  (27,648 bytes) instead of the page of identifiers (2,048 bytes). `small` with every function on is
+  18,681,778 bytes, under the 20,000,000-byte budget of ADR 0048 rule 3, item 2. The figure recorded
+  there (was 18,188,451 bytes, 1,811,549 bytes of margin) is now 18,681,778 bytes and 1,318,222 bytes.
 
 ## Spec change on acceptance
 
