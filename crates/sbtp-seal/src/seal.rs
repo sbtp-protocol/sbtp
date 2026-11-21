@@ -19,7 +19,10 @@ use crate::{Bucket, SealError, Tag};
 const ENC_KIND: &str = "sbtp.enc";
 
 /// What to seal, and to whom (spec §5.3, §5.4).
-#[derive(Clone, Copy, Debug)]
+///
+/// Its `Debug` output shows the length of `msg` and the bucket only: never `msg`, the sender or
+/// the recipient, which the envelope hides (spec §5.9).
+#[derive(Clone, Copy)]
 pub struct SealRequest<'a> {
     /// The recipient's X25519 key: the `x25519` of its current `sbtp.enc_key` (spec §5.5), or
     /// the key the application that defines the tag names.
@@ -34,6 +37,15 @@ pub struct SealRequest<'a> {
     pub msg: &'a [u8],
     /// The bucket to use; `None` picks the smallest that fits (spec §5.3, SHOULD).
     pub bucket: Option<Bucket>,
+}
+
+impl core::fmt::Debug for SealRequest<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SealRequest")
+            .field("msg_len", &self.msg.len())
+            .field("bucket", &self.bucket)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A sealed payload, ready to be put in a block.

@@ -549,6 +549,27 @@ fn open_msg_invalid() {
         ("body", Value::Bytes(b"")),
     ]))
     .unwrap();
+    // A `msg` of kind `sbtp.enc` (review I-3): its row needs 1 parent, `msg` has 0.
+    let enc_msg = Payload {
+        kind: "sbtp.enc",
+        edges: vec![sbtp_l2::Edge {
+            target: sbtp_l2::Target::Parent(0),
+            rel: sbtp_l2::Rel::Tagged,
+        }],
+        body: Body::Enc(Enc {
+            ct: &[0; 422],
+            enc: [0; 32],
+        }),
+    }
+    .encode(&[BlockId(TAG)])
+    .unwrap();
+    // It is a valid payload with its 1 parent (encode checked it), and too long for B512.
+    let mut pt = item(&sender(), &OUTER, &x, &enc_msg);
+    pt.resize(Bucket::B2048.plaintext_len(), 0);
+    assert!(matches!(
+        open_crafted(&pt, &OUTER, &["sbtp.enc", KIND]).unwrap_err(),
+        OpenError::MsgInvalid(_)
+    ));
     for bad in [&b"\x00"[..], &causal] {
         let pt = padded(item(&sender(), &OUTER, &x, bad));
         assert!(matches!(
@@ -570,6 +591,78 @@ fn open_msg_kind_not_allowed() {
         open_crafted(&pt, &OUTER, &[]).unwrap_err(),
         OpenError::MsgKindNotAllowed
     );
+}
+
+/// Whether `dbg` contains the `Debug` text of `bytes` or a run of four of its first bytes.
+fn leaks(dbg: &str, bytes: &[u8]) -> bool {
+    let full = std::format!("{bytes:?}");
+    let head = &full[1..full.len().min(1 + 4 * 5)];
+    dbg.contains(&full) || dbg.contains(head.trim_end_matches([',', ' ']))
+}
+
+// Review L-2: `SealRequest`'s `Debug` shows neither `msg` nor the sender nor the recipient.
+#[test]
+fn seal_request_debug_hides_secrets() {
+    let m = msg(40);
+    let key = recipient();
+    let sender = sender();
+    let req = request(key.public(), &sender, &m, Some(Bucket::B2048));
+    let dbg = std::format!("{req:?}");
+    assert!(dbg.contains("msg_len"), "{dbg}");
+    let from = sender.verifying_key().to_bytes();
+    for secret in [
+        &m[..],
+        &from,
+        key.public(),
+        &RECIPIENT_ID,
+        &sender.to_bytes(),
+    ] {
+        assert!(!leaks(&dbg, secret), "{dbg}");
+    }
+}
+
+// Review L-2: `OpenRequest`'s `Debug` shows neither the recipient's identity nor its keys.
+#[test]
+fn open_request_debug_hides_secrets() {
+    let keys = [recipient()];
+    let enc = Enc {
+        ct: &[0x77; 422],
+        enc: [0x66; 32],
+    };
+    let req = OpenRequest {
+        outer_pubkey: &OUTER,
+        tag: &TAG,
+        enc: &enc,
+        recipient_id: &RECIPIENT_ID,
+        keys: &keys,
+        allowed_kinds: &[KIND],
+    };
+    let dbg = std::format!("{req:?}");
+    assert!(dbg.contains("ct_len"), "{dbg}");
+    for secret in [
+        &RECIPIENT_ID[..],
+        keys[0].public(),
+        &*keys[0].secret_bytes(),
+    ] {
+        assert!(!leaks(&dbg, secret), "{dbg}");
+    }
+}
+
+// Review L-2: `Opened`'s `Debug` shows neither `from` nor `msg`.
+#[test]
+fn opened_debug_hides_secrets() {
+    let m = msg(40);
+    let key = recipient();
+    let sealed = seal(
+        &request(key.public(), &sender(), &m, None),
+        &mut TestRng::new("debug"),
+    )
+    .unwrap();
+    let opened = deliver(&sealed, &[key]).unwrap();
+    let dbg = std::format!("{opened:?}");
+    assert!(dbg.contains("msg_len"), "{dbg}");
+    assert!(!leaks(&dbg, opened.from()), "{dbg}");
+    assert!(!leaks(&dbg, opened.msg()), "{dbg}");
 }
 
 // Key storage: the private key bytes round-trip; `Debug` shows the public key only.

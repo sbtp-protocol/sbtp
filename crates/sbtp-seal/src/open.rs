@@ -16,7 +16,9 @@ use crate::seal::aad;
 use crate::{Bucket, OpenError, RecipientKey, Tag};
 
 /// What a recipient opens, and with which of its keys (spec §5.3).
-#[derive(Clone, Copy, Debug)]
+///
+/// Its `Debug` output shows lengths and counts only: never the recipient's identity or keys.
+#[derive(Clone, Copy)]
 pub struct OpenRequest<'a> {
     /// The `PubKey` field of the outer block.
     pub outer_pubkey: &'a [u8; 32],
@@ -35,7 +37,18 @@ pub struct OpenRequest<'a> {
     pub allowed_kinds: &'a [&'a str],
 }
 
+impl core::fmt::Debug for OpenRequest<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpenRequest")
+            .field("ct_len", &self.enc.ct.len())
+            .field("keys", &self.keys.len())
+            .field("allowed_kinds", &self.allowed_kinds.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// An opened sealed block: steps (4) to (8) of spec §5.3 passed. The plaintext is wiped on drop.
+/// Its `Debug` output never shows `from` or `msg` (spec §5.9: the sender is hidden).
 ///
 /// Steps (9), the tag check of the application, and (10), the checks of the kind, are left to
 /// the caller, on [`Opened::payload`].
@@ -77,7 +90,6 @@ impl Opened {
 impl core::fmt::Debug for Opened {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Opened")
-            .field("from", &self.from)
             .field("msg_len", &self.msg.len())
             .field("key_index", &self.key_index)
             .finish_non_exhaustive()

@@ -45,7 +45,10 @@ impl RecipientKey {
     }
 
     /// The key pair derived from `ikm` by RFC 9180 §7.1.3 `DeriveKeyPair`. For known-answer
-    /// tests and test keys from public seeds; never with low-entropy input in production.
+    /// tests and test keys from public seeds; never with low-entropy input in production, and
+    /// never from a password or an identity seed (spec §5.5: generated independently). Hidden
+    /// from the documentation for that reason.
+    #[doc(hidden)]
     #[must_use]
     pub fn derive(ikm: &[u8]) -> Self {
         let (secret, public) = Kem::derive_keypair(ikm);
