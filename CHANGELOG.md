@@ -52,6 +52,11 @@ Initial public version. Pre-release software: no version is supported for produc
   (single-shot, X25519/HKDF-SHA256/ChaCha20Poly1305), padding to the fixed buckets, strict inner
   signature, directory and application tags; `no_std` + `alloc`, `wasm32`. Security review:
   `docs/security/2026-11-21-sbtp-seal.md` (mergeable; L-2 fixed, other low and info findings tracked).
+- `sbtp-wasm`: layer 2 validation (`validateL2Payload`) and the sealed envelope (`seal`, two-phase
+  `sealPrepare` / `finish` for an identity key outside WASM such as a non-extractable Web Crypto key,
+  `openSealed` with one opaque `OpenFailed`, `EncKeyPair`, tags); one module behind the `l2` and `seal`
+  features (122 KB gzip). `sbtp-seal`: two-phase API, in-place item encoding (review L-1). Security
+  review: `docs/security/2026-11-21-wasm-seal.md` (mergeable; low findings tracked).
 - `sbtp-relay`: operator deny list (ADR 0052, clarifications L1-L3): `deny_file` reloaded on `SIGHUP` or change
   (an invalid file keeps the previous list), `451` `Denied` / `DeniedKey` with `no-store`, empty batch
   records, filtered `/query`, key marking pass, `hide` / `purge`, `/info` `deny_list`; replication and the
