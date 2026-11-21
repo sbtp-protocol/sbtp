@@ -11,7 +11,7 @@ use std::path::Path;
 use axum::Router;
 use common::{TestServer, get as http_get, settings, tmp_dir};
 use sbtp_core::BlockId;
-use sbtp_relay::index::{FileState, IndexBackend, IndexError, Page, Position, RedbIndex};
+use sbtp_relay::index::{FileState, IndexBackend, IndexError, Position, RedbIndex};
 use sbtp_relay::pool::FATAL_INDEX_FAILURES;
 
 /// A redb index whose every `/query` page finds a corrupt row.
@@ -54,7 +54,10 @@ impl IndexBackend for CorruptQueries {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.0.contains(id)
     }
-    fn query(&self, _: Option<&BlockId>, _: Position, _: usize) -> Result<Page, IndexError> {
+    fn read_query(
+        &self,
+        _plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
         Err(IndexError::CorruptRow)
     }
     fn expired(

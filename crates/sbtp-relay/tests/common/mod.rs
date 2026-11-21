@@ -260,6 +260,16 @@ pub fn read_response(s: &mut TcpStream) -> std::io::Result<Response> {
         .find(|(k, _)| k == "content-length")
         .map_or(0, |(_, v)| v.parse().unwrap());
     let mut body = buf[head_end + 4..].to_vec();
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    if chunked {
+        return read_chunked(s, body).map(|body| Response {
+            status,
+            headers,
+            body,
+        });
+    }
     while body.len() < len {
         let n = s.read(&mut chunk)?;
         if n == 0 {
@@ -272,6 +282,41 @@ pub fn read_response(s: &mut TcpStream) -> std::io::Result<Response> {
         headers,
         body,
     })
+}
+
+/// Decodes a chunked body (no trailers), starting with the bytes `buf` already read. A body
+/// that ends before its last chunk is `UnexpectedEof`.
+fn read_chunked(s: &mut TcpStream, mut buf: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let mut chunk = [0u8; 16_384];
+    let mut more = |buf: &mut Vec<u8>| -> std::io::Result<()> {
+        let n = s.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        Ok(())
+    };
+    let mut body = Vec::new();
+    let mut at = 0;
+    loop {
+        let line_end = loop {
+            if let Some(i) = buf[at..].windows(2).position(|w| w == b"\r\n") {
+                break at + i;
+            }
+            more(&mut buf)?;
+        };
+        let size_text = std::str::from_utf8(&buf[at..line_end]).unwrap();
+        let size = usize::from_str_radix(size_text.split(';').next().unwrap().trim(), 16).unwrap();
+        let start = line_end + 2;
+        while buf.len() < start + size + 2 {
+            more(&mut buf)?;
+        }
+        if size == 0 {
+            return Ok(body);
+        }
+        body.extend_from_slice(&buf[start..start + size]);
+        at = start + size + 2;
+    }
 }
 
 /// The wall clock in Unix milliseconds.

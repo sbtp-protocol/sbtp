@@ -77,15 +77,24 @@ impl Entry {
 
     /// Takes one token of class `c`, or returns the `Retry-After` of ADR 0018 rule 29: the time
     /// until one token is available, in whole seconds, rounded up, at least 1.
+    #[cfg(test)]
     fn take(&mut self, rates: &[Rate; 3], c: usize) -> Result<(), u64> {
+        self.take_n(rates, c, 1)
+    }
+
+    /// Takes `tokens` tokens of class `c` (ADR 0051 rules 7 and 26), at least 1 and at most the
+    /// burst, or none and returns the `Retry-After` until that many are available (ADR 0018
+    /// rule 29), in whole seconds, rounded up, at least 1.
+    fn take_n(&mut self, rates: &[Rate; 3], c: usize, tokens: u64) -> Result<(), u64> {
         let (Some(level), Some(rate)) = (self.level.get_mut(c), rates.get(c)) else {
             return Ok(());
         };
-        if *level >= UNIT {
-            *level -= UNIT;
+        let need = tokens.max(1).saturating_mul(UNIT).min(rate.cap.max(UNIT));
+        if *level >= need {
+            *level -= need;
             return Ok(());
         }
-        let deficit = UNIT - *level;
+        let deficit = need - *level;
         let ms = deficit.div_ceil(rate.per_min.max(1));
         Err(ms.div_ceil(1_000).max(1))
     }
@@ -328,18 +337,44 @@ impl Limiter {
     ///
     /// The bucket is empty: the `Retry-After` of ADR 0018 rule 29.
     pub fn take(&self, key: ClientKey, class: RequestClass) -> Result<ClientKey, u64> {
-        self.take_at(key, class, self.now())
+        self.take_tokens(key, class, 1)
+    }
+
+    /// [`Limiter::take`] with the weight of the request (ADR 0051 rules 7 and 26): `tokens`
+    /// tokens, at least 1 and capped at the burst of `class`, all or none.
+    ///
+    /// # Errors
+    ///
+    /// The bucket holds fewer: the `Retry-After` until it holds that many.
+    pub fn take_tokens(
+        &self,
+        key: ClientKey,
+        class: RequestClass,
+        tokens: u64,
+    ) -> Result<ClientKey, u64> {
+        self.take_n_at(key, class, tokens, self.now())
+    }
+
+    #[cfg(test)]
+    fn take_at(&self, key: ClientKey, class: RequestClass, now: u64) -> Result<ClientKey, u64> {
+        self.take_n_at(key, class, 1, now)
     }
 
     /// ADR 0027 rules 1 to 4: one hash lookup and at most two changes of the order, O(log n).
-    fn take_at(&self, key: ClientKey, class: RequestClass, now: u64) -> Result<ClientKey, u64> {
+    fn take_n_at(
+        &self,
+        key: ClientKey,
+        class: RequestClass,
+        tokens: u64,
+        now: u64,
+    ) -> Result<ClientKey, u64> {
         let (rates, c) = (&self.rates, slot(class));
         let mut guard = self.lock();
         let t = &mut *guard;
         if let Some(e) = t.map.get_mut(&key) {
             let before = e.full_at(rates);
             e.refill(rates, now);
-            let taken = e.take(rates, c);
+            let taken = e.take_n(rates, c, tokens);
             let after = e.full_at(rates);
             // ADR 0027 rule 7: a request of a known key moves that key in the order.
             if before != after && !t.pins.contains_key(&key) {
@@ -362,7 +397,7 @@ impl Limiter {
         }
         if t.map.len() < self.max_clients {
             let mut e = Entry::full(rates, now);
-            let taken = e.take(rates, c);
+            let taken = e.take_n(rates, c, tokens);
             let full_at = e.full_at(rates);
             // The map has room for `max_clients` keys, so the insert always stores the key
             // (review I-4). Were it ever refused, the key would stay out of the order too and the
@@ -380,7 +415,9 @@ impl Limiter {
             }
         }
         t.overflow.refill(rates, now);
-        t.overflow.take(rates, c).map(|()| ClientKey::OVERFLOW)
+        t.overflow
+            .take_n(rates, c, tokens)
+            .map(|()| ClientKey::OVERFLOW)
     }
 
     /// One more unit in flight for `key` (ADR 0019 rule 31): while its count is above 0, its
@@ -460,6 +497,32 @@ mod tests {
 
     fn v4(i: u8) -> ClientKey {
         key(&format!("192.0.2.{i}"))
+    }
+
+    /// ADR 0051 rules 7 and 26: a weighted request takes all its tokens or none, at least 1 and
+    /// at most the burst; the `Retry-After` is the wait for all of them.
+    #[test]
+    fn weighted_requests_take_all_or_nothing() {
+        let l = limiter(60, 10, 64);
+        let k = key("192.0.2.1");
+        assert_eq!(l.take_n_at(k, Block, 4, 0), Ok(k));
+        assert_eq!(l.take_n_at(k, Block, 0, 0), Ok(k), "at least one token");
+        assert_eq!(l.take_n_at(k, Block, 6, 0), Err(1), "5 left, 6 asked");
+        assert_eq!(
+            l.take_n_at(k, Block, 5, 0),
+            Ok(k),
+            "the refusal took nothing"
+        );
+        // Empty; 60 per minute: 3 tokens in 3 s.
+        assert_eq!(l.take_n_at(k, Block, 3, 0), Err(3));
+        assert_eq!(l.take_n_at(k, Block, 3, 3_000), Ok(k));
+        // A weight above the burst costs the whole burst, once full.
+        let k2 = key("192.0.2.2");
+        assert_eq!(l.take_n_at(k2, Block, 64, 0), Ok(k2));
+        assert_eq!(l.take_n_at(k2, Block, 1, 0), Err(1));
+        assert_eq!(l.take_n_at(k2, Block, 64, 0), Err(10));
+        // Other buckets of the key are untouched.
+        assert_eq!(l.take_n_at(k2, Query, 10, 0), Ok(k2));
     }
 
     /// Rule 21: the burst, then `429` with the time to the next token (rule 29); the bucket

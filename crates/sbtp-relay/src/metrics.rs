@@ -20,17 +20,20 @@ pub enum Route {
     Query,
     /// `GET /sbtp/v1/info`.
     Info,
+    /// `POST /sbtp/v1/blocks` (ADR 0051).
+    Blocks,
     /// Any other path (`404`).
     Other,
 }
 
 impl Route {
     /// Every route, in order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Block,
         Self::BlockId,
         Self::Query,
         Self::Info,
+        Self::Blocks,
         Self::Other,
     ];
 
@@ -42,6 +45,7 @@ impl Route {
             Self::BlockId => "/sbtp/v1/block/{id}",
             Self::Query => "/sbtp/v1/query",
             Self::Info => "/sbtp/v1/info",
+            Self::Blocks => "/sbtp/v1/blocks",
             Self::Other => "other",
         }
     }
@@ -54,6 +58,7 @@ impl Route {
             Some(p) if p.starts_with("/sbtp/v1/block/") => Self::BlockId,
             Some("/sbtp/v1/query") => Self::Query,
             Some("/sbtp/v1/info") => Self::Info,
+            Some("/sbtp/v1/blocks") => Self::Blocks,
             _ => Self::Other,
         }
     }
@@ -233,7 +238,7 @@ const fn zeros<const N: usize>() -> [AtomicU64; N] {
 }
 
 /// `http_requests_total{route, class}`; classes `2xx`, `4xx`, `5xx`.
-static REQUESTS: [[AtomicU64; 3]; 5] = [const { zeros() }; 5];
+static REQUESTS: [[AtomicU64; 3]; Route::ALL.len()] = [const { zeros() }; Route::ALL.len()];
 /// `http_refused_total{status, reason}`.
 static REFUSED: [AtomicU64; Refused::ALL.len()] = zeros();
 /// `accept_errors_total{class}`.
@@ -611,6 +616,87 @@ pub fn set_demand_coldest_ms(ms: u64) {
 /// Counts a `304` of `/block`.
 pub fn block_not_modified() {
     BLOCK_NOT_MODIFIED.fetch_add(1, Relaxed);
+}
+
+/// Why the body of a batch (`POST /sbtp/v1/blocks`, ADR 0051 rule 3) ended before its last
+/// record: the `reason` label of `batch_cut_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchEnd {
+    /// The next record would bring the body above 1,048,576 bytes (rule 4).
+    Ceiling,
+    /// The time budget of the response was spent.
+    Budget,
+    /// The block read queue refused the next record.
+    Busy,
+    /// The next record could not be read (an I/O error).
+    Failed,
+}
+
+impl BatchEnd {
+    const ALL: [Self; 4] = [Self::Ceiling, Self::Budget, Self::Busy, Self::Failed];
+
+    /// The label value.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ceiling => "ceiling",
+            Self::Budget => "budget",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// `batch_requests_total`: batches answered `200`.
+static BATCH_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// `batch_records_total{result}`: `served`, `missing`.
+static BATCH_RECORDS: [AtomicU64; 2] = zeros();
+/// `batch_cut_total{reason}`.
+static BATCH_CUT: [AtomicU64; BatchEnd::ALL.len()] = zeros();
+
+/// Counts a batch whose identifiers were accepted.
+pub fn batch_request() {
+    BATCH_REQUESTS.fetch_add(1, Relaxed);
+}
+
+/// Counts one record of a batch: a block (`served`) or `length = 0` (`missing`).
+pub fn batch_record(served: bool) {
+    if let Some(n) = BATCH_RECORDS.get(usize::from(!served)) {
+        n.fetch_add(1, Relaxed);
+    }
+}
+
+/// Counts a batch body ended early (rule 3).
+pub fn batch_end(why: BatchEnd) {
+    if let Some(n) = BATCH_CUT.get(why as usize) {
+        n.fetch_add(1, Relaxed);
+    }
+}
+
+/// The batch counters, by name (tests, `/metrics` later).
+#[must_use]
+pub fn batch_snapshot() -> Vec<(String, u64)> {
+    let mut out = vec![
+        (
+            "batch_requests_total".to_owned(),
+            BATCH_REQUESTS.load(Relaxed),
+        ),
+        (
+            "batch_records_total{result=\"served\"}".to_owned(),
+            BATCH_RECORDS.first().map_or(0, |n| n.load(Relaxed)),
+        ),
+        (
+            "batch_records_total{result=\"missing\"}".to_owned(),
+            BATCH_RECORDS.get(1).map_or(0, |n| n.load(Relaxed)),
+        ),
+    ];
+    for e in BatchEnd::ALL {
+        out.push((
+            format!("batch_cut_total{{reason=\"{}\"}}", e.name()),
+            BATCH_CUT.get(e as usize).map_or(0, |n| n.load(Relaxed)),
+        ));
+    }
+    out
 }
 
 /// The demand counters and gauges, by their ADR 0046 rule 29 names (tests, `/metrics` later).

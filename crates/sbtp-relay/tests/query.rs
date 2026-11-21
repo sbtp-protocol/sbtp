@@ -15,7 +15,7 @@ use common::{
     Response, TestServer, get as http_get, now_ms, put_block, settings, signed_block, tmp_dir,
 };
 use sbtp_core::BlockId;
-use sbtp_relay::index::{FileState, IndexBackend, IndexError, Page, Position, RedbIndex};
+use sbtp_relay::index::{FileState, IndexBackend, IndexError, Position, RedbIndex};
 use sbtp_relay::metrics;
 use sbtp_relay::store::{Store, reconcile};
 
@@ -58,7 +58,11 @@ fn page(c: &mut TcpStream, query: &str) -> (Vec<String>, String, bool) {
     let v = r.json();
     let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
     keys.sort();
-    assert_eq!(keys, ["block_ids", "cursor", "more"], "ADR 0012 rule 10");
+    assert_eq!(
+        keys,
+        ["block_ids", "cursor", "head", "more"],
+        "ADR 0012 rule 10, ADR 0051 rule 18"
+    );
     let ids = v["block_ids"].as_array().unwrap();
     let ids = ids.iter().map(|i| i.as_str().unwrap().to_owned()).collect();
     let cursor = v["cursor"].as_str().unwrap().to_owned();
@@ -262,10 +266,13 @@ impl IndexBackend for SlowQueries {
     fn contains(&self, id: &BlockId) -> Result<Option<Position>, IndexError> {
         self.0.contains(id)
     }
-    fn query(&self, p: Option<&BlockId>, from: Position, n: usize) -> Result<Page, IndexError> {
+    fn read_query(
+        &self,
+        plan: &sbtp_relay::index::QueryPlan,
+    ) -> Result<sbtp_relay::index::QueryAnswer, IndexError> {
         self.1.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(300));
-        self.0.query(p, from, n)
+        self.0.read_query(plan)
     }
     fn expired(
         &self,

@@ -147,6 +147,13 @@ impl ApiError {
         self
     }
 
+    /// Closes the connection after the response: the request body was not read.
+    #[must_use]
+    pub fn closing(mut self) -> Self {
+        self.close = true;
+        self
+    }
+
     /// The HTTP status.
     #[must_use]
     pub fn status(&self) -> StatusCode {

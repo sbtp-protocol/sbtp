@@ -40,6 +40,25 @@ Initial public version. Pre-release software: no version is supported for produc
   resource limits and admission control, structured logs and metrics, store integrity checks;
   distroless container image and reverse-proxy guidance in `deploy/`.
 - `sbtp-l2`: validation of the layer 2 grammar.
+- `sbtp-relay`, ADR 0051 stage 1 (read API for large graphs): `POST /sbtp/v1/blocks`, a batch read
+  of 1 to 256 raw identifiers (body of at most 8,192 bytes with `Content-Length`; chunked or
+  unannounced bodies get `400` and the connection closed), answered `no-store` with one
+  length-prefixed record per identifier in request order (`0` when not served), streamed one block
+  at a time through the read path of `GET /block`, ending after a complete record at 1 MiB, at
+  half of `request_timeout_ms` or when a later read is refused; it costs `⌈N / 4⌉` `block` tokens
+  at admission (64 without `Content-Length`, capped at the burst), counts each served block as
+  demand once per epoch, none with `Sbtp-Replication: 1` (which also gets `CDN-Cache-Control:
+  no-store`); CORS allows `POST`. `/query?fields=parents` adds `parents` and `lens` aligned with
+  `block_ids`, pages of at most 200, refused with `parent`. Counters `batch_requests_total`,
+  `batch_records_total{result}` and `batch_cut_total{reason}`; the route label
+  `/sbtp/v1/blocks`.
+- `sbtp-relay`, ADR 0051 stage 2: `/query?order=desc` (newest first, redb backward ranges; a
+  cursor names a gap and is valid in both orders; `since` and the expiry bound end a `desc` walk);
+  `head` in every `/query` response; `parent` repeated up to 32 times with per-parent cursors
+  `<block_id>.<cursor>`, the per-parent limit `max(1, ⌊max_query_limit / N⌋)`, one read
+  transaction and one reader job, the grouped body `{"head", "parents": [{"block_ids", "cursor",
+  "more", "parent"}]}`, and a weight of `⌈N / 8⌉` `query` tokens. `/info` publishes
+  `read_api: 2`.
 - `sbtp-core`: the inner signature of a sealed payload (`l2-grammar.md` §5.3): typed builder
   `sealed_sig_message` (into a caller buffer, no allocation), `sign_sealed`, and `verify_sealed` with the
   strict criteria V1 to V6 (`SealedSigError`); the layer 2 registry constants `SEALED_HPKE_INFO`,
@@ -200,6 +219,19 @@ Initial public version. Pre-release software: no version is supported for produc
 
 ### Fixed
 
+- Pre-push security review 2026-11-21 of replication and ingest bounds
+  (`docs/security/2026-11-21-replication-ingest-pre-push.md`), `sbtp-relay`:
+  - the byte budget of a network group (ADR 0049) is checked once the `PUT` permit is held, still
+    before the body is read: `PUT`s waiting in the queue no longer pass it uncharged, which let one
+    group store about 5 times its share (M-1);
+  - with `peers` set, `max_blocking_threads` defaults to (and must be at least)
+    `block_max_readers + put_max_in_flight + 2 + replication_max_in_flight + 1`: the DNS lookups and
+    cursor writes of replication no longer take the blocking threads of `GET` and `PUT` (L-1);
+  - the global ingest cap is checked after the signature: a bad signature gets `422`, not `503`,
+    while the cap is active (ADR 0049 rule 6, L-2);
+  - replication refuses peer addresses in `64:ff9b:1::/48`, `192.0.0.0/24` and `198.18.0.0/15`, and
+    judges 6to4 and Teredo addresses by the IPv4 addresses they embed (I-1);
+  - a peer URL with userinfo is refused without printing the userinfo back (I-2).
 - Pre-push security review 2026-11-21 (`docs/security/2026-11-21-pre-push-eviction-fixes-web-0047.md`):
   - `sbtp-relay`: a demand pass no longer ends after one deletion when `PUT`s or index growth move
     the admission total during it; a deletion ends the pass only when it released no quota bytes
