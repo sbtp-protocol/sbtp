@@ -161,10 +161,11 @@ At the 2,782 blocks/s of the fastest drain, signing is about 1.3% of one core.
 5. **Per-block CPU** of about 3 ms on this machine for an accepted block, mirror off, is mostly the
    durable write path on APFS; it is not affected by the mirror.
 
-## Remote runs (not run here)
+## Remote runs (not run yet)
 
-The harness is ready for a real endpoint. The endpoint, the bucket and the credentials never go into
-a file: the endpoint and the credentials come from environment variables, the rest from flags.
+The harness is ready for a real endpoint; no remote run has been made. The endpoint and the
+credentials come only from environment variables, the rest from flags; neither the endpoint nor a
+credential is ever printed or written to a file.
 
 - MinIO: `SBTP_MIRROR_BENCH_MINIO_ENDPOINT`, `SBTP_MIRROR_BENCH_MINIO_ACCESS_KEY_ID`,
   `SBTP_MIRROR_BENCH_MINIO_SECRET_ACCESS_KEY`.
@@ -177,17 +178,27 @@ Build once:
 cargo build --release --locked -p sbtp-relay --features object-store --bin sbtp-relay --example mirror_bench
 ```
 
-Then, with the three variables set in the environment of the command only:
+With `T="--target minio --bucket <bucket> --region us-east-1 --url-style path --allow-private"`
+(`--target s3 --region auto`, without `--allow-private`, for a provider) and the three variables in the
+environment of the command only:
 
 ```sh
-target/release/examples/mirror_bench run --relay target/release/sbtp-relay --work <scratch dir> \
-  --mirror remote --target minio --bucket <bucket> --region us-east-1 --url-style path \
-  --allow-private --in-flight 4 --blocks 200 --max-puts 200 --rate 10 --max-rate 10
-
-target/release/examples/mirror_bench run --relay target/release/sbtp-relay --work <scratch dir> \
-  --mirror remote --target s3 --bucket <bucket> --region auto --url-style path \
-  --in-flight 4 --blocks 200 --max-puts 200 --rate 10 --max-rate 10
+B=target/release/examples/mirror_bench; REL=target/release/sbtp-relay
+# Uploader throughput and lag under sustained ingest, client-facing latency while it runs.
+$B run --relay $REL --work <scratch> $T --mirror remote --in-flight 4 --blocks 6000 --payload-mix \
+  --rate 50 --max-rate 150 --max-puts 6000 --probe-every 20 --max-heads 1000 --drain-timeout-s 120
+# Burst: the uploader alone on a stored backlog, 8 lanes.
+$B run --relay $REL --work <scratch> $T --mirror remote --backlog --in-flight 8 --blocks 6000 \
+  --payload-mix --max-puts 6000 --max-rate 150 --probe-every 50 --drain-timeout-s 120
+# The store's PUT latency distribution, then the same blocks again (expect 412).
+$B s3put $T --blocks 6000 --payload-mix --rate 100 --max-rate 150 --max-puts 6000 --in-flight 4 \
+  --save-blocks <scratch>/blocks.bin
+$B s3put $T --load-blocks <scratch>/blocks.bin --rate 100 --max-rate 150 --max-puts 6000 --in-flight 4
 ```
 
-`--blocks` above `--max-puts` is refused; `--rate` is capped at `--max-rate`. Each block is one bucket
-`PUT` plus its retries, plus one `PUT` of `/info`, plus at most `--max-heads` signed `HEAD` probes.
+A block count above `--max-puts` is refused (default 200); `--rate` is capped at `--max-rate`
+(default 10/s). Each block is one bucket `PUT` plus its retries, plus one `PUT` of `/info`, plus at
+most `--max-heads` signed `HEAD` probes. The guards of the file's documentation stop a run on a
+store p99 above 1 s, on `5xx`/`507` answers or on relay `mirror_failed` lines. `fake-s3` runs the
+fake store alone so that these commands can be tried offline first (`..._ENDPOINT` set to its
+printed `http://127.0.0.1:<port>`, bucket `bench`).
