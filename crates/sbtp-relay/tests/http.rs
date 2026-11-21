@@ -87,6 +87,7 @@ fn info_has_exactly_the_adr_members() {
             // ADR 0046 rules 1, 2 and 4: keep by default, demand eviction on.
             "block_ttl_ms": null,
             "demand_eviction": true,
+            "read_api": 2,
         })
     );
     // ADR 0019 rule 25: no header carries the name or version of the relay.

@@ -1,6 +1,11 @@
-//! `GET /sbtp/v1/query?parent=&since=&limit=&cursor=&fields=` (spec §4; ADR 0012 rules 5 to 15
-//! and 32; ADR 0013 rules 3, 5 and 14; ADR 0018 rules 12 to 14 and 30; ADR 0024; ADR 0051 rules
-//! 13 and 14).
+//! `GET /sbtp/v1/query?parent=&since=&limit=&cursor=&order=&fields=` (spec §4; ADR 0012 rules 5
+//! to 15 and 32; ADR 0013 rules 3, 5 and 14; ADR 0018 rules 12 to 14 and 30; ADR 0024; ADR 0051
+//! rules 13 to 27).
+//!
+//! `parent` may be repeated (1 to 32 distinct values); with two or more, each value may carry a
+//! per-parent cursor, `<block_id>.<cursor>`, and the response is grouped (rule 24). Every response
+//! carries `head` (rule 18). A cursor names a gap of the store order and is valid in both orders
+//! and with any parent (rules 16 and 27).
 //!
 //! The query string is read as received, not percent-decoded: every accepted value is plain
 //! ASCII from a fixed set, so a `%` or a `+` is malformed. Nothing a client sent is logged.
@@ -27,6 +32,9 @@ pub const DEFAULT_LIMIT: u64 = 100;
 /// ADR 0051 rule 14: the page size bound with `fields=parents`.
 pub const MAX_FIELDS_LIMIT: u64 = 200;
 
+/// ADR 0051 rule 21: `parent` values per request at most.
+pub const MAX_PARENTS: usize = 32;
+
 /// ADR 0012 rule 5: the length bound of a `cursor`.
 const MAX_CURSOR_CHARS: usize = 128;
 
@@ -49,6 +57,12 @@ pub enum QueryError {
     MalformedLimit,
     /// ADR 0012 rule 5: `cursor` is not 1 to 128 characters of `A-Z a-z 0-9 - _`.
     MalformedCursor,
+    /// ADR 0051 rule 21: a 33rd `parent`.
+    TooManyParents,
+    /// ADR 0051 rule 21: a `parent` identifier given twice.
+    RepeatedParent,
+    /// ADR 0051 rule 15: `order` is not `asc` or `desc`.
+    MalformedOrder,
     /// ADR 0051 rule 13: `fields` is not `parents`.
     MalformedFields,
     /// ADR 0051 rule 14: `fields` with `parent`.
@@ -69,15 +83,19 @@ impl QueryError {
                  and fields",
             ),
             Self::RepeatedParameter => invalid().with_message("a query parameter is repeated"),
-            Self::MalformedParent => {
-                invalid().with_message("parent must be 64 lowercase hexadecimal characters")
-            }
+            Self::MalformedParent => invalid().with_message(
+                "parent must be 64 lowercase hexadecimal characters, with .cursor only when \
+                 parent is repeated",
+            ),
             Self::MalformedSince => {
                 invalid().with_message("since must be a decimal u64 in Unix milliseconds")
             }
             Self::MalformedLimit => invalid().with_message("limit must be a decimal integer >= 1"),
             Self::MalformedCursor => invalid()
                 .with_message("cursor must be 1 to 128 characters of A-Z, a-z, 0-9, - and _"),
+            Self::TooManyParents => invalid().with_message("at most 32 parent values"),
+            Self::RepeatedParent => invalid().with_message("a parent is repeated"),
+            Self::MalformedOrder => invalid().with_message("order must be asc or desc"),
             Self::MalformedFields => invalid().with_message("fields must be parents"),
             Self::FieldsWithParent => invalid().with_message("fields is not allowed with parent"),
             Self::UnrecognisedCursor => ApiError::invalid_cursor(),
@@ -85,11 +103,20 @@ impl QueryError {
     }
 }
 
-/// The parameters of one request, syntax checked; the cursor is not decoded yet.
+/// One `parent` value (ADR 0051 rule 21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentParam<'a> {
+    /// The parent.
+    pub id: BlockId,
+    /// Its per-parent cursor, as received; only when `parent` is repeated.
+    pub cursor: Option<&'a str>,
+}
+
+/// The parameters of one request, syntax checked; the cursors are not decoded yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Params<'a> {
-    /// `parent`.
-    pub parent: Option<BlockId>,
+    /// The `parent` values, in request order, 0 to 32, distinct.
+    pub parents: Vec<ParentParam<'a>>,
     /// `since`, Unix milliseconds of the relay clock (ADR 0012 rule 7).
     pub since: Option<u64>,
     /// `limit`, at least 1; a value past `u64::MAX` saturates (it is lowered anyway, rule 8).
@@ -98,6 +125,8 @@ pub struct Params<'a> {
     pub cursor: Option<&'a str>,
     /// `fields=parents` (ADR 0051 rule 13).
     pub fields: Option<bool>,
+    /// `order` (ADR 0051 rule 15).
+    pub order: Option<Order>,
 }
 
 /// Parses a raw query string (ADR 0012 rule 5). An absent or empty query has no parameter.
@@ -113,9 +142,28 @@ pub fn parse_params(query: Option<&str>) -> Result<Params<'_>, QueryError> {
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=').ok_or(QueryError::UnknownParameter)?;
         match name {
-            "parent" => set(
-                &mut p.parent,
-                parse_hex_id(value).ok_or(QueryError::MalformedParent)?,
+            "parent" => {
+                // ADR 0051 rule 21: `.` is outside the cursor alphabet.
+                let (id, cursor) = match value.split_once('.') {
+                    Some((id, c)) => (id, Some(cursor_syntax(c)?)),
+                    None => (value, None),
+                };
+                let id = parse_hex_id(id).ok_or(QueryError::MalformedParent)?;
+                if p.parents.len() == MAX_PARENTS {
+                    return Err(QueryError::TooManyParents);
+                }
+                if p.parents.iter().any(|q| q.id == id) {
+                    return Err(QueryError::RepeatedParent);
+                }
+                p.parents.push(ParentParam { id, cursor });
+            }
+            "order" => set(
+                &mut p.order,
+                match value {
+                    "asc" => Order::Asc,
+                    "desc" => Order::Desc,
+                    _ => return Err(QueryError::MalformedOrder),
+                },
             )?,
             "since" => set(
                 &mut p.since,
@@ -130,8 +178,14 @@ pub fn parse_params(query: Option<&str>) -> Result<Params<'_>, QueryError> {
             _ => return Err(QueryError::UnknownParameter),
         }
     }
+    // ADR 0051 rule 21: with a single `parent` the `.<cursor>` form is malformed.
+    if let [one] = p.parents.as_slice()
+        && one.cursor.is_some()
+    {
+        return Err(QueryError::MalformedParent);
+    }
     // ADR 0051 rule 14.
-    if p.fields.is_some() && p.parent.is_some() {
+    if p.fields.is_some() && !p.parents.is_empty() {
         return Err(QueryError::FieldsWithParent);
     }
     Ok(p)
@@ -194,19 +248,51 @@ fn cursor_bytes(epoch: u64, at: Position) -> [u8; 20] {
 /// Every value is hexadecimal, a number or a boolean, so nothing needs escaping. Members are in
 /// alphabetical order.
 #[must_use]
-pub fn page_body(epoch: u64, page: &Page) -> Vec<u8> {
-    let mut out = Vec::with_capacity(page_len(page) + 2);
+pub fn page_body(epoch: u64, page: &Page, head: Position) -> Vec<u8> {
+    let mut out = Vec::with_capacity(page_len(page, true) + 2);
     out.push(b'{');
-    push_page(&mut out, epoch, page);
+    push_page(&mut out, epoch, page, Some(head));
     out.push(b'}');
     out
 }
 
-/// The bytes [`push_page`] writes for `page`.
-fn page_len(page: &Page) -> usize {
-    // `"block_ids":[` … `],"cursor":"` 40 `","more":false`.
+/// The grouped body of ADR 0051 rule 24: `{"head": …, "parents": [{"block_ids", "cursor",
+/// "more", "parent"} …]}`, one entry per requested parent in request order, in one buffer of
+/// its exact size. `parents` and `pages` are aligned.
+#[must_use]
+pub fn grouped_body(epoch: u64, parents: &[BlockId], pages: &[Page], head: Position) -> Vec<u8> {
+    // `{"head":"` 40 `","parents":[` … `]}`; per entry `{` … `,"parent":"` 64 `"}` and a comma.
+    let entries: usize = pages
+        .iter()
+        .map(|p| page_len(p, false) + 2 + 11 + 64 + 1)
+        .sum::<usize>()
+        + pages.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(9 + 40 + 13 + entries + 2);
+    out.extend_from_slice(br#"{"head":""#);
+    push_hex(&mut out, &cursor_bytes(epoch, head));
+    out.extend_from_slice(br#"","parents":["#);
+    for (k, (parent, page)) in parents.iter().zip(pages).enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        out.push(b'{');
+        push_page(&mut out, epoch, page, None);
+        out.extend_from_slice(br#","parent":""#);
+        push_hex(&mut out, parent.as_bytes());
+        out.extend_from_slice(b"\"}");
+    }
+    out.extend_from_slice(b"]}");
+    out
+}
+
+/// The bytes [`push_page`] writes for `page`, with or without `head`.
+fn page_len(page: &Page, head: bool) -> usize {
+    // `"block_ids":[` … `],"cursor":"` 40 `","more":false`, and `,"head":"` 40 `"`.
     let ids = page.entries.len().saturating_mul(67).saturating_sub(1);
     let mut n = 13 + ids + 12 + 40 + 9 + if page.more { 4 } else { 5 };
+    if head {
+        n += 9 + 40 + 1;
+    }
     if !page.fields.is_empty() {
         // `,"lens":[` … `],"parents":[` … `]`.
         n += 9 + 2 + 11 + 1;
@@ -223,13 +309,18 @@ fn decimal_len(v: u32) -> usize {
     v.checked_ilog10().map_or(1, |l| l as usize + 1)
 }
 
-/// The members of one page, without braces.
-fn push_page(out: &mut Vec<u8>, epoch: u64, page: &Page) {
+/// The members of one page, without braces, in alphabetical order; `head` when given.
+fn push_page(out: &mut Vec<u8>, epoch: u64, page: &Page, head: Option<Position>) {
     out.extend_from_slice(br#""block_ids":["#);
     push_ids(out, page.entries.iter().map(|(_, id)| id));
     out.extend_from_slice(br#"],"cursor":""#);
     push_hex(out, &cursor_bytes(epoch, page.next));
     out.push(b'"');
+    if let Some(head) = head {
+        out.extend_from_slice(br#","head":""#);
+        push_hex(out, &cursor_bytes(epoch, head));
+        out.push(b'"');
+    }
     if !page.fields.is_empty() {
         out.extend_from_slice(br#","lens":["#);
         for (k, f) in page.fields.iter().enumerate() {
@@ -321,6 +412,17 @@ fn index_read_failed<I: IndexBackend>(e: &I::Error) {
     log::throttled(&QUERY_LOG, Event::IndexReadFailed, &fields, None);
 }
 
+/// The page of a listing the index did not return (never: one page per listing).
+static EMPTY_PAGE: Page = Page {
+    entries: Vec::new(),
+    next: Position {
+        received_at: 0,
+        n: 0,
+    },
+    more: false,
+    fields: Vec::new(),
+};
+
 /// The state of the `/query` route.
 pub struct QueryState<I> {
     /// ADR 0018 rules 9 to 13: each page is one job of the index reader threads.
@@ -369,49 +471,72 @@ pub async fn query<I: IndexBackend + 'static>(
     };
     // ADR 0013 rule 5: the epoch changes only during the start-up walk, before the relay listens.
     let epoch = q.index.epoch();
-    let cursor = match p.cursor.map(|c| decode_cursor(c, epoch)).transpose() {
+    // ADR 0051 rule 27: one unrecognised cursor makes the whole request `400`.
+    let decode = |c: Option<&str>| c.map(|c| decode_cursor(c, epoch)).transpose();
+    let shared = match decode(p.cursor) {
         Ok(c) => c,
         Err(e) => return e.to_api().into_response(),
     };
-    // ADR 0012 rule 9: the later of `since` and the cursor.
-    let start = p
-        .since
-        .map_or_else(Position::default, Position::at)
-        .max(cursor.unwrap_or_default());
+    let mut listings = Vec::with_capacity(p.parents.len().max(1));
+    if p.parents.is_empty() {
+        listings.push(Listing {
+            parent: None,
+            cursor: shared,
+        });
+    }
+    for parent in &p.parents {
+        match decode(parent.cursor) {
+            // A per-parent cursor overrides `cursor` for that parent (rule 21).
+            Ok(own) => listings.push(Listing {
+                parent: Some(parent.id),
+                cursor: own.or(shared),
+            }),
+            Err(e) => return e.to_api().into_response(),
+        }
+    }
     // ADR 0012 rule 8: lowered to `max_query_limit`, not an error; the index clamps again (ADR
-    // 0018 rule 14). ADR 0051 rule 14: at most 200 with `fields`.
+    // 0018 rule 14). ADR 0051 rule 23: per parent, lowered to `max(1, ⌊max_query_limit / N⌋)`;
+    // rule 14: at most 200 with `fields`.
     let fields = p.fields.is_some();
-    let mut limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(q.max_limit);
+    let count = listings.len() as u64;
+    let mut limit = p
+        .limit
+        .unwrap_or(DEFAULT_LIMIT)
+        .min(q.max_limit)
+        .min((q.max_limit / count).max(1));
     if fields {
         limit = limit.min(MAX_FIELDS_LIMIT);
     }
+    // ADR 0012 rule 9, ADR 0051 rule 17: `since` is the lower end in both orders.
+    let since = p.since.map_or_else(Position::default, Position::at);
+    let grouped: Vec<BlockId> = if p.parents.len() >= 2 {
+        p.parents.iter().map(|x| x.id).collect()
+    } else {
+        Vec::new()
+    };
     let mut plan = QueryPlan {
-        listings: vec![Listing {
-            parent: p.parent,
-            cursor: None,
-        }],
-        order: Order::Asc,
-        lower: start,
+        listings,
+        order: p.order.unwrap_or_default(),
+        lower: since,
         limit: usize::try_from(limit).unwrap_or(MAX_QUERY_LIMIT),
         fields,
     };
     let (ttl, clock) = (q.block_ttl_ms, q.clock);
+    // ADR 0051 rule 25: one job of the reader threads, one read transaction.
     let page = q
         .index
         .read(move |index| {
             // ADR 0013 rule 14 (security review L-1): the expiry bound is read when the page is
             // built, after the wait in the reader queue, not when the request arrived.
-            plan.lower = start.max(expiry_floor(ttl, clock()));
-            index
-                .read_query(&plan)
-                .map(|mut a| a.pages.pop().unwrap_or_default())
+            plan.lower = since.max(expiry_floor(ttl, clock()));
+            index.read_query(&plan)
         })
         .await;
     if let Ok(r) = &page {
         q.index.record_read(r); // ADR 0018 rule 37
     }
-    let page = match page {
-        Ok(Ok(page)) => page,
+    let answer = match page {
+        Ok(Ok(answer)) => answer,
         // ADR 0012 clarification K2, ADR 0021 clarifications X1, X3 and X4: a read failure of
         // the index is `500` with no detail; it changes no state (no epoch change, no shedding),
         // so every cursor stays valid.
@@ -431,7 +556,12 @@ pub async fn query<I: IndexBackend + 'static>(
             return ApiError::unavailable(q.retry_after_s).into_response();
         }
     };
-    let body = page_body(epoch, &page);
+    let body = if grouped.is_empty() {
+        let page = answer.pages.first().unwrap_or(&EMPTY_PAGE);
+        page_body(epoch, page, answer.head)
+    } else {
+        grouped_body(epoch, &grouped, &answer.pages, answer.head)
+    };
     let mut r = Response::new(Body::from(body));
     let h = r.headers_mut();
     h.insert(
@@ -460,7 +590,8 @@ mod tests {
         assert_eq!(parse(""), Ok(Params::default()));
         let q = format!("parent={H}&since=17&limit=007&cursor=a-Z_9");
         let p = parse(&q).unwrap();
-        assert_eq!(p.parent, parse_hex_id(H));
+        assert_eq!(p.parents.len(), 1);
+        assert_eq!(Some(p.parents[0].id), parse_hex_id(H));
         assert_eq!(
             (p.since, p.limit, p.cursor),
             (Some(17), Some(7), Some("a-Z_9"))
@@ -493,7 +624,126 @@ mod tests {
             assert_eq!(parse(q), Err(QueryError::RepeatedParameter), "{q}");
         }
         let p = format!("parent={H}&parent={H}");
-        assert_eq!(parse(&p), Err(QueryError::RepeatedParameter));
+        assert_eq!(parse(&p), Err(QueryError::RepeatedParent));
+        assert_eq!(
+            parse("order=asc&order=asc"),
+            Err(QueryError::RepeatedParameter)
+        );
+    }
+
+    /// ADR 0051 rules 15 and 21: `order`, repeated `parent` with per-parent cursors.
+    #[test]
+    fn order_and_repeated_parents() {
+        assert_eq!(parse("order=asc").unwrap().order, Some(Order::Asc));
+        assert_eq!(parse("order=desc").unwrap().order, Some(Order::Desc));
+        for q in ["order=", "order=DESC", "order=newest"] {
+            assert_eq!(parse(q), Err(QueryError::MalformedOrder), "{q}");
+        }
+        let id = |n: usize| format!("{n:064x}");
+        let many = |n: usize| {
+            (0..n)
+                .map(|k| format!("parent={}", id(k)))
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        assert_eq!(parse(&many(32)).unwrap().parents.len(), 32);
+        assert_eq!(parse(&many(33)), Err(QueryError::TooManyParents));
+        let q = format!("parent={}.abc&parent={}&cursor=zz", id(1), id(2));
+        let p = parse(&q).unwrap();
+        assert_eq!(p.parents[0].cursor, Some("abc"));
+        assert_eq!(p.parents[1].cursor, None);
+        assert_eq!(p.cursor, Some("zz"));
+        let one = format!("parent={}.abc", id(1));
+        assert_eq!(
+            parse(&one),
+            Err(QueryError::MalformedParent),
+            "one parent, .cursor"
+        );
+        let long = "a".repeat(129);
+        for c in ["", long.as_str(), "a.b", "a+b"] {
+            let q = format!("parent={}.{c}&parent={}", id(1), id(2));
+            assert_eq!(parse(&q), Err(QueryError::MalformedCursor), "{q}");
+        }
+        assert!(
+            parse(&format!(
+                "parent={}.{}&parent={}",
+                id(1),
+                "a".repeat(128),
+                id(2)
+            ))
+            .is_ok()
+        );
+        let q = format!("parent={}.abc&parent={}.abc", id(1), id(1));
+        assert_eq!(
+            parse(&q),
+            Err(QueryError::RepeatedParent),
+            "same id, any cursor"
+        );
+        assert_eq!(
+            parse("cursor=a.b"),
+            Err(QueryError::MalformedCursor),
+            "rule 21"
+        );
+        let q = format!("{}&fields=parents", many(2));
+        assert_eq!(parse(&q), Err(QueryError::FieldsWithParent));
+        for e in [
+            QueryError::TooManyParents,
+            QueryError::RepeatedParent,
+            QueryError::MalformedOrder,
+        ] {
+            assert_eq!(e.to_api().name(), "InvalidParameter");
+        }
+    }
+
+    /// ADR 0051 rule 24: the grouped body, exactly sized; its worst case (32 parents, 31 entries
+    /// each, at `max_query_limit = 1000`) stays under the 131,072-byte ceiling of `/query`.
+    #[test]
+    fn grouped_body_shape_and_bound() {
+        let at = |n| Position { received_at: 5, n };
+        let pages = vec![
+            Page {
+                entries: vec![(at(1), BlockId([0x77; 32]))],
+                next: at(2),
+                more: false,
+                fields: Vec::new(),
+            },
+            Page {
+                entries: Vec::new(),
+                next: at(0),
+                more: true,
+                fields: Vec::new(),
+            },
+        ];
+        let parents = [BlockId([0x9e; 32]), BlockId([0x4c; 32])];
+        let body = grouped_body(3, &parents, &pages, at(7));
+        assert_eq!(body.len(), body.capacity(), "sized exactly");
+        let expected = serde_json::json!({
+            "head": encode_cursor(3, at(7)),
+            "parents": [
+                {"block_ids": [BlockId([0x77; 32]).to_string()], "cursor": encode_cursor(3, at(2)),
+                 "more": false, "parent": parents[0].to_string()},
+                {"block_ids": [], "cursor": encode_cursor(3, at(0)), "more": true,
+                 "parent": parents[1].to_string()},
+            ],
+        });
+        assert_eq!(body, expected.to_string().into_bytes());
+        let per = (1_000 / MAX_PARENTS).max(1);
+        let worst: Vec<Page> = (0..MAX_PARENTS)
+            .map(|_| Page {
+                entries: (0..per)
+                    .map(|n| (at(u32::try_from(n).unwrap()), BlockId([1; 32])))
+                    .collect(),
+                next: at(0),
+                more: false,
+                fields: Vec::new(),
+            })
+            .collect();
+        let parents: Vec<BlockId> = (0..MAX_PARENTS)
+            .map(|n| BlockId([u8::try_from(n).unwrap(); 32]))
+            .collect();
+        let body = grouped_body(3, &parents, &worst, at(0));
+        assert_eq!(body.len(), body.capacity());
+        assert!(body.len() < 131_072, "{}", body.len());
     }
 
     #[test]
@@ -670,12 +920,13 @@ mod tests {
                 more,
                 fields: Vec::new(),
             };
-            let body = page_body(5, &page);
+            let body = page_body(5, &page, at(11));
             assert_eq!(body.len(), body.capacity(), "sized exactly");
             let ids: Vec<String> = page.entries.iter().map(|(_, id)| id.to_string()).collect();
             let expected = serde_json::json!({
                 "block_ids": ids,
                 "cursor": encode_cursor(5, page.next),
+                "head": encode_cursor(5, at(11)),
                 "more": more,
             });
             assert_eq!(
@@ -707,12 +958,13 @@ mod tests {
             more: true,
             fields: vec![f(118, &[]), f(9, &[1]), f(65_909, &[2, 1])],
         };
-        let body = page_body(5, &page);
+        let body = page_body(5, &page, at(4));
         assert_eq!(body.len(), body.capacity(), "sized exactly");
         let hex = |b: u8| BlockId([b; 32]).to_string();
         let expected = serde_json::json!({
             "block_ids": [hex(1), hex(2), hex(3)],
             "cursor": encode_cursor(5, page.next),
+            "head": encode_cursor(5, at(4)),
             "lens": [118, 9, 65_909],
             "more": true,
             "parents": [[], [hex(1)], [hex(2), hex(1)]],
@@ -726,7 +978,7 @@ mod tests {
                 .map(|_| f(65_909, &[1, 2, 3, 4, 5, 6, 7, 8]))
                 .collect(),
         };
-        let body = page_body(5, &worst);
+        let body = page_body(5, &worst, at(0));
         assert_eq!(body.len(), body.capacity());
         assert!(body.len() < 131_072, "{}", body.len());
     }

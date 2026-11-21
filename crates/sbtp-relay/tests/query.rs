@@ -58,7 +58,11 @@ fn page(c: &mut TcpStream, query: &str) -> (Vec<String>, String, bool) {
     let v = r.json();
     let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
     keys.sort();
-    assert_eq!(keys, ["block_ids", "cursor", "more"], "ADR 0012 rule 10");
+    assert_eq!(
+        keys,
+        ["block_ids", "cursor", "head", "more"],
+        "ADR 0012 rule 10, ADR 0051 rule 18"
+    );
     let ids = v["block_ids"].as_array().unwrap();
     let ids = ids.iter().map(|i| i.as_str().unwrap().to_owned()).collect();
     let cursor = v["cursor"].as_str().unwrap().to_owned();

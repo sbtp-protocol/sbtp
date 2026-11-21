@@ -402,3 +402,273 @@ fn fields_pages_are_capped_at_200() {
     let v = get(&mut c, "/sbtp/v1/query?limit=1000", "").json();
     assert_eq!(v["block_ids"].as_array().unwrap().len(), 205);
 }
+
+/// `/query` with `query`, as JSON, asserting `200`.
+fn query(c: &mut TcpStream, q: &str) -> serde_json::Value {
+    let r = get(c, &format!("/sbtp/v1/query?{q}"), "");
+    assert_eq!(r.status, 200, "{q}: {}", String::from_utf8_lossy(&r.body));
+    r.json()
+}
+
+fn listed(v: &serde_json::Value) -> Vec<String> {
+    v["block_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn s(v: &serde_json::Value, k: &str) -> String {
+    v[k].as_str().unwrap().to_owned()
+}
+
+/// ADR 0051 rules 15 to 19: `desc` lists newest first across pages; each cursor names a gap and
+/// works in both orders; `since` ends a `desc` walk; `head` is in every response and an `asc`
+/// poll from it returns exactly the blocks stored since; `order` other than `asc` or `desc` is
+/// `400`.
+#[test]
+fn desc_walks_both_ways_and_head_polls() {
+    let relay = start(&[("RATE_PUT_BURST", "1000"), ("RATE_QUERY_BURST", "1000")]);
+    let mut c = relay.connect();
+    let (_, root) = store(&mut c, b"root", &[]);
+    let kids: Vec<String> = (0..7u32)
+        .map(|n| {
+            // Distinct milliseconds for the `since` check.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            store(&mut c, format!("kid {n}").as_bytes(), &[root])
+                .1
+                .to_string()
+        })
+        .collect();
+    let newest_first: Vec<String> = kids.iter().rev().cloned().collect();
+    // Backward, three per page.
+    let p = format!("parent={root}&order=desc&limit=3");
+    let v1 = query(&mut c, &p);
+    assert_eq!(listed(&v1), newest_first[..3]);
+    assert_eq!(v1["more"], true);
+    let v2 = query(&mut c, &format!("{p}&cursor={}", s(&v1, "cursor")));
+    assert_eq!(listed(&v2), newest_first[3..6]);
+    let v3 = query(&mut c, &format!("{p}&cursor={}", s(&v2, "cursor")));
+    assert_eq!(listed(&v3), newest_first[6..]);
+    assert_eq!(v3["more"], false);
+    // The gap of page 1, forward: the blocks after it, oldest first.
+    let up = query(
+        &mut c,
+        &format!("parent={root}&order=asc&cursor={}", s(&v1, "cursor")),
+    );
+    assert_eq!(listed(&up), kids[4..]);
+    // An `asc` cursor, backward.
+    let a = query(&mut c, &format!("parent={root}&limit=2"));
+    let back = query(
+        &mut c,
+        &format!("parent={root}&order=desc&cursor={}", s(&a, "cursor")),
+    );
+    assert_eq!(listed(&back), vec![kids[1].clone(), kids[0].clone()]);
+    // `head` is in every response, and the same while nothing is stored.
+    let head = s(&v1, "head");
+    for v in [&v2, &v3, &up, &a, &back] {
+        assert_eq!(s(v, "head"), head);
+    }
+    let poll = query(&mut c, &format!("parent={root}&cursor={head}"));
+    assert_eq!(listed(&poll), Vec::<String>::new());
+    assert_eq!(poll["more"], false);
+    let (_, late) = store(&mut c, b"late kid", &[root]);
+    let (_, other) = store(&mut c, b"unrelated", &[]);
+    let poll = query(&mut c, &format!("parent={root}&cursor={head}"));
+    assert_eq!(listed(&poll), vec![late.to_string()]);
+    let all = query(&mut c, &format!("cursor={head}"));
+    assert_eq!(listed(&all), vec![late.to_string(), other.to_string()]);
+    assert_ne!(s(&all, "head"), head, "head moved");
+    let r = get(&mut c, "/sbtp/v1/query?order=up", "");
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, "InvalidParameter".into())
+    );
+}
+
+/// ADR 0051 rule 17: with `desc`, `since` and the expiry bound end the walk with `more =
+/// false`.
+#[test]
+fn desc_stops_at_since_and_expiry() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(1_000_000);
+    fn clock() -> u64 {
+        NOW.load(Ordering::SeqCst)
+    }
+    let s_ = settings(&[
+        ("MIN_POW_DIFFICULTY", "0"),
+        ("BLOCK_TTL_MS", "60000"),
+        ("RATE_PUT_BURST", "1000"),
+    ]);
+    let relay = TestServer::start_clocked(&s_, clock);
+    let mut c = relay.connect();
+    let mut ids = Vec::new();
+    for n in 0..5u64 {
+        NOW.store(1_000_000 + n * 10_000, Ordering::SeqCst);
+        let k = sbtp_core::SigningKey::from_bytes(&[4; 32]);
+        let bytes = sbtp_core::BlockBuilder::for_key(&k)
+            .timestamp(1)
+            .payload(format!("ttl {n}").as_bytes())
+            .build(&k, 0)
+            .unwrap();
+        assert_eq!(put_block(&mut c, &bytes).status, 201);
+        ids.push(sbtp_core::parse(&bytes).unwrap().block_id().to_string());
+    }
+    // Now 1,040,000: nothing expired yet.
+    let v = query(&mut c, "order=desc&since=1020000");
+    assert_eq!(
+        listed(&v),
+        vec![ids[4].clone(), ids[3].clone(), ids[2].clone()]
+    );
+    assert_eq!(v["more"], false);
+    // At 1,075,000 the blocks received at 1,000,000 and 1,010,000 are expired.
+    NOW.store(1_075_000, Ordering::SeqCst);
+    let v = query(&mut c, "order=desc&limit=3");
+    assert_eq!(
+        listed(&v),
+        vec![ids[4].clone(), ids[3].clone(), ids[2].clone()]
+    );
+    assert_eq!(v["more"], false, "the expiry bound ends the walk");
+}
+
+/// ADR 0051 rules 21 to 28: several parents in one request, grouped in request order, each with
+/// its cursor and `more`; per-parent cursors override `cursor`; the per-parent limit is lowered
+/// to `max(1, ⌊max_query_limit / N⌋)`; one unrecognised cursor fails the whole request.
+#[test]
+fn grouped_listings_and_per_parent_more() {
+    let relay = start(&[
+        ("RATE_PUT_BURST", "1000"),
+        ("RATE_QUERY_BURST", "1000"),
+        ("MAX_QUERY_LIMIT", "4"),
+    ]);
+    let mut c = relay.connect();
+    let (_, p1) = store(&mut c, b"p1", &[]);
+    let (_, p2) = store(&mut c, b"p2", &[]);
+    let (_, p3) = store(&mut c, b"p3", &[]);
+    let k1: Vec<String> = (0..3u32)
+        .map(|n| {
+            store(&mut c, format!("a{n}").as_bytes(), &[p1])
+                .1
+                .to_string()
+        })
+        .collect();
+    let k2 = store(&mut c, b"b0", &[p2]).1.to_string();
+    // Three parents, `max_query_limit` 4: one entry per parent per page.
+    let v = query(&mut c, &format!("parent={p1}&parent={p2}&parent={p3}"));
+    let groups = v["parents"].as_array().unwrap();
+    assert_eq!(groups.len(), 3);
+    assert!(v.get("block_ids").is_none() && v["head"].is_string());
+    for (g, p) in groups.iter().zip([p1, p2, p3]) {
+        assert_eq!(s(g, "parent"), p.to_string(), "request order");
+    }
+    assert_eq!(listed(&groups[0]), vec![k1[0].clone()]);
+    assert_eq!(groups[0]["more"], true);
+    assert_eq!(listed(&groups[1]), vec![k2.clone()]);
+    assert_eq!(groups[1]["more"], false);
+    assert_eq!(listed(&groups[2]), Vec::<String>::new());
+    assert_eq!(groups[2]["more"], false, "a complete, empty listing");
+    // Continue the first parent only, with its own cursor; the others from `head`.
+    let head = s(&v, "head");
+    let v2 = query(
+        &mut c,
+        &format!(
+            "parent={p1}.{}&parent={p2}&cursor={head}",
+            s(&groups[0], "cursor")
+        ),
+    );
+    let g2 = v2["parents"].as_array().unwrap();
+    assert_eq!(listed(&g2[0]), k1[1..], "two parents: two per page");
+    assert!(listed(&g2[1]).is_empty(), "nothing after head");
+    // Two parents: two per page; `desc` grouped.
+    let v3 = query(
+        &mut c,
+        &format!("parent={p1}&parent={p2}&order=desc&limit=9"),
+    );
+    let g3 = v3["parents"].as_array().unwrap();
+    assert_eq!(listed(&g3[0]), vec![k1[2].clone(), k1[1].clone()]);
+    assert_eq!(g3[0]["more"], true);
+    // One unrecognised cursor fails the whole request.
+    let bad = "0".repeat(40);
+    let r = get(
+        &mut c,
+        &format!("/sbtp/v1/query?parent={p1}.{bad}&parent={p2}"),
+        "",
+    );
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, "InvalidCursor".into())
+    );
+    // Malformed forms.
+    let many: Vec<String> = (0..33u8)
+        .map(|n| format!("parent={}", BlockId([n; 32])))
+        .collect();
+    for q in [
+        many.join("&"),
+        format!("parent={p1}&parent={p1}"),
+        format!("parent={p1}.{head}"),
+        format!("parent={p1}&parent={p2}&fields=parents"),
+    ] {
+        let r = get(&mut c, &format!("/sbtp/v1/query?{q}"), "");
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (400, "InvalidParameter".into())
+        );
+    }
+    let ok: Vec<String> = (0..32u8)
+        .map(|n| format!("parent={}", BlockId([n; 32])))
+        .collect();
+    let v = query(&mut c, &ok.join("&"));
+    assert_eq!(v["parents"].as_array().unwrap().len(), 32);
+}
+
+/// ADR 0051 rule 27: a cursor taken from one parent's listing, used for another, starts that
+/// listing at the same gap, as `since` would: it grants nothing that a listing from the start
+/// of that parent would not show.
+#[test]
+fn cursor_reuse_across_parents_grants_nothing() {
+    let relay = start(&[("RATE_PUT_BURST", "1000"), ("RATE_QUERY_BURST", "1000")]);
+    let mut c = relay.connect();
+    let (_, a) = store(&mut c, b"pa", &[]);
+    let (_, b) = store(&mut c, b"pb", &[]);
+    let b0 = store(&mut c, b"b early", &[b]).1.to_string();
+    let a0 = store(&mut c, b"a0", &[a]).1.to_string();
+    let b1 = store(&mut c, b"b late", &[b]).1.to_string();
+    let va = query(&mut c, &format!("parent={a}"));
+    assert_eq!(listed(&va), vec![a0]);
+    let cur = s(&va, "cursor");
+    // `asc` for `b` from `a`'s cursor: only `b`'s children after that gap.
+    let vb = query(&mut c, &format!("parent={b}&cursor={cur}"));
+    assert_eq!(listed(&vb), vec![b1.clone()]);
+    // `desc`: only `b`'s children before it.
+    let vd = query(&mut c, &format!("parent={b}&order=desc&cursor={cur}"));
+    assert_eq!(listed(&vd), vec![b0.clone()]);
+    // Together they are exactly `b`'s full listing: nothing more, nothing of `a`.
+    let full = query(&mut c, &format!("parent={b}"));
+    assert_eq!(listed(&full), vec![b0, b1]);
+}
+
+/// ADR 0051 rule 26: a `/query` takes `⌈N / 8⌉` `query` tokens at admission. With a burst of 8
+/// and a refill of 1 per minute: two requests of 32 parents (4 tokens each) pass, a third
+/// request gets `429`.
+#[test]
+fn grouped_query_weight() {
+    let relay = start(&[("RATE_QUERY_BURST", "8"), ("RATE_QUERY_PER_MIN", "1")]);
+    let mut c = relay.connect();
+    let q: Vec<String> = (0..32u8)
+        .map(|n| format!("parent={}", BlockId([n; 32])))
+        .collect();
+    let q = q.join("&");
+    query(&mut c, &q);
+    query(&mut c, &q);
+    let r = get(&mut c, "/sbtp/v1/query", "");
+    assert_eq!(r.status, 429);
+}
+
+/// ADR 0051 rule 31: `/info` publishes `read_api: 2`.
+#[test]
+fn info_publishes_read_api_2() {
+    let relay = start(&[]);
+    let mut c = relay.connect();
+    assert_eq!(get(&mut c, "/sbtp/v1/info", "").json()["read_api"], 2);
+}

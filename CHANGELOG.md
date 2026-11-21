@@ -51,7 +51,14 @@ Initial public version. Pre-release software: no version is supported for produc
   no-store`); CORS allows `POST`. `/query?fields=parents` adds `parents` and `lens` aligned with
   `block_ids`, pages of at most 200, refused with `parent`. Counters `batch_requests_total`,
   `batch_records_total{result}` and `batch_cut_total{reason}`; the route label
-  `/sbtp/v1/blocks`. `read_api` is not published yet (stage 2).
+  `/sbtp/v1/blocks`.
+- `sbtp-relay`, ADR 0051 stage 2: `/query?order=desc` (newest first, redb backward ranges; a
+  cursor names a gap and is valid in both orders; `since` and the expiry bound end a `desc` walk);
+  `head` in every `/query` response; `parent` repeated up to 32 times with per-parent cursors
+  `<block_id>.<cursor>`, the per-parent limit `max(1, ⌊max_query_limit / N⌋)`, one read
+  transaction and one reader job, the grouped body `{"head", "parents": [{"block_ids", "cursor",
+  "more", "parent"}]}`, and a weight of `⌈N / 8⌉` `query` tokens. `/info` publishes
+  `read_api: 2`.
 - `sbtp-core`: the inner signature of a sealed payload (`l2-grammar.md` §5.3): typed builder
   `sealed_sig_message` (into a caller buffer, no allocation), `sign_sealed`, and `verify_sealed` with the
   strict criteria V1 to V6 (`SealedSigError`); the layer 2 registry constants `SEALED_HPKE_INFO`,

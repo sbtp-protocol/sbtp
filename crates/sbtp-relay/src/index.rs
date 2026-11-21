@@ -1391,6 +1391,116 @@ mod tests {
         );
     }
 
+    /// ADR 0051 rules 15 to 20 and 25: `desc` reads backward from the cursor gap (the newest gap
+    /// without one) down to the lower bound; a cursor of either order is valid in the other; each
+    /// listing of one plan is read in one transaction with `head`.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn desc_walks_and_head() {
+        let idx = RedbIndex::open(&tmp("desc"), DEFAULT_INDEX_CACHE_BYTES).unwrap();
+        let empty = idx
+            .read_query(&QueryPlan {
+                listings: vec![Listing::default()],
+                order: Order::Desc,
+                ..QueryPlan::default()
+            })
+            .unwrap();
+        assert_eq!(empty.head, Position::default());
+        assert_eq!(empty.pages[0], Page::default());
+        for b in 1..=7u8 {
+            let parents = if b % 2 == 1 { vec![id(100)] } else { vec![] };
+            put(&idx, b, &parents, u64::from(b) * 10);
+        }
+        let plan = |parent: Option<u8>, order, cursor, lower, limit| QueryPlan {
+            listings: vec![Listing {
+                parent: parent.map(id),
+                cursor,
+            }],
+            order,
+            lower,
+            limit,
+            fields: false,
+        };
+        let read = |p: &QueryPlan| idx.read_query(p).unwrap();
+        let a = read(&plan(None, Order::Desc, None, Position::default(), 3));
+        assert_eq!(a.head, Position::at(70).next(), "after the newest position");
+        assert_eq!(ids(&a.pages[0]), vec![id(7), id(6), id(5)]);
+        assert!(a.pages[0].more);
+        let gap = a.pages[0].next;
+        assert_eq!(gap, Position::at(50), "the gap before the oldest entry");
+        let b = read(&plan(None, Order::Desc, Some(gap), Position::default(), 3));
+        assert_eq!(ids(&b.pages[0]), vec![id(4), id(3), id(2)]);
+        let c = read(&plan(
+            None,
+            Order::Desc,
+            Some(b.pages[0].next),
+            Position::default(),
+            3,
+        ));
+        assert_eq!(ids(&c.pages[0]), vec![id(1)]);
+        assert!(!c.pages[0].more, "the walk reached the start");
+        // The same gap, `asc`: the blocks after it.
+        let d = read(&plan(None, Order::Asc, Some(gap), Position::default(), 10));
+        assert_eq!(ids(&d.pages[0]), vec![id(5), id(6), id(7)]);
+        // An `asc` cursor used `desc`: the blocks before it.
+        let e = read(&plan(None, Order::Asc, None, Position::default(), 2));
+        let f = read(&plan(
+            None,
+            Order::Desc,
+            Some(e.pages[0].next),
+            Position::default(),
+            9,
+        ));
+        assert_eq!(ids(&f.pages[0]), vec![id(2), id(1)]);
+        // Rule 17: the lower bound ends the walk with `more = false`.
+        let g = read(&plan(None, Order::Desc, None, Position::at(40), 9));
+        assert_eq!(ids(&g.pages[0]), vec![id(7), id(6), id(5), id(4)]);
+        assert!(!g.pages[0].more);
+        let h = read(&plan(None, Order::Desc, None, Position::at(40), 4));
+        assert!(!h.pages[0].more, "exactly at the bound");
+        let i = read(&plan(
+            None,
+            Order::Desc,
+            Some(Position::at(30)),
+            Position::at(40),
+            4,
+        ));
+        assert_eq!(i.pages[0].entries, vec![], "cursor below the bound");
+        assert_eq!(i.pages[0].next, Position::at(30));
+        // Children, backward.
+        let j = read(&plan(Some(100), Order::Desc, None, Position::default(), 2));
+        assert_eq!(ids(&j.pages[0]), vec![id(7), id(5)]);
+        let k = read(&plan(
+            Some(100),
+            Order::Desc,
+            Some(j.pages[0].next),
+            Position::default(),
+            2,
+        ));
+        assert_eq!(ids(&k.pages[0]), vec![id(3), id(1)]);
+        assert!(!k.pages[0].more);
+        // `asc` from `head`: nothing yet, then exactly what is stored after.
+        let head = a.head;
+        let l = read(&plan(None, Order::Asc, Some(head), Position::default(), 9));
+        assert!(l.pages[0].entries.is_empty() && !l.pages[0].more);
+        put(&idx, 8, &[], 80);
+        let m = read(&plan(None, Order::Asc, Some(head), Position::default(), 9));
+        assert_eq!(ids(&m.pages[0]), vec![id(8)]);
+        // Several listings in one transaction, one `head`.
+        let mut several = plan(Some(100), Order::Desc, None, Position::default(), 1);
+        several.listings.push(Listing::default());
+        several.listings.push(Listing {
+            parent: Some(id(200)),
+            cursor: None,
+        });
+        let n = read(&several);
+        assert_eq!(n.pages.len(), 3);
+        assert_eq!(ids(&n.pages[0]), vec![id(7)]);
+        assert_eq!(ids(&n.pages[1]), vec![id(8)]);
+        assert_eq!(n.pages[2].entries, vec![]);
+        assert_eq!(n.head, Position::at(80).next());
+    }
+
     /// Security review F-4: `limit = 0` must not give `more = true` with a cursor that does not
     /// move, and no `limit` may exceed `MAX_QUERY_LIMIT`.
     #[test]
