@@ -338,8 +338,8 @@ The blocks the gateway ingested, in ingestion order.
   `{"items": [{"block_id", "kind", "pubkey", "timestamp"}], "cursor", "more"}`, with the meaning of
   `/query` (core spec §4): the same request with the returned cursor gives the blocks ingested since.
 - Cost: `O(log n + limit)` index work, no block read.
-- This is a pull feed. Push delivery `[Q-65]` follows the relay's WebSocket design once it exists
-  `[Q-23]`.
+- This is a pull feed. Push delivery `[Q-65]` follows the shape of the relay's subscriptions (core
+  spec §4, `GET /sbtp/v1/subscribe`).
 
 (ADR 0041 rule 19, ADR 0051 rule 32)
 

@@ -375,6 +375,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
   1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051)
 - `deny_list`: boolean; `true` when the relay applies a deny list of its operator, whatever its
   entries. A client MUST read an absent member as `false`. (ADR 0052)
+- `subscribe`: object `{ "versions": [1], "max_subscriptions": n, "tick_ms": t }`, present when the
+  relay serves `GET /sbtp/v1/subscribe`. `max_subscriptions` from 1 to 64, `tick_ms` from 5,000 to
+  120,000. A client MUST read an absent or malformed member as "no subscriptions" and MUST NOT open the
+  route then, nor when `versions` holds no version it implements. (ADR 0054)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
@@ -455,11 +459,57 @@ path prefix. The routes of this section are under it. (ADR 0030)
   cursor: only `InvalidCursor` does. The client keeps its cursor and retries later with exponential
   backoff (see "Admission control"). (ADR 0012, clarification K2)
 
-### WebSocket
+### `GET /sbtp/v1/subscribe` (WebSocket)
 
-Not specified in this version. A relay MUST NOT expose a WebSocket endpoint under `/sbtp/v1/`. Clients
-poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent set (ADR 0051 rule 30).
-`[Q-23]`
+- Optional. A relay that publishes `subscribe` in `/info` serves it; another relay answers `404`
+  (`NotFound`). A relay without `read_api` ≥ 2, or with `read_only`, MUST NOT publish it.
+- A WebSocket upgrade (RFC 6455, version 13) of `GET /sbtp/v1/subscribe` under the relay URL; `wss`
+  for `https`. The client offers the subprotocol `sbtp.subscribe.v1` and the relay selects it. An
+  invalid upgrade, a query string or a missing subprotocol gets `400` (`InvalidParameter`); a
+  `Sec-WebSocket-Version` other than 13 also gets `Sec-WebSocket-Version: 13`. A `101` without the
+  subprotocol is a failed request. No cookie, no authentication; `Origin` is not checked. The
+  protocol does not depend on the HTTP version that carries the upgrade.
+- Client to relay: text frames, one JSON object each, at most 4,096 bytes: `subscribe` (`sub` 1 to
+  2^32 − 1, unique on the connection; `parents`, 1 to 32 distinct `block_id` values, or `all: true`;
+  optional `fields: "parents"`) and `unsubscribe` (`sub`). A binary frame closes with 1003, a frame
+  that is not a JSON object with 1007, a larger message with 1009. A malformed or refused message gets
+  `error`; the connection stays open.
+- Relay to client: text control messages, JSON, at most 1,024 bytes: `subscribed` (`sub`, `start`),
+  `unsubscribed` (`sub`), `gap` (`sub`, `cursor`), `tick` (`cursor`), `error` (`sub` when it applies,
+  `error`: `InvalidParameter`, `RateLimited` with `retry_after` in seconds, or `Unavailable`;
+  optional `message`). Binary delivery frames, big-endian, at most 65,536 bytes: type `0x01`, `sub`
+  (u32), flags (bit 0 `fields`, bit 1 `mask`), cursor length (1 to 128) and cursor, entry count
+  (u16, at least 1), then per entry the `block_id` (32 bytes), a match mask (u32, bit `i` for the
+  `i`-th parent of the subscription) for a parent subscription, and with `fields` the parent count
+  (0 to 8), the Parents Hashes in header order and the length (u32). Every cursor is a `/query`
+  cursor. A client ignores unknown members, unknown `op` values and unknown frame types.
+- A subscription delivers, in store order, each block that takes a new position after `start`
+  (`201`, replication, read-through) and matches it: one of its parents in Parents Hashes, or every
+  block for `all`. The set is what `/query` `asc` from `start` with the same filter lists. A block is
+  delivered only once `/query` lists it and `GET /block` serves it, never when the relay denies it,
+  and never from before `start`: a client with an older cursor walks `/query` `asc` from it to
+  `more = false` after `subscribed`, and deduplicates.
+- When the relay cannot queue a delivery it drops it and later ones of that subscription, then sends
+  `gap` with the cursor of the last frame it queued for it (or `start`) before any later frame. The
+  client walks `/query` `asc` from that cursor to `more = false`. The relay MAY close a connection that
+  keeps overflowing (1008). Subscriptions end with their connection; after any close the client walks
+  from each subscription's resume point (the last cursor received for it: `start`, frame, `gap`, or
+  `tick` while no gap is unresolved) and MAY subscribe again with back-off. `InvalidCursor` on that
+  walk follows the `/query` rule. A relay that stops closes with 1001.
+- A followed set is complete when the connection is open, every catch-up walk ended with
+  `more = false` and no gap is unresolved.
+- The relay sends a `tick` when it sent nothing for `tick_ms`, and pings. A client treats a connection
+  with nothing received for 3 × `tick_ms` as closed. A connection with no subscription for the idle
+  time of the relay, or older than its maximum age, is closed with 1000.
+- Admission: the upgrade takes one `query` token; each `subscribe` takes `⌈N/8⌉` `query` tokens (`N`
+  parents; 4 for `all`). A relay bounds subscription connections in total, per client and per network
+  group, and subscriptions per connection (`max_subscriptions`). An upgrade over a per-client or
+  group bound gets `429` with `Retry-After`; over the total, `503`. A relay bounds the bytes it queues
+  per connection.
+- A subscription, a delivery and a `tick` are not demand (ADR 0046). There is no submission over the
+  connection. A replicating relay that subscribes sends `Sbtp-Replication: 1`. A shared cache MUST NOT
+  store a response of this route.
+- (ADR 0051, ADR 0054)
 
 ### Errors
 
@@ -555,6 +605,9 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
 - A relay MAY close a connection without a response: when it is idle or too slow, when the client holds
   too many connections, or after a number of requests or a duration. A response MAY carry
   `Connection: close`. (ADR 0019)
+- A subscription connection (`GET /sbtp/v1/subscribe`) counts in the relay's connection cap and, from
+  its upgrade, in a per-client bound of subscription connections instead of the per-client
+  connection bound. Its client key is the one of its upgrade request. (ADR 0054)
 - A client MUST NOT repeat the request before `Retry-After` has elapsed. Without the header, it SHOULD
   back off exponentially with jitter, starting at 1 second. After `408` or a closed connection it MAY
   retry once at once, then backs off. Every request of this interface is safe to repeat (`PUT` is
@@ -609,6 +662,10 @@ poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent s
 - A failed request is treated like a network failure: nothing from it is used. The client backs off
   before repeating it, or ends the operation. A `3xx` response is a failed request that is not
   repeated (see "Redirects"). (ADR 0029, ADR 0030)
+- A subscription client MUST bound its subscriptions per relay, MUST stop reading a message at its
+  bound plus one byte (65,536 bytes for a delivery frame, 1,024 for a control message), and MUST treat
+  a frame that breaks the frame layout as failed: nothing from it is used and it closes with 1002.
+  Every delivered identifier is a hint: the client fetches and validates the block (§3.4). (ADR 0054)
 - Peer-to-peer bounds are not specified in this version. `[Q-26]`
 
 ### Several relays (non-normative)
@@ -633,6 +690,9 @@ follows from §3.3, §3.4 and the subsections above.
 - The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
   stays a function of the client's settings. `Retry-After` and the back-off apply to the relay that
   sent them.
+- A client that follows the same parents on several relays holds one subscription connection per
+  relay that offers it and polls the others; it deduplicates by `block_id` and keeps one resume point
+  per relay. (ADR 0054)
 
 ### Fast first catch-up (non-normative)
 

@@ -9,7 +9,9 @@
   (rule 20: one more optional `/info` member, `graph_gateway`); 0051 (rules 5, 6, 9, 10 and 12: `order`,
   `fields`, repeated `parent` with per-parent cursors, a cursor as a gap valid in both orders, `head`,
   grouped response; rule 20: `/info` member `read_api`; rule 27: preflight methods `GET, PUT, POST`;
-  new route `POST /sbtp/v1/blocks`)
+  new route `POST /sbtp/v1/blocks`); 0054 (rule 3: a WebSocket route is specified, `GET
+  /sbtp/v1/subscribe`, the only WebSocket endpoint under `/sbtp/v1/`, served only when `/info`
+  publishes `subscribe`; rule 20: one more optional `/info` member, `subscribe`)
 - Clarifications: 2026-11-19, after relay milestone 1c-a (K1, K2), and after `cli-demo query` (K3: `502`
   and `504` retried like `503`), accepted by the project owner, 2026-11-19
 - Date: 2026-11-18

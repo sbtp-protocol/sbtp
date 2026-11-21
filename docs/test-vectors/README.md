@@ -34,6 +34,19 @@ rule it checks. The set includes the `denied` cases of ADR 0052 (rules 12 and 13
 each file and its SHA-256, for consumers outside this repository. Frozen only after the security review
 has checked that each negative case discriminates its rule.
 
+Subscription frame vectors (planned, ADR 0054, accepted 2026-11-21; not generated, not frozen):
+`subscribe-v1/` holds delivery frames of `GET /sbtp/v1/subscribe` as hexadecimal with their decoding:
+one relay-wide entry, a parent subscription with a mask, `fields` with 0 and 8 parents, the largest
+frame. Negative frames each discriminate one criterion of the frame layout: an entry count above the
+entries present, a trailing byte, a parent count of 9, a length of 0 and of 65,910, a mask of 0, a mask
+bit at the number of parents, an unknown flag bit, a cursor length of 0 and of 129, a cursor with a
+character out of syntax, a frame of 65,537 bytes, `mask` set on a relay-wide subscription. ADR 0054 also
+adds cases to `relay-v1/` (upgrade refusals, `subscribe` errors, delivery after `start`, overflow and
+`gap`, close at shutdown) and to `client-v1/` (`follow` over a subscription: catch-up walk, gap walk,
+resume after a close, fallback to polling, malformed frame). The case list is in ADR 0054, "Test
+vectors". Frozen only after the security review has checked that each negative frame discriminates its
+criterion.
+
 Publication is the first time the set leaves this repository: a push to a remote, a release, or a copy
 handed to another implementation. A published set never changes; a format change then creates `v2/`.
 
