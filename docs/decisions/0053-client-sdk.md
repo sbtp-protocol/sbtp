@@ -5,6 +5,9 @@
   `sbtp-client-js`, deferred crate `sbtp-client`; the TypeScript SDK first, `@sbtp/wasm` published first
   on npm, crates.io only when a Rust consumer outside the workspace exists; the first-party exception of
   rules 36 to 45, with a required cooling delay of 48 hours (rule 45)
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): rule 12 (the SDK keeps
+  the availability of ADR 0047 amendment D1) and rule 14, second bullet (a `451` to a presence check
+  of an acknowledged block changes its availability, not its delivery state)
 - Date: 2026-11-21
 - Questions: none resolved; opens Q-78 and Q-79. Refers to Q-23 (subscriptions, `follow`), Q-26
   (peer-to-peer serving) and Q-77 (snapshot format)
@@ -123,8 +126,9 @@ Constraints:
     and `201` are the same success.
 12. **Delivery state of own blocks.** For a block the user created, the SDK keeps a per-relay state
     `pending`, `acknowledged`, `refused` or `given-up` under the rules of ADR 0047 (final refusals,
-    attempt and time bounds, relays added to or removed from the list), and exposes whether the block
-    is protected. Persisting it is the application's: the SDK takes a storage interface and holds no
+    attempt and time bounds, relays added to or removed from the list), with the per-relay
+    availability `available` or `refused` of ADR 0047 amendment D1, and exposes whether the block is
+    protected. Persisting it is the application's: the SDK takes a storage interface and holds no
     storage of its own.
 13. **Re-submission.** A re-submission sends the same bytes. The SDK MUST NOT re-mine, re-sign or alter
     a block (ADR 0043 rule 5, ADR 0045 rule 6). It re-submits a block it keeps available on a relay
@@ -136,7 +140,11 @@ Constraints:
     `451` from a relay, on any route (ADR 0052; core §4 "Denied blocks"). On `denied`:
     - the block is not served by that relay; the SDK MAY ask another relay;
     - for a block the user created, the state of that relay becomes `refused`, a final refusal
-      (ADR 0047 rule 3);
+      (ADR 0047 rule 3), on a `PUT` and on a presence check while that relay is `pending`. On a
+      presence check of a block that relay had acknowledged, the delivery state stays `acknowledged`
+      and the availability on that relay becomes `refused`: the relay no longer counts as holding the
+      block for protection, and the bound from the first acknowledgement does not restart (ADR 0047
+      amendment D1, accepted 2026-11-21);
     - the SDK never sends that block to that relay again automatically; only an explicit call of the
       application, on a user action, does. After `DeniedKey` it sends no block signed by that key to
       that relay automatically;

@@ -4,6 +4,9 @@
   "Decisions of the project owner": `451` with `Denied` for every ground; `DeniedKey` on `PUT`; default
   action `hide`, `purge` per entry; a denied block is never re-sent automatically; `/info`
   `"deny_list": true`; `deny_max_entries` 2,048 / 65,536 / 1,048,576
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): rule 12, last bullet, a
+  cross-reference to ADR 0047 amendment D1 (a `451` to a presence check of a block the relay had
+  acknowledged changes its availability, not its delivery state)
 - Date: 2026-11-21
 - Questions: opens Q-80 (keeping the bytes of a denied block as evidence) and Q-81 (public notice and
   appeal of a denial)
@@ -142,7 +145,10 @@ header's public key. Blocks are immutable: a denied block cannot be altered, onl
     - MUST NOT create a new block automatically because of a `451` (re-signing, re-mining or altering
       the payload to obtain another `block_id`);
     - applies the same rules to a `451` from a `GET` or `HEAD` of a block it publishes or keeps
-      available: it records the denial and does not re-submit.
+      available: it records the denial and does not re-submit. When that relay had acknowledged the
+      block, its delivery state stays `acknowledged` and the block's availability on that relay
+      becomes `refused`; the relay no longer counts as holding the block for ADR 0047 rule 2, and the
+      second bound of ADR 0047 rule 4 does not restart (ADR 0047 amendment D1, accepted 2026-11-21).
 
     A client keeps, per relay, the `block_id` values (and the keys of `DeniedKey`) it saw denied, within
     its storage bounds (ADR 0029 rule 12). Dropping a record only lets the client send the block once

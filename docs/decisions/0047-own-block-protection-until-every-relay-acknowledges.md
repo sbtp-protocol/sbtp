@@ -5,6 +5,10 @@
 - Amended by: 0052 (rule 3: a `451` is a final refusal, `refused`; rule 5: a block a relay denied is
   not sent to that relay again automatically, only on a user action, and after `DeniedKey` no block of
   that key is)
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): amendment D1 below (rules 1,
+  2 and 4: a `451` to a presence check of an acknowledged block is an availability event; delivery
+  stays `acknowledged`, the relay no longer counts as holding the block, the second bound of rule 4
+  does not restart)
 - Date: 2026-11-21
 - Questions: none open; owner direction of 2026-11-21 (a block published to several relays is kept
   until each of them has it, not only the first)
@@ -155,6 +159,46 @@ the list, the client keeps a **delivery state**: `pending`, `acknowledged`, `ref
   `pending` for each relay of the list in its `failedOn`, `acknowledged` for the other relays of the
   list, and a first acknowledgement time set to the migration time. A block with `acked = false` is
   `pending` on every relay of the list.
+
+## Amendments (2026-11-21, accepted by the project owner on 2026-11-21)
+
+Raised by ADR 0052 rule 12, which sets a relay to `refused` when a `GET` or `HEAD` of an own block gets
+`451`, and by Q-83: that rule did not say what happens when that relay had already acknowledged the
+block. No wire format, relay interface or test vector of a frozen set changes.
+
+- **D1. A denial after an acknowledgement is an availability event, not a delivery event (rules 1, 2
+  and 4).** Besides its delivery state, the client keeps, per own block and per relay of the list, an
+  **availability**: `available` or `refused`. A relay's availability for a block becomes `refused` when
+  it answers `451` to a `GET` or `HEAD` of that block; the client records it with the denials of
+  ADR 0052 rule 12. When that relay's delivery state is `acknowledged`:
+  - *rule 1:* the delivery state stays `acknowledged`. It does not become `refused` or `pending`;
+  - *rule 2:* a relay whose availability is `refused` does not count as having acknowledged the block,
+    nor as pending for it. If no other relay of the list has acknowledged the block with availability
+    `available`, the block is protected again by the first case of rule 2, as after rule 6;
+  - *rule 4:* the second bound keeps running from the first acknowledgement of the block by a relay of
+    the list, including one whose availability is now `refused`. It does not restart.
+
+  The client keeps the block available on its other relays (rule 5, ADR 0043). It MUST NOT send the
+  block to that relay again automatically (ADR 0052 rule 12). The availability returns to `available`
+  only when that relay later serves the block (a `200` to a `GET` whose body passes the receipt rule,
+  spec §3.4) or acknowledges a `PUT` sent on a user action. A client that drops the denial record
+  within its storage bounds (ADR 0052 rule 12) also drops the `refused` availability.
+
+  A `451` to a presence check from a relay whose delivery state is `pending` sets that state to
+  `refused` (ADR 0052 rule 12, unchanged): no acknowledgement was acquired. A `451` from a relay whose
+  delivery state is `refused` or `given up` changes no delivery state.
+
+Spec change, applied with this amendment: core spec §4, "Client bounds", a bullet after the bullet on
+protected blocks:
+
+> - A relay that acknowledged a block and later answers `451` to a `GET` or `HEAD` of it stays
+>   acknowledged, but no longer counts as holding the block for this protection, nor as pending for it.
+>   The bounded time since the block's first acknowledgement does not restart. (ADR 0047, ADR 0052)
+
+and §4, "Denied blocks", after "MUST NOT send that block to that relay again automatically.":
+
+> When that relay had already acknowledged the block, the `451` changes the block's availability on
+> that relay, not its delivery: see "Client bounds".
 
 ## Spec change on acceptance
 
