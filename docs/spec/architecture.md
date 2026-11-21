@@ -177,7 +177,8 @@ On the first failure, the block is rejected without allocating any persistent re
   time limit applies to each phase (`header_timeout_ms` for the first two, `request_timeout_ms`,
   `idle_timeout_ms`). A new connection that sends nothing is closed at `header_timeout_ms`. (ADR 0019)
 - One client holds at most `max_connections_per_client` connections, or requests in flight when it
-  comes through a trusted proxy. (ADR 0019)
+  comes through a trusted proxy. (ADR 0019) A subscription connection counts in
+  `ws_max_connections_per_client` instead, from its upgrade. (ADR 0054)
 - Behind trusted proxies, the client address comes from `X-Forwarded-For`, or, when the operator
   sets `client_ip_header`, from that single-value header written by a CDN. Either source is read only
   from a peer in `trusted_proxies`. (ADR 0020, ADR 0044)
@@ -194,6 +195,14 @@ On the first failure, the block is rejected without allocating any persistent re
   `http/1.1`). With TLS on, a handshake takes a per-client token and completes within
   `header_timeout_ms`. (ADR 0019, ADR 0028)
 - The limits are local settings of a relay, not protocol values. (ADR 0018, ADR 0019)
+
+### Subscriptions
+- Optional (`ws_enabled`, off by default). One fan-out task, fed by the index writer after commit
+  through a queue of 256 entries, matches each new position against a table keyed by parent and the
+  relay-wide subscriptions. No index or block read; the writer never waits for a subscriber.
+- Each connection queues at most 65,536 bytes; an overflow becomes a `gap`, never memory. The memory
+  terms are added to the computed bound only when the function is on; `small` with every function on
+  stays under 20 MB. Subscription state lives in memory only and is never logged. (ADR 0054)
 
 ## 3. Target runtimes
 

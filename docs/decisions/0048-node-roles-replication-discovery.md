@@ -15,7 +15,10 @@
   is 18,681,778 bytes, 1,318,222 bytes of margin); 0052 (rules 6 and 7: a listed `block_id` is
   skipped without a fetch, a fetched block whose key is listed is discarded, a `451` from a peer is a
   skip; no entry is added because a peer denies a block; ADR 0052 rule 21 states its memory term and the
-  new total under rule 3, item 2: 19,009,458 bytes with every function on)
+  new total under rule 3, item 2: 19,009,458 bytes with every function on); 0054 (rule 3, item 2:
+  the subscription term, 415,744 bytes on `small`, is added when `ws_enabled` is `true`; the `small`
+  bound with every function on is 19,425,202 bytes, 574,798 bytes under 20,000,000; the default bound
+  is unchanged, 14,910,996 bytes)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)

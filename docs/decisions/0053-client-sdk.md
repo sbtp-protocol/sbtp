@@ -8,6 +8,10 @@
 - Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): rule 12 (the SDK keeps
   the availability of ADR 0047 amendment D1) and rule 14, second bullet (a `451` to a presence check
   of an acknowledged block changes its availability, not its delivery state)
+- Amended by: 0054 (API shape, `follow`: Q-23 is decided; `follow` uses a subscription when the relay
+  publishes `subscribe` with a version the SDK implements and the transport allows WebSocket, polls
+  otherwise and after a refused upgrade, holds at most one subscription connection per relay, and
+  reports completeness the same way, ADR 0054 rule 44)
 - Date: 2026-11-21
 - Questions: none resolved; opens Q-78 and Q-79. Refers to Q-23 (subscriptions, `follow`), Q-26
   (peer-to-peer serving) and Q-77 (snapshot format)
@@ -220,7 +224,11 @@ Exact signatures are each SDK's.
 - **`follow(parents, from)`**: a stream of new identifiers for a parent set. Until Q-23 is decided it is
   grouped `asc` polling from `head` with the back-off of rule 9 and an interval that is a setting;
   afterwards the same stream MAY be fed by the subscription of ADR 0051 rule 30, resuming by `/query`
-  `asc` from the last delivered gap after a disconnect.
+  `asc` from the last delivered gap after a disconnect. (Amended by ADR 0054 rule 44: Q-23 is
+  decided. `follow` uses the subscription of `GET /sbtp/v1/subscribe` when the relay publishes
+  `subscribe` with a version the SDK implements and the transport allows WebSocket; otherwise, and
+  after a refused upgrade, it polls as above. Both feed the same stream with the same completeness
+  report.)
 - **`Completeness`**: the report of rule 10, as data the application can keep with what it shows.
 
 The Rust crate is sans-I/O: its walk, batch, admission, completeness and delivery logic take responses
