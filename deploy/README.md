@@ -293,13 +293,27 @@ a durable cursor, so a bucket outage only delays the copy; with demand eviction 
 the bucket only after an outage of at least 3 × `demand_epoch_ms` (24 hours by default).
 `412` counts as done; `409`, `429`, `5xx` and network errors are retried with back-off up to
 `mirror_max_backoff_s` (1 hour); any other `4xx` or a `3xx` (bad credentials, missing bucket,
-policy) backs off at that maximum. No block is skipped for a failure.
+policy) backs off at that maximum. No block is skipped for a failure. A block waiting out its
+back-off does not hold the others: the lanes copy up to 256 positions past the cursor, which
+stays at the oldest block not yet done.
 
 **Least privilege.**
 
-- The relay's credentials allow `s3:PutObject` on `arn:aws:s3:::sbtp-archive/sbtp/v1/*` (with the
-  prefix, if any) and nothing else: no `GetObject`, `ListBucket` or `DeleteObject`. Prefer
-  credentials with an expiry where the provider offers them.
+- The relay's credentials allow `s3:PutObject` on **both** `{prefix}sbtp/v1/block/*` and the exact
+  key `{prefix}sbtp/v1/info`, and nothing else: no `GetObject`, `ListBucket` or `DeleteObject`.
+  Prefer credentials with an expiry where the provider offers them. With the default empty prefix:
+
+  ```json
+  {"Version": "2012-10-17",
+   "Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": ["arn:aws:s3:::sbtp-archive/sbtp/v1/block/*",
+                               "arn:aws:s3:::sbtp-archive/sbtp/v1/info"]}]}
+  ```
+
+  A policy that covers only `sbtp/v1/block/*` makes the `/info` `PUT` fail: the relay logs
+  `mirror_failed` with `status=4xx` (usually `403`) and retries it at `mirror_max_backoff_s`;
+  block uploads are unaffected, but the bucket serves no `/info`, so clients do not learn
+  `read_only` from it (rule 4 of ADR 0050: they may still read blocks there).
 - On S3, a bucket policy denies a `PutObject` under `sbtp/v1/block/` without `If-None-Match`:
 
   ```json
@@ -308,7 +322,10 @@ policy) backs off at that maximum. No block is skipped for a failure.
    "Condition": {"Null": {"s3:if-none-match": "true"}}}
   ```
 
-- Public read on `sbtp/v1/*` only (`s3:GetObject`, `Principal: *`).
+- Public read (`s3:GetObject`, `Principal: *`) on the same two resources,
+  `{prefix}sbtp/v1/block/*` and `{prefix}sbtp/v1/info`, and nothing else. This is what readers
+  use, and what the poisoning check after a `412` uses: it fetches the block through
+  `mirror_public_url` without credentials, so the relay's own credentials need no `GetObject`.
 - R2 API tokens are read-write per bucket: use a token scoped to this one bucket, and a bucket
   used for nothing else. MinIO: a policy with `s3:PutObject` on the prefix only.
 - One writer per bucket is recommended: a writer that uploads wrong bytes under a key makes that
@@ -322,7 +339,7 @@ policy) backs off at that maximum. No block is skipped for a failure.
 on `large`), each bounded by `mirror_request_timeout_ms` (30 s); response bodies are read up to
 16 KiB and discarded. One lane copies about 25 blocks/s against a store 36 ms away; raise the
 setting when ingest is sustained above about 20 blocks/s per lane. On `small` the memory bound
-grows by 625,684 bytes with replication also on, 1,025,684 bytes without it (the TLS root store);
+grows by 651,284 bytes with replication also on, 1,051,284 bytes without it (the TLS root store);
 it is logged at start-up (`memory_bound`).
 `mirror_allow_private = true` lets the endpoint name resolve to private addresses (a MinIO on the
 same network); the rule is that of `replication_allow_private`.
