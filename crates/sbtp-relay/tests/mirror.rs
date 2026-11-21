@@ -455,6 +455,33 @@ fn an_existing_key_is_done_and_a_poisoned_copy_is_detected() {
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// Mirror review L-4: a store that answers `412` for a key the public URL does not serve
+/// (`404`) counts in `mirror_unverified_total`, also on the `stats` line, and the block is done
+/// (rule 9: a failed fetch proves nothing).
+#[test]
+fn a_claimed_object_the_public_url_lacks_is_unverified() {
+    let _g = serial();
+    let s3 = S3::start();
+    s3.state().script.push_back(412);
+    let data = tmp_dir("mirror-unverified");
+    let (id, bytes) = block(b"claimed, not stored");
+    let unverified = metrics::unverified_total();
+    let public = format!("{}/archive", s3.url());
+    let node = Node::mirrored(&data, &s3, &[("MIRROR_PUBLIC_URL", &public)]);
+    assert_eq!(node.put(&bytes), 201);
+    assert!(wait_until(Duration::from_secs(20), || {
+        metrics::unverified_total() > unverified
+    }));
+    drop(node);
+    assert_eq!(metrics::unverified_total() - unverified, 1);
+    assert!(s3.object(&block_key(&id)).is_none());
+    let stats = sbtp_relay::metrics::snapshot();
+    for name in ["mirror_uploaded", "mirror_unverified", "mirror_lag_ms"] {
+        assert!(stats.iter().any(|(n, _)| *n == name), "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 /// Rule 9: `5xx` is retried with back-off, a refused request (`403`) and a `3xx` back off at the
 /// maximum; none moves the cursor or skips the block, and no redirect is followed.
 #[test]

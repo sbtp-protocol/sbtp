@@ -434,6 +434,31 @@ fn sighup_without_a_deny_file_is_ignored() {
     assert_eq!(log.matches("code=sighup_ignored").count(), 1, "{log}");
 }
 
+/// Deny review I-7: with the archive copy off (`mirror_endpoint` unset), a value pasted into a
+/// `*_ref` setting is not logged: the three `setting` lines say `unused`.
+#[test]
+fn ref_settings_are_not_logged_while_the_copy_is_off() {
+    const PASTED: &str = "PASTEDVALUEQ3R8T1M6";
+    let relay = RelayProcess::start_with(
+        &tmp_dir("e2e-ref-off"),
+        &[
+            ("MIRROR_ACCESS_KEY_REF", PASTED),
+            ("MIRROR_SECRET_KEY_REF", PASTED),
+            ("MIRROR_SESSION_TOKEN_REF", PASTED),
+        ],
+    );
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{log}");
+    assert!(!log.contains(PASTED), "{log}");
+    for name in [
+        "mirror_access_key_ref",
+        "mirror_secret_key_ref",
+        "mirror_session_token_ref",
+    ] {
+        assert!(log.contains(&format!("name={name} value=unused")), "{log}");
+    }
+}
+
 /// Security review 2026-11-21 (archive copy), L-1: a value pasted into a `*_ref` setting
 /// instead of a variable name, which passes the name check, stops the start-up before any
 /// `setting` line: it appears in no line of the log.

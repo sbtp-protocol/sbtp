@@ -280,7 +280,12 @@ manager's secret mechanism (a Docker or Kubernetes secret exposed as environment
 systemd `LoadCredential`/`EnvironmentFile` readable by the relay user only), never in the
 configuration file. They are read once at start-up: rotation is a restart. They never appear in
 logs, `setting` lines, metrics or errors; the `mirror_endpoint` setting line logs `set`, not the
-URL.
+URL, and the `*_ref` lines log `unused` while `mirror_endpoint` is unset. The relay keeps a copy
+of the three named variables only while it prepares the copy, and wipes it after use. The
+**process environment** still holds them for the life of the process, and the relay cannot clear
+it: anyone who can read `/proc/<pid>/environ` (the relay's user and root) or a core dump can read
+them. Run the relay under its own user, keep core dumps off for it (`LimitCORE=0`, or
+`--ulimit core=0`), and do not give other services that user.
 
 What the relay sends: one `PUT` per block to `{mirror_prefix}sbtp/v1/block/{block_id}`, signed
 with AWS Signature Version 4 (signed payload), with `If-None-Match: *` (the first write wins; an
@@ -345,13 +350,17 @@ it is logged at start-up (`memory_bound`).
 same network); the rule is that of `replication_allow_private`.
 
 **Logs and metrics.** Counters (served with `/metrics` once it exists, as those of replication;
-the `stats` line does not carry them yet) `mirror_uploaded_total`, `mirror_existing_total`,
+until then on the `stats` line, without the `_total` suffix and with `mirror_failed` summed over
+the classes) `mirror_uploaded_total`, `mirror_existing_total`,
 `mirror_failed_total{status}` (`3xx`, `4xx`, `5xx`, `network`), `mirror_missed_total` (evicted
 before its turn), `mirror_damaged_total`, `mirror_poisoned_total`, `mirror_denied_total` (on the
-operator deny list, not uploaded); gauges `mirror_lag_blocks`
-(counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed` (status class and delay
-only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on `mirror_lag_ms` above
-`demand_epoch_ms` and on any `mirror_poisoned_total`. **Egress**: allow TCP 443 to the endpoint
+operator deny list, not uploaded), `mirror_unverified_total` (after a `412`, the public URL did
+not answer `200`: the store says it holds an object that nobody can read there); gauges
+`mirror_lag_blocks` (counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed`
+(status class and delay only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on
+`mirror_lag_ms` above `demand_epoch_ms`, on any `mirror_poisoned_total`, and on
+`mirror_unverified_total` growing with `mirror_existing_total` (a store that answers success
+without storing). **Egress**: allow TCP 443 to the endpoint
 (and to `mirror_public_url`), and DNS.
 
 ## Operator deny list
