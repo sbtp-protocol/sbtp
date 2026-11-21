@@ -498,7 +498,8 @@ fn envelope(sealed: Sealed) -> SealedEnvelope {
 /// A seal waiting for its inner signature (spec §5.3), for an identity key that signs outside WASM
 /// (a non-extractable Web Crypto key). Sign [`SealPending::message_bytes`] with the identity key,
 /// then call [`SealPending::finish`]: once, whatever its result. Holds the ephemeral key of the
-/// outer block and the encoded plaintext, wiped on `finish` or `free()`.
+/// outer block and the encoded plaintext, moved out by `finish` (a copy is left unwiped: security
+/// review 2026-11-21-wasm-seal L-1, to be fixed by boxing the pending state) or wiped on `free()`.
 #[wasm_bindgen]
 pub struct SealPending {
     inner: Option<PendingSeal>,

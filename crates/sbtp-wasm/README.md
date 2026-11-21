@@ -190,7 +190,8 @@ computed is discarded and the call throws `EntropyUnavailable`; it never panics.
 
 Wiped when the object is freed (call `free()`: garbage collection is neither prompt nor guaranteed):
 the X25519 private key of an `EncKeyPair`, the ephemeral Ed25519 key and the encoded plaintext of a
-`SealPending` (also wiped by `finish`), the ephemeral Ed25519 key of a `SealedEnvelope` (also wiped
+`SealPending` (moved out by `finish`: a copy of the pending state, ephemeral key included, stays in the
+`SealPending`'s freed memory and is not wiped yet, see `docs/security/2026-11-21-wasm-seal.md` L-1), the ephemeral Ed25519 key of a `SealedEnvelope` (also wiped
 right after its one `signBlock`), and the `msg` and `kind` an `OpenedMessage` holds. The binding's own
 copy of the `msg` argument of `seal` and `sealPrepare` is wiped when the call returns. No secret, no `from` and no `msg` appears in a `Debug` output or in
 an error message.
