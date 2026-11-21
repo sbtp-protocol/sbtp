@@ -1,6 +1,6 @@
 [package]
 name = "sbtp-relay"
-description = "SBTP dumb relay: validation (format, PoW, Ed25519), content-addressed flat-file storage, LRU cache, HTTP/WS API."
+description = "SBTP dumb relay: block validation (format, timestamp, PoW, Ed25519), content-addressed flat-file storage with a redb index, LRU cache, HTTP API (block, batch, query, info), operator deny list, optional replication and object-storage copy."
 version.workspace = true
 edition.workspace = true
 # ADR 0013 rule 25: redb 4.x requires Rust 1.90, now the workspace value (hpke review F-1).
