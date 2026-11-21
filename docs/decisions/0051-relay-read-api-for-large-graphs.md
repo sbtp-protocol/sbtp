@@ -12,6 +12,10 @@
   ADR 0029 rule 4 (one more body ceiling); ADR 0041 rules 11, 17 and 18 (gateway order, several
   targets, counts, per-node completeness); CORS of core spec §4 (`POST`). Nothing else in these ADRs
   changes
+- Clarifications: B1 to B9 (2026-11-21, after implementation and security review): no declared
+  length, rounding of `N`, time budget, empty `desc` page, failed records, minimum bursts (amends
+  ADR 0018 rule 22 and ADR 0019 rule 4), metrics (amends ADR 0021 rule 41), hints and completeness
+  over several relays, shared cache rule
 - Depends on: ADR 0012 (`/query`), ADR 0013 (positions, index), ADR 0018 and 0027 (admission), ADR 0023
   (served bytes are validated), ADR 0024 (epochs), ADR 0029 (client bounds), ADR 0041 (gateway),
   ADR 0046 (demand), ADR 0048 (`Sbtp-Replication`)
@@ -492,3 +496,70 @@ They are frozen only after this ADR is accepted, implemented and reviewed.
 - **Order by the `Timestamp` field.** Chosen by authors, so a block could be placed at the top at
   will; store order is the relay's own.
 - **Signed gateway checkpoints, relay per-parent counts or fingerprints.** See rule 36.
+
+## Clarifications (2026-11-21)
+
+Arising from the implementation and its security review (`docs/security/2026-11-21-read-api-0051.md`).
+B1 to B5 state normatively what the reference relay does where the rules above left a choice. B6 is a
+rule recommended by the project owner after review finding L-1. B7 lists the metrics. B8 is a client
+rule from review findings M-1 and L-2. B9 is a deployment rule. They are applied to core spec §4.
+
+- **B1. No declared length (rules 1 and 7).** A `POST /sbtp/v1/blocks` request without
+  `Content-Length`, or with any `Transfer-Encoding` (with or without `Content-Length`), is charged 64
+  `block` tokens at admission (rule 7, capped at the burst). If admitted, it gets `400`
+  (`InvalidParameter`) with `Connection: close`, and the relay closes the connection before it reads
+  any byte of the body. A `Content-Length` that is not a decimal integer is treated as absent.
+- **B2. Rounding of `N` (rule 7).** `N` is `⌈Content-Length / 32⌉`, and the weight `⌈N / 4⌉` is at
+  least 1 token. A body that is empty or not a multiple of 32 bytes is therefore charged before its
+  `400`: no refusal of this route is free. A `Content-Length` above 8,192 is charged the burst
+  (saturating arithmetic) and gets `413` before the body is read.
+- **B3. Time budget (rule 3).** The time budget of a batch is half of the relay's request time limit
+  (`request_timeout_ms` for `sbtp-relay`, ADR 0018 rule 22), counted from the start of the request. A
+  relay MUST NOT start a record once the budget is spent; the body then ends after the last complete
+  record. The other half leaves time to write that record before the request deadline (ADR 0018
+  rule 25).
+- **B4. Empty `desc` page (rule 16).** A `desc` page with no entry returns as its `cursor` the gap it
+  started from: the cursor sent (per-parent or shared), or `head` when the request had no cursor for
+  that listing. The cursor of an empty page is never absent and never moves the walk: an `asc`
+  request from it lists the matching blocks after that gap (rule 16).
+- **B5. Failed records (rules 2, 3 and 5).** The first record decides the status: when it cannot be
+  read, the relay answers as `GET /block` would (`503` when its block readers are busy, `500` on an
+  I/O error), with no batch body. A later record that cannot be read (I/O error, read refused under
+  load) ends the body before that record, as a prefix of rule 3; the client requests the rest again.
+  `length = 0` means only that the relay does not serve that block (rule 2). A relay MUST NOT use
+  `length = 0` for an error.
+- **B6. Minimum bursts (rules 7 and 26; owner recommendation after review L-1).** The weights are
+  capped at the burst so that a request is always admissible from a full bucket. A burst below the
+  largest weight would sell more than the intended ratio: with a `block` burst `b < 64`, a 256-id
+  batch costs `b` tokens. A relay MUST refuse at start-up a `block` bucket burst below 64 and a
+  `query` bucket burst below 4 (`rate_block_burst` and `rate_query_burst` for `sbtp-relay`; ADR 0018
+  rule 22 and ADR 0019 rule 4: the ranges become 64 to 1,000,000 and 4 to 1,000,000). A batch then
+  buys at most 4 blocks per token, and a grouped query at most 8 parents per token. Every profile of
+  ADR 0019 rule 37 is above both minimums; no default changes.
+- **B7. Metrics (ADR 0021 rule 41).** The set of rule 41 gains, with the prefix `sbtp_relay_`:
+
+  | Name | Kind | Labels |
+  |---|---|---|
+  | `batch_requests_total` | counter | none; batches answered `200` |
+  | `batch_records_total` | counter | `result` (`served`, `missing`) |
+  | `batch_cut_total` | counter | `reason` (`ceiling`, `budget`, `busy`, `failed`): bodies ended before the last requested record, by cause (rule 4, B3, B5) |
+
+  The `route` label of `http_requests_total` gains the value `/sbtp/v1/blocks`. The labels come from
+  fixed sets (ADR 0021 rule 39).
+- **B8. Several relays (rules 13, 28 and 29; review M-1 and L-2).**
+  - A client that merges `fields=parents` hints from several relays MUST take, for each `block_id`,
+    the union of the parents the relays list. A hint can only add a fetch; the fetched header decides
+    what the block is (rule 13, §3.4). With a first-wins merge, one relay could hide a block that
+    another relay lists with its true parents.
+  - A listing over several relays is complete only when every relay of the client's list was asked
+    and returned a complete listing (rule 28). A relay skipped because it does not publish
+    `read_api` ≥ 2, and was not asked with the single-parent form instead, counts as not asked: the
+    listing is not complete (rule 29). A client MAY instead present completeness per relay.
+- **B9. Shared caches (rule 12).** A batch response carries `Cache-Control: no-store` and MUST NOT be
+  stored by a shared cache. An operator rule that caches blocks at a CDN or reverse proxy MUST match
+  the path prefix `/sbtp/v1/block/` with its trailing slash (and `GET`), never `/sbtp/v1/block*`,
+  which would also match `/sbtp/v1/blocks`.
+
+Spec change (applied with these clarifications): core spec §4, `POST /sbtp/v1/blocks` (B1, B2, B3, B5,
+B9), `/query` (B4, B8), "Admission control" (B2, B6). ADR 0019 and ADR 0021 get an "Amended by" entry;
+the ADR 0018 entry for 0051 gains rule 22.
