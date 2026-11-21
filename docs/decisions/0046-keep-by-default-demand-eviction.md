@@ -2,7 +2,7 @@
 
 - Status: accepted (by the project owner, 2026-11-21)
 - Amended by: 0048 (rules 10 and 15: a request carrying `Sbtp-Replication: 1` is not demand and is
-  answered `no-store`)
+  answered `no-store`); 0052 (rule 10: a request answered `451` is not demand)
 - Clarified: 2026-11-21, by the project owner after the security review
   `docs/security/2026-11-21-demand-eviction.md` (clarifications D1 to D8 below: rules 8, 13, 22 and 25);
   2026-11-21, by the project owner: default `demand_epoch_ms` 8 hours (clarification D10: rules 24, 27

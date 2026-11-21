@@ -12,7 +12,10 @@
   becomes 8 MB and an image gate of 5 MB compressed is added; resolves Q-70 and Q-72; "Decisions of the
   project owner", item 7); 0050 (rule 18: a relay makes no fallback fetch for a request that carries
   `Sbtp-Replication: 1`); 0050 amendment U3 (rule 3, item 2: the `small` bound with every function on
-  is 18,681,778 bytes, 1,318,222 bytes of margin)
+  is 18,681,778 bytes, 1,318,222 bytes of margin); 0052 (rules 6 and 7: a listed `block_id` is
+  skipped without a fetch, a fetched block whose key is listed is discarded, a `451` from a peer is a
+  skip; no entry is added because a peer denies a block; ADR 0052 rule 21 states its memory term and the
+  new total under rule 3, item 2: 19,009,458 bytes with every function on)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)

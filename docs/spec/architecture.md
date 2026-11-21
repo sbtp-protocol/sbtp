@@ -52,6 +52,8 @@ Direct reading of the network buffer, parsing by offsets (O(1)), no copy.
 2. Timestamp policy: Timestamp against the relay clock plus the configured window (ADR 0007).
 3. PoW: digest difficulty against the configured threshold.
 4. Ed25519: signature against the public key in the header.
+5. Deny list: a block whose `block_id` or public key the operator denies gets `451` and is not stored
+   (ADR 0052).
 
 On the first failure, the block is rejected without allocating any persistent resource.
 
@@ -111,7 +113,10 @@ On the first failure, the block is rejected without allocating any persistent re
 - An archive relay disables both; it never deletes a block. (ADRs 0019, 0046)
 - Eviction is local to a relay and is not a deletion mechanism. (ADR 0013)
 - Long-lived blocks are kept available by archive relays and by clients that submit them again after
-  a `404` or an expiry; a `PUT` never renews a block before it expires. (ADR 0043)
+  a `404` to a single `GET` or `HEAD`, or an expiry, never after a `451`; a `PUT` never renews a block
+  before it expires. (ADR 0043, ADR 0052)
+- An operator deny list (ADR 0052) is not eviction: a denied block is not served or listed; with
+  `purge` it is deleted as an eviction deletes, without the demand protection. (ADR 0052)
 
 ### Quota
 - `max_store_bytes` bounds the block files and quarantined files (each counted in 4,096-byte units
@@ -138,6 +143,9 @@ On the first failure, the block is rejected without allocating any persistent re
   target and counted; it is not an error of the source. (ADR 0045)
 - When `D_NET` is raised, clients mine at the new value from its announcement and relays raise their
   floor at its effective date. Blocks mined earlier stay where they are held. (ADR 0045)
+- Replication skips a block the relay denies: a listed `block_id` is not fetched, a fetched block
+  whose key is listed is discarded, and a `451` from a peer is a skip. A relay never adds an entry to
+  its own list because a peer denies a block. (ADR 0052)
 
 ### Archive copy and read-through
 - A relay MAY copy every block it stores to an object store under `sbtp/v1/block/{block_id}`, with a
@@ -147,6 +155,11 @@ On the first failure, the block is rejected without allocating any persistent re
   within fixed bounds, validate it as any received block and serve it; it MAY then store it as an
   accepted block. A source never replaces a local block, and a relay never forwards a fallback
   request it received from another relay. (ADR 0050)
+- Neither function handles a denied block: the archive copy does not upload it, and the read-through
+  answers `451` for it without serving or keeping a fetched copy. A `451` from a source means that
+  source does not serve the block; the relay tries the next one and answers `404` when none serves it.
+  The relay never deletes from a bucket; removing a denied block already uploaded is an operator task.
+  (ADR 0052)
 
 ### Admission control
 - Every request has a cost bounded by constants and settings: time, memory and index work.
@@ -190,5 +203,9 @@ On the first failure, the block is rejected without allocating any persistent re
 | 2 | Self-hosted micro-relays (one Rust image under 5 MB compressed, < 15 MB RAM with the default profile `small` and the default settings, < 20 MB with every function on) | Backbone. Built-in TLS, replication and the archive copy are compiled in and off until configured (ADR 0028, ADR 0048, ADR 0050). Either with built-in TLS (one binary, ADR 0028), or behind a reverse proxy that terminates TLS and buffers request heads (Caddy, nginx, HAProxy). |
 | 3 | Object storage / CDN (S3, R2, Pages) | Static mirrors, near-zero cost: read-only relay URLs written by a relay's archive copy (ADR 0050). |
 | 4 | Desktop / mobile daemon | Super-peers: 24/7 seeding, indexing; MAY run a graph gateway (`graph-access.md` §3). |
+
+Clients in every tier reach relays through the same client rules (core spec §4). The project's
+client libraries (a TypeScript package on the npm package of `sbtp-wasm`, and later `sbtp-client` in
+Rust) implement them; they are not normative (ADR 0053).
 
 Browser extensions are not a primary target (installation friction, Manifest V3, not available on mobile).

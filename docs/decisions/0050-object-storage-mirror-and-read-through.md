@@ -8,6 +8,9 @@
 - Amended: 2026-11-21, accepted by the project owner on 2026-11-21, after measurement
   (`docs/benchmarks/2026-11-21-mirror-measurements.md`): amendments U1 to U3 below (rules 7, 27 and
   28: `small` uploads 4 at a time, the uploader's window replaces the page barrier, new memory terms)
+- Amended by: 0052 (rule 7: the uploader treats a denied block as done and does not upload it; rule 16:
+  no source is asked for a listed `block_id`, and a `451` from a source is a source that does not serve
+  the block; rule 19: a fetched block whose key is listed is neither served nor kept)
 - Date: 2026-11-21
 - Questions: Q-72 (opened here; resolved by the owner's budget decision, rule 27), Q-73 (opened:
   verification and repair of a shared bucket; stays open)

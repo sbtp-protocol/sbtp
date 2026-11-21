@@ -193,6 +193,9 @@ A view is one JSON object (RFC 8259):
   `NotFound`, `408`, `429`, `500`, `503`, `Retry-After`). A `block_id` in a path or a parameter is 64
   lowercase hexadecimal characters. A parameter that is unknown, repeated or malformed gets `400`
   (`InvalidParameter`). A numeric parameter above its maximum is lowered to it.
+- **Denied blocks.** A gateway handles a `451` from a relay as a block that relay does not serve. It
+  does not show it, and it does not fetch it from another source to serve it in that relay's place.
+  (ADR 0052)
 - **CORS methods.** One difference from the relay CORS rules: a preflight from an allowed origin gets
   `Access-Control-Allow-Methods: GET`, not `GET, PUT, POST`. The other CORS headers are those of core
   spec §4.
