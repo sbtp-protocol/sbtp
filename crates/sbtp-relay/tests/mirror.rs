@@ -614,3 +614,47 @@ fn settings_and_credentials_are_checked() {
     );
     assert!(!data.exists());
 }
+
+/// ADR 0052 rule 18: a held block on the deny list, by `block_id` or by key, is not uploaded;
+/// it is done (counted in `mirror_denied_total`) and the blocks after it are copied.
+#[test]
+fn denied_blocks_are_not_uploaded() {
+    let _g = serial();
+    let s3 = S3::start();
+    let dir = tmp_dir("mirror-deny");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    let (by_id, a) = block(b"denied by id");
+    let k = sbtp_core::SigningKey::from_bytes(&[31; 32]);
+    let b = sbtp_core::BlockBuilder::for_key(&k)
+        .timestamp(common::now_ms())
+        .payload(b"denied by key")
+        .build(&k, 0)
+        .unwrap();
+    let by_key = sbtp_core::parse(&b).unwrap().block_id().to_string();
+    let key = sbtp_core::BlockId(*sbtp_core::parse(&b).unwrap().pubkey()).to_string();
+    let (kept, c) = block(b"copied");
+    {
+        // Stored before the list exists, without the archive copy.
+        let mut node = Node::try_start(&data, &[], &[]).unwrap();
+        for x in [&a, &b, &c] {
+            assert_eq!(node.put(x), 201);
+        }
+        node.halt().unwrap();
+    }
+    let file = dir.join("deny.txt");
+    std::fs::write(&file, format!("block {by_id}\nkey {key}\n")).unwrap();
+    let before = metrics::denied_total();
+    let node = Node::mirrored(&data, &s3, &[("DENY_FILE", file.to_str().unwrap())]);
+    assert!(wait_until(Duration::from_secs(20), || s3
+        .object(&block_key(&kept))
+        .is_some()));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        || metrics::denied_total() - before >= 2
+    ));
+    drop(node);
+    assert_eq!(s3.puts_of(&block_key(&by_id)), 0);
+    assert_eq!(s3.puts_of(&block_key(&by_key)), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

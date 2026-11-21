@@ -1197,6 +1197,8 @@ pub(crate) enum Copied {
     Absent,
     /// Damaged, moved to quarantine (`mirror_damaged_total`).
     Damaged,
+    /// On the operator deny list (ADR 0052 rule 18, `mirror_denied_total`).
+    Denied(Match),
     /// No permit, an I/O error or a failed task: tried again later.
     Retry,
 }
@@ -1253,8 +1255,23 @@ impl<I: IndexBackend + 'static> Relay<I> {
     /// miss takes a block-read permit like a `GET`, but the block is not put in the cache: a walk
     /// of the whole history must not push the blocks clients read out of it.
     #[cfg(feature = "object-store")]
+    ///
+    /// ADR 0052 rule 18: a denied block is never handed to the uploader, by `block_id` before
+    /// any read, by key once read.
     pub(crate) async fn read_for_copy(self: &Arc<Self>, id: BlockId) -> Copied {
+        let deny = self.deny.list();
+        if deny.as_ref().is_some_and(|l| l.denies_id(&id)) {
+            return Copied::Denied(Match::Block);
+        }
+        let by_key = |b: &Bytes| {
+            deny.as_ref()
+                .and_then(|l| pubkey_of(b).filter(|k| l.denies_key(k)))
+                .is_some()
+        };
         if let Some(bytes) = self.cache.get(&id) {
+            if by_key(&bytes) {
+                return Copied::Denied(Match::Key);
+            }
             return Copied::Bytes(bytes);
         }
         let Ok(permit) = self.read.acquire().await else {
@@ -1267,6 +1284,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
         })
         .await;
         match loaded {
+            Ok(Ok(Loaded::Bytes(b))) if by_key(&b) => Copied::Denied(Match::Key),
             Ok(Ok(Loaded::Bytes(b))) => Copied::Bytes(b),
             Ok(Ok(Loaded::Absent)) => Copied::Absent,
             Ok(Ok(Loaded::Damaged)) => Copied::Damaged,

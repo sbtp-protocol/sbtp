@@ -162,8 +162,8 @@ impl Client {
             }
             // A `404` is a skip and a `400` may name `InvalidCursor`: both are read within the
             // error ceiling, so that the connection stays usable; an error body over it is
-            // unparseable, not a failure (core spec §4).
-            400 | 404 => {
+            // unparseable, not a failure (core spec §4). ADR 0052 rule 17: a `451` is a skip too.
+            400 | 404 | 451 => {
                 let body = read_bounded(resp.into_body(), ERROR_CEILING)
                     .await
                     .unwrap_or_default();
