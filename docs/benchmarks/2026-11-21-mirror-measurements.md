@@ -143,16 +143,29 @@ At the 2,782 blocks/s of the fastest drain, signing is about 1.3% of one core.
    blocks/s at 20 ms, 15 at 50 ms. A relay that accepts more than that for long builds a backlog that
    only drains when ingest slows. Not a memory risk (the backlog is the index, not RAM), but the
    archive lags. Operators of a busy relay should raise `mirror_max_in_flight`; the profile rows
-   (1/4/8) look right for `standard` and `large`.
+   (1/4/8) look right for `standard` and `large`. **Since changed:** `small` has 4 lanes, after
+   the MinIO runs above.
 2. **A page barrier.** The cursor moves once every block of a 64-block page is done, so one slow or
    failing block holds its page's other lanes idle. With 4 lanes at 20 ms the drain reaches 116
    blocks/s against an ideal near 160; at 0 ms, 4 lanes are ten times faster than 1 (2,222 against 224
    blocks/s), which suggests per-block local work that the lanes overlap. Not investigated further.
+   **Since changed:** the lanes take blocks from a window of four pages from the cursor, which is the
+   oldest block not yet done; a failing block waits out its back-off in the window, not in a lane.
+   Re-measured (same laptop, fake store, backlog of 2,000 blocks, 4 lanes, 20 ms): 120 blocks/s.
 3. **A store that fails part of the requests collapses the copy rate.** With one `PUT` in three
    answered `503`, each failure sleeps its lane for 0.5 to 1 s (more on a repeat failure), and the
    page barrier makes the other lanes wait for it: 7 blocks/s. This is the ADR 0050 rule 9 back-off
    working as written, against a store that is shedding load; worth knowing when a provider throttles
-   with `503 SlowDown`. Client traffic is not affected.
+   with `503 SlowDown`. Client traffic is not affected. **After the window change** (backlog of 2,000
+   blocks, 4 lanes, 20 ms, every third block `PUT` answered `503`): 12 blocks/s with the default
+   `mirror_max_backoff_s` (one hour), and, in the integration test (300 blocks, no added latency,
+   `mirror_max_backoff_s = 1`), 51.6 blocks/s against 9.4 before. With the one-hour cap the rate
+   stays low: rule 9 doubles a block's back-off at each failure, the block with the longest run
+   of failures holds the cursor, and the window can only get four pages past it. A simulation of
+   the lanes gives the same picture: about 8 blocks/s with a two-page window, 12 with four, 14 with
+   sixteen, against 43, 66 and 104 with a 1 s cap. Only a change of the back-off itself (for
+   example, a per-block exponent that stops growing while the store answers other `PUT`s with
+   `2xx`) would lift it; that is rule 9, not an internal detail.
 4. **macOS resident size with the outbound TLS client.** Any build with `replication` starts at about
    10.2 MiB resident against 5.5 MiB without, although no TLS connection is made. A plausible cause is
    the macOS system frameworks the native trust store links (their pages are counted in RSS). The
@@ -161,11 +174,42 @@ At the 2,782 blocks/s of the fastest drain, signing is about 1.3% of one core.
 5. **Per-block CPU** of about 3 ms on this machine for an accepted block, mirror off, is mostly the
    durable write path on APFS; it is not affected by the mirror.
 
-## Remote runs (not run yet)
+## MinIO (LAN, single node)
 
-The harness is ready for a real endpoint; no remote run has been made. The endpoint and the
-credentials come only from environment variables, the rest from flags; neither the endpoint nor a
-credential is ever printed or written to a file.
+A single-node MinIO on the LAN, TLS, path-style, with the commands of "Remote runs" below. These
+runs **predate** two later changes on this branch: `mirror_max_in_flight` on `small` raised from 1
+to 4, and the uploader's window that lets the other lanes go on while one block is in back-off
+(see "Possible problems" 2 and 3). Run 1 is the relay with ingest paced at 50 blocks/s; run 2 is
+`s3put`, the uploader's `PUT` sent straight to the store; run 3 is a backlog drain.
+
+| Run | Phase | Requests | p50 | p99 | Max | Throughput |
+|---|---|---|---|---|---|---|
+| 1 | relay at 50/s, in_flight 1 (6,000 blocks) | client PUT 6,000 × 201 | 8.5 ms | 17 ms | | upload lag p50 66 s, p99 119 s |
+| 1 | relay at 50/s, in_flight 4 | client PUT | 9.7 ms | 19 ms | | lag p50 319 ms, p99 730 ms |
+| 1 | relay at 50/s, in_flight 8 | client PUT | 10.0 ms | 17 ms | | lag p50 318 ms, p99 494 ms |
+| 1 | RSS peak, in_flight 1 / 4 / 8 | | | | | 21.7 / 24.4 / 24.5 MiB |
+| 2 | s3put, 1 lane, 3,000 blocks | 200 | 36 ms | 77 ms | 166 ms | 25/s |
+| 2 | s3put, 4 lanes, 6,000 blocks at 100/s | 200 | 37 ms | 81 ms | 372 ms | 100/s |
+| 2 | rerun of the same 6,000 blocks | 6,000 × 412 | 35 ms | 81 ms | 499 ms | 100/s |
+| 3 | backlog drain, 8 lanes, 6,000 blocks (47.7 MB) | | | | | 37.6 s, 160 blocks/s, 1.27 MB/s, relay CPU 3.0 s, RSS 20 MiB, `mirror_failed` 0 |
+
+- The store answers a `412` in the same time as a `201`: a rerun of a copied range costs as many
+  round trips as the first copy.
+- One lane copies about 25 blocks/s (1 / 36 ms plus local work), below the 50 blocks/s of ingest,
+  so the lag of run 1 grew for the whole run; 4 lanes kept it under 1 s. This is why `small` now
+  has 4 lanes.
+- The store's disk peaked at 13 % utilisation: the uploader, not the store, was the bottleneck.
+- The first `PUT` of the session (5.3 s) was a local firewall prompt and is excluded as warm-up.
+- In run 1, each sub-run logged one `mirror_failed` line: the bucket policy covered only
+  `sbtp/v1/block/*`, so the `/info` `PUT` got `403`. Block uploads were not affected.
+  `deploy/README.md` now shows a policy that covers both keys.
+- RSS is the macOS figure of the relay process (see "Possible problems" 4).
+
+## Remote runs
+
+The harness drives a real endpoint as follows. The endpoint and the credentials come only from
+environment variables, the rest from flags; neither the endpoint nor a credential is ever printed
+or written to a file.
 
 - MinIO: `SBTP_MIRROR_BENCH_MINIO_ENDPOINT`, `SBTP_MIRROR_BENCH_MINIO_ACCESS_KEY_ID`,
   `SBTP_MIRROR_BENCH_MINIO_SECRET_ACCESS_KEY`.
