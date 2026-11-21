@@ -7,7 +7,7 @@
 - Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): rule 12, last bullet, a
   cross-reference to ADR 0047 amendment D1 (a `451` to a presence check of a block the relay had
   acknowledged changes its availability, not its delivery state)
-- Clarifications: L1 to L3 (2026-11-21, after the implementation of `sbtp-relay`; proposed): L1, the
+- Clarifications: L1 to L3 (2026-11-21, after the implementation of `sbtp-relay`; accepted by the project owner, 2026-11-21): L1, the
   cursor of a page that the list emptied (rule 9, an exception to ADR 0051 clarification B4); L2, the
   `/info` member is `true` or absent (rule 11); L3, the line format of `deny_file` (rules 3 and 21).
   No wire format change
@@ -408,9 +408,9 @@ a `451`".
 
 ## Clarifications (2026-11-21)
 
-After the implementation of `sbtp-relay`. Status: proposed.
+After the implementation of `sbtp-relay`. Accepted by the project owner, 2026-11-21.
 
-- **L1. A page that the list emptied (rule 9).** The relay builds a page from the index, then removes
+- **L1. A page that the list emptied (rule 9).** Accepted 2026-11-21. The relay builds a page from the index, then removes
   the denied identifiers from it. The page's `cursor` is the cursor of the entries it read, before the
   removal: with `asc`, the gap after the last entry read; with `desc`, the gap before the oldest entry
   read. This holds when every entry read was denied and `block_ids` is empty. ADR 0051 clarification
@@ -418,10 +418,10 @@ After the implementation of `sbtp-relay`. Status: proposed.
   Without this exception, a `desc` walk over a run of at least `limit` denied blocks would receive the
   same cursor again and never end. A client sees an empty page with `more = true` and an advanced
   cursor, and continues the walk as for any page (rule 9).
-- **L2. `/info` (rule 11).** The member `deny_list` is either `true` or absent. A relay without a deny
+- **L2. `/info` (rule 11).** Accepted 2026-11-21. The member `deny_list` is either `true` or absent. A relay without a deny
   list omits it; `sbtp-relay` never publishes `false`. A client reads `false` and an absent member
   alike.
-- **L3. Line format of `deny_file` (rules 3 and 21).** Operator-facing, not wire. `sbtp-relay` reads
+- **L3. Line format of `deny_file` (rules 3 and 21).** Accepted 2026-11-21. Operator-facing, not wire. `sbtp-relay` reads
   the file strictly:
   - Lines are separated by `\n` (LF). The last line MAY end without `\n`. A line is at most 256 bytes,
     the `\n` not included.
