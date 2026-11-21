@@ -7,6 +7,10 @@
 - Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (Q-83): rule 12, last bullet, a
   cross-reference to ADR 0047 amendment D1 (a `451` to a presence check of a block the relay had
   acknowledged changes its availability, not its delivery state)
+- Clarifications: L1 to L3 (2026-11-21, after the implementation of `sbtp-relay`; proposed): L1, the
+  cursor of a page that the list emptied (rule 9, an exception to ADR 0051 clarification B4); L2, the
+  `/info` member is `true` or absent (rule 11); L3, the line format of `deny_file` (rules 3 and 21).
+  No wire format change
 - Date: 2026-11-21
 - Questions: opens Q-80 (keeping the bytes of a denied block as evidence) and Q-81 (public notice and
   appeal of a denial)
@@ -113,7 +117,8 @@ header's public key. Blocks are immutable: a denied block cannot be altered, onl
      later is refused at `PUT` (rule 7) or skipped (rules 17 to 19) and never listed.
    - A page MAY therefore hold fewer than `limit` identifiers, and `more` MAY be `true` when only denied
      blocks remain; the next page is then empty with `more = false`. Cursors are unchanged. The work of
-     a request stays `O(log n + limit)`.
+     a request stays `O(log n + limit)`. A page whose entries were all denied returns the cursor of
+     the entries it read, not the gap it started from (clarification L1).
    - Edges in which a denied block is the parent belong to its children: `/query?parent=` still lists
      the children that are not denied (as after an eviction, ADR 0046 rule 22).
 10. **Caching.** A `451` is an error response and carries `Cache-Control: no-store` (§4, Errors), and
@@ -127,7 +132,8 @@ header's public key. Blocks are immutable: a denied block cannot be altered, onl
     after the marking pass, for the purge. Private caches are out of reach.
 11. **`/info`.** A relay that applies a deny list publishes `"deny_list": true`: the setting `deny_file`
     is set, whatever the number of entries, including none. A client MUST read an absent member as
-    `false`. The member says that `451` can occur; it says nothing about the entries. A relay MUST NOT
+    `false`; a relay without a deny list omits the member (clarification L2). The member says that
+    `451` can occur; it says nothing about the entries. A relay MUST NOT
     publish the entries, their number or their grounds in `/info`.
 
 ### What a client does
@@ -399,3 +405,35 @@ a `451`".
   normal course meanwhile.
 - **Denial by content** (hashes of payload data, keyword filters). The relay does not parse payloads;
   that belongs to layers above, which can apply their own lists before showing a block.
+
+## Clarifications (2026-11-21)
+
+After the implementation of `sbtp-relay`. Status: proposed.
+
+- **L1. A page that the list emptied (rule 9).** The relay builds a page from the index, then removes
+  the denied identifiers from it. The page's `cursor` is the cursor of the entries it read, before the
+  removal: with `asc`, the gap after the last entry read; with `desc`, the gap before the oldest entry
+  read. This holds when every entry read was denied and `block_ids` is empty. ADR 0051 clarification
+  B4 (an empty `desc` page returns the gap it started from) applies only to a page that read no entry.
+  Without this exception, a `desc` walk over a run of at least `limit` denied blocks would receive the
+  same cursor again and never end. A client sees an empty page with `more = true` and an advanced
+  cursor, and continues the walk as for any page (rule 9).
+- **L2. `/info` (rule 11).** The member `deny_list` is either `true` or absent. A relay without a deny
+  list omits it; `sbtp-relay` never publishes `false`. A client reads `false` and an absent member
+  alike.
+- **L3. Line format of `deny_file` (rules 3 and 21).** Operator-facing, not wire. `sbtp-relay` reads
+  the file strictly:
+  - Lines are separated by `\n` (LF). The last line MAY end without `\n`. A line is at most 256 bytes,
+    the `\n` not included.
+  - The file is UTF-8 as a whole, comment lines included.
+  - A line is empty (zero bytes), a comment (`#` in the first column, then any text), or an entry:
+    `block <hex>`, `key <hex>`, optionally followed by ` hide` or ` purge`. `<hex>` is 64 lowercase
+    hexadecimal characters. Fields are separated by exactly one space.
+  - Anything else makes the whole file invalid (rule 4): a CR before the `\n` (CRLF line ends),
+    leading or trailing whitespace, a tab, two spaces between fields, a line of only whitespace, a
+    `#` after whitespace, upper-case hexadecimal, an unknown kind or action, a fourth field.
+  - An entry is its kind and its value: `block X` and `key X` are two entries. The same entry twice
+    with one action counts once; with two actions it makes the file invalid. `deny_max_entries`
+    counts distinct entries (rule 21).
+  - An invalid file is reported by line number and a fixed reason (`deny_list_invalid`, rule 20); the
+    line's content is never logged.

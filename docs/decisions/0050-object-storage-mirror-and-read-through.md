@@ -8,6 +8,10 @@
 - Amended: 2026-11-21, accepted by the project owner on 2026-11-21, after measurement
   (`docs/benchmarks/2026-11-21-mirror-measurements.md`): amendments U1 to U3 below (rules 7, 27 and
   28: `small` uploads 4 at a time, the uploader's window replaces the page barrier, new memory terms)
+- Clarification: 2026-11-21, editorial, after the ADR 0052 implementation (amendment U3, rule 27): the
+  819,481 bytes are the archive copy's share (651,284) plus the read-through's share (168,197); the
+  root store (400,000) is not part of them, it is counted once, in the replication term (723,077) of
+  ADR 0048 rule 16. No figure changes
 - Amended by: 0052 (rule 7: the uploader treats a denied block as done and does not upload it; rule 16:
   no source is asked for a listed `block_id`, and a `451` from a source is a source that does not serve
   the block; rule 19: a fetched block whose key is listed is neither served nor kept)
@@ -233,8 +237,9 @@ documentation):
     cache keeps its default (`block_cache_bytes`, 2 MiB on `small`) whether these functions are on or
     off. On `small` with both functions on (four uploads, one fetch, 256 negative entries; amendment
     U3, accepted 2026-11-21; was one upload): 5 × 155,909 + 400,000 + 27,648 + 12,288 = 1,219,481 bytes alone,
-    819,481 bytes when replication is also on (the root store is already counted; the archive copy's
-    share is then 4 × 155,909 + 27,648 = 651,284, the read-through's 168,197).
+    819,481 bytes when replication is also on (the root store is already counted, once, in the
+    replication term of ADR 0048 rule 16; the archive copy's share is then 4 × 155,909 + 27,648 =
+    651,284, the read-through's 155,909 + 12,288 = 168,197, and 651,284 + 168,197 = 819,481).
 
     The owner accepts about 1 MB per enabled outbound function rather than a smaller block cache. The
     budget of ADR 0048 rule 3, item 2 (as amended on 2026-11-21) applies: `small` with the default
