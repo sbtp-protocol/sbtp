@@ -123,6 +123,9 @@ impl From<SealError> for BindError {
             SealError::MsgInvalid(inner) => return inner.into(),
             SealError::TooLong => names::SEAL_TOO_LONG,
             SealError::Hpke => names::INVALID_RECIPIENT_KEY,
+            // The criteria of core spec §3.2, under the names of spec §2.2 (C2 and C3).
+            SealError::SenderKey => "InvalidPublicKey",
+            SealError::Signature => "InvalidSignature",
             // Probability 2^-252 (`EphemeralIsSender`), or documented as unreachable.
             SealError::EphemeralIsSender | SealError::Signing | SealError::Encoding(_) => {
                 names::INTERNAL

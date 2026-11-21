@@ -5,7 +5,9 @@
 //! and the key directory tag. In this crate, "spec §x" names a section of `l2-grammar.md`.
 //!
 //! - Sender: [`seal`] turns an encoded grammar payload `msg` into the payload of an `sbtp.enc`
-//!   block, with a fresh ephemeral signer for the outer block.
+//!   block, with a fresh ephemeral signer for the outer block. When the identity key signs
+//!   elsewhere (a non-extractable key store), [`seal_prepare`] returns the message to sign and
+//!   [`PendingSeal::finish`] checks the signature and seals.
 //! - Recipient: [`open`] runs steps (4) to (8) of the order of checks of spec §5.3 on an outer
 //!   body that already passed layer 0 and grammar validation.
 //! - Tags: [`directory_tag`] and [`is_directory_tag`] (spec §5.5), [`application_tag`] for the
@@ -41,7 +43,7 @@ pub use bucket::{AEAD_TAG_LEN, Bucket};
 pub use error::{OpenError, SealError, TagError};
 pub use keys::RecipientKey;
 pub use open::{OpenRequest, Opened, open};
-pub use seal::{SealRequest, Sealed, seal};
+pub use seal::{PendingSeal, PrepareRequest, SealRequest, Sealed, seal, seal_prepare};
 pub use tag::{Tag, application_tag, directory_tag, is_directory_tag};
 
 /// Re-export of the `rand_core` version the `CryptoRng` bound of [`seal`] and

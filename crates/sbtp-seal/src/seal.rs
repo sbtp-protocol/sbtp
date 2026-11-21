@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use hpke::rand_core::CryptoRng;
 use hpke::{Deserializable, OpModeS, Serializable};
 use sbtp_core::{
-    BlockId, SEALED_HPKE_INFO, SigningKey, sealed_sig_message, sealed_sig_message_len, sign_sealed,
+    BlockId, SEALED_HPKE_INFO, SealedSigError, SealedSigMessage, SigningKey, sealed_sig_message,
+    sealed_sig_message_len, sign_sealed, verify_sealed,
 };
 use sbtp_l2::cbor::{self, Value};
 use sbtp_l2::{Body, Edge, Enc, L2Error, Payload, Rel, Target, validate_l2_invariants};
@@ -74,78 +75,281 @@ impl core::fmt::Debug for Sealed {
     }
 }
 
-/// Seals `request.msg` to `request.recipient_x25519` under `request.tag`.
+/// What to seal, and to whom, when the sender's identity key signs outside this crate
+/// (spec §5.3): [`SealRequest`] with the sender's public key `from` in place of its private key.
 ///
-/// Steps: `msg` is validated as a payload of a block with 0 parents (spec §5.3); a fresh
-/// ephemeral Ed25519 key is drawn from `rng` (spec §5.2); `sig` is signed over the typed sealed
-/// message of `sbtp-core` (spec §5.3); the item `{from, msg, sig}` is
-/// encoded in the deterministic profile and padded with `0x00` to the bucket's plaintext length
-/// (spec §5.3); HPKE base mode seals it with `info` and `aad = PubKey ‖ tag` (spec §5.1); the
-/// outer payload is encoded and validated (spec §5.2).
+/// Its `Debug` output shows the length of `msg` and the bucket only (spec §5.9).
+#[derive(Clone, Copy)]
+pub struct PrepareRequest<'a> {
+    /// The recipient's X25519 key (spec §5.5), as in [`SealRequest::recipient_x25519`].
+    pub recipient_x25519: &'a [u8; 32],
+    /// The `recipient_id` the application that defines the tag fixes (spec §5.3, §5.4).
+    pub recipient_id: &'a [u8; 32],
+    /// The delivery tag, the single header parent of the outer block (spec §5.2, §5.4).
+    pub tag: &'a Tag,
+    /// The sender's Ed25519 public key `from`, whose private key makes `sig` (spec §5.3).
+    pub from: &'a [u8; 32],
+    /// `msg`: an encoded grammar payload with no causal edge (spec §5.3).
+    pub msg: &'a [u8],
+    /// The bucket to use; `None` picks the smallest that fits (spec §5.3, SHOULD).
+    pub bucket: Option<Bucket>,
+}
+
+impl core::fmt::Debug for PrepareRequest<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PrepareRequest")
+            .field("msg_len", &self.msg.len())
+            .field("bucket", &self.bucket)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A seal waiting for its inner signature `sig` (spec §5.3): the output of [`seal_prepare`].
+///
+/// Sign [`PendingSeal::message`] with the private key of `from` (a pure Ed25519 signature,
+/// RFC 8032 §5.1), then pass the signature to [`PendingSeal::finish`]. The value is single use:
+/// `finish` consumes it, whatever its result. It is not `Clone`. It holds the ephemeral key of
+/// the outer block and a copy of `msg`; both are wiped on drop (`ed25519-dalek` `zeroize`,
+/// `Zeroizing`). Its `Debug` output shows the length of `msg` and the bucket only.
+///
+/// Single use is enforced by the type: a second `finish` does not compile.
+///
+/// ```compile_fail,E0382
+/// fn twice(p: sbtp_seal::PendingSeal, rng: &mut impl sbtp_seal::rand_core::CryptoRng) {
+///     let _ = p.finish(&[0; 64], rng);
+///     let _ = p.finish(&[0; 64], rng);
+/// }
+/// ```
+pub struct PendingSeal {
+    /// The fresh Ed25519 key of the outer block (spec §5.2).
+    ephemeral: SigningKey,
+    /// `ephemeral`'s public key, the outer `PubKey`.
+    outer_pubkey: [u8; 32],
+    from: [u8; 32],
+    recipient_x25519: [u8; 32],
+    recipient_id: [u8; 32],
+    tag: Tag,
+    bucket: Bucket,
+    /// A copy of `msg`.
+    msg: Zeroizing<Vec<u8>>,
+    /// The sealed signature message, `sealed_sig_message_len(msg.len())` bytes.
+    message: Zeroizing<Vec<u8>>,
+}
+
+impl core::fmt::Debug for PendingSeal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingSeal")
+            .field("msg_len", &self.msg.len())
+            .field("bucket", &self.bucket)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The length of the item `{from, msg, sig}` in the deterministic profile (spec §5.3, §1.2): the
+/// map head, the three keys, the heads of the three byte strings, 32 + 64 bytes of `from` and
+/// `sig`, and `msg`. `None` on overflow. Checked against `cbor::encode` by a test.
+pub(crate) fn item_len(msg_len: usize) -> Option<usize> {
+    // `0xa3`; `"from"` (5), `"msg"` (4), `"sig"` (4); `0x58 0x20`, `0x58 0x40`; 32 + 64.
+    const FIXED: usize = 1 + 5 + 4 + 4 + 2 + 2 + 32 + 64;
+    let head = match msg_len {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        _ => 5,
+    };
+    FIXED.checked_add(head)?.checked_add(msg_len)
+}
+
+/// First phase of a seal whose `sig` is made outside this crate (spec §5.3), for a sender whose
+/// identity key cannot leave its key store.
+///
+/// Steps: `msg` is validated as a payload of a block with 0 parents (spec §5.3); the bucket is
+/// chosen from the item length (spec §5.2, §5.3); a fresh ephemeral Ed25519 key is drawn from
+/// `rng` (spec §5.2); the typed sealed signature message is built by `sbtp-core` (spec §5.3).
+/// The returned [`PendingSeal`] carries that message for the signer.
 ///
 /// `rng` MUST be the operating system's secure source; a seeded generator is for tests only
-/// (spec §5.1). It provides the ephemeral Ed25519 key and the HPKE ephemeral key.
+/// (spec §5.1).
+///
+/// `from` is not checked here: [`PendingSeal::finish`] verifies `sig` by `from` with criteria V1
+/// to V6 of core spec §3.2, so a `from` that fails V1 or V2 is refused there.
 ///
 /// # Errors
 ///
-/// A [`SealError`]; nothing is to be sent.
-pub fn seal(request: &SealRequest<'_>, rng: &mut impl CryptoRng) -> Result<Sealed, SealError> {
+/// [`SealError::MsgInvalid`], [`SealError::TooLong`], [`SealError::EphemeralIsSender`],
+/// [`SealError::Signing`] (not reachable: the message buffer is sized by `sbtp-core`).
+pub fn seal_prepare(
+    request: &PrepareRequest<'_>,
+    rng: &mut impl CryptoRng,
+) -> Result<PendingSeal, SealError> {
     // spec §5.3: `msg` is a grammar payload of a block with 0 parents. This also rejects a
     // `msg` of kind `sbtp.enc`, whose row requires exactly 1 parent (spec §3).
     validate_l2_invariants(&[], request.msg).map_err(SealError::MsgInvalid)?;
+
+    // spec §5.2, §5.3: the item must fit the bucket; the smallest that fits by default. `sig`
+    // has a fixed length, so the item length is known before signing.
+    let item_len = item_len(request.msg.len()).ok_or(SealError::TooLong)?;
+    let bucket = match request.bucket {
+        Some(b) if b.plaintext_len() >= item_len => b,
+        Some(_) => return Err(SealError::TooLong),
+        None => Bucket::smallest_for(item_len).ok_or(SealError::TooLong)?,
+    };
 
     // spec §5.2: a fresh Ed25519 key, never the sender's.
     let mut seed = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(seed.as_mut());
     let ephemeral = SigningKey::from_bytes(&seed);
     let outer_pubkey = ephemeral.verifying_key().to_bytes();
-    let from = request.sender.verifying_key().to_bytes();
-    if outer_pubkey == from {
+    if &outer_pubkey == request.from {
         return Err(SealError::EphemeralIsSender);
     }
 
-    // spec §5.3: `sig` over the typed sealed message.
+    // spec §5.3: the typed sealed message, bound to the outer key, `recipient_id`, the X25519
+    // key and `msg`. Both buffers are allocated once at their final length.
     let sig_len = sealed_sig_message_len(request.msg.len()).ok_or(SealError::Signing)?;
-    let mut sig_buf = Zeroizing::new(vec![0u8; sig_len]);
-    let message = sealed_sig_message(
+    let mut message = Zeroizing::new(vec![0u8; sig_len]);
+    sealed_sig_message(
         &outer_pubkey,
         request.recipient_id,
         request.recipient_x25519,
         request.msg,
-        &mut sig_buf,
+        &mut message,
     )
     .map_err(|_| SealError::Signing)?;
-    let sig = sign_sealed(request.sender, &message).map_err(|_| SealError::Signing)?;
+    Ok(PendingSeal {
+        ephemeral,
+        outer_pubkey,
+        from: *request.from,
+        recipient_x25519: *request.recipient_x25519,
+        recipient_id: *request.recipient_id,
+        tag: *request.tag,
+        bucket,
+        msg: Zeroizing::new(request.msg.to_vec()),
+        message,
+    })
+}
 
-    // spec §5.3: one deterministic CBOR item, then `0x00` up to the bucket's plaintext length.
-    let item = Value::Map(vec![
-        ("from", Value::Bytes(&from)),
-        ("msg", Value::Bytes(request.msg)),
-        ("sig", Value::Bytes(&sig)),
-    ]);
-    // An item over 65,535 bytes is refused by the encoder: it fits no bucket either.
-    let mut plaintext = Zeroizing::new(cbor::encode(&item).map_err(|e| match e {
-        L2Error::PayloadTooLong => SealError::TooLong,
-        e => SealError::Encoding(e),
-    })?);
-    let item_len = plaintext.len();
-    let bucket = match request.bucket {
-        Some(b) if b.plaintext_len() >= item_len => b,
-        Some(_) => return Err(SealError::TooLong),
-        None => Bucket::smallest_for(item_len).ok_or(SealError::TooLong)?,
-    };
-    plaintext.resize(bucket.plaintext_len(), 0x00);
+/// The typed sealed message of `pending`, rebuilt in place from its fields (spec §5.3): the
+/// bytes are those of [`PendingSeal::message`].
+fn typed_message<'b>(
+    outer_pubkey: &[u8; 32],
+    recipient_id: &[u8; 32],
+    recipient_x25519: &[u8; 32],
+    msg: &[u8],
+    buf: &'b mut [u8],
+) -> Result<SealedSigMessage<'b>, SealError> {
+    sealed_sig_message(outer_pubkey, recipient_id, recipient_x25519, msg, buf)
+        .map_err(|_| SealError::Signing)
+}
 
+impl PendingSeal {
+    /// The exact message `sig` signs (spec §5.3):
+    /// `SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖ recipient_x25519 ‖ msg`, built by the
+    /// typed builder of `sbtp-core`. Sign it with the private key of `from`, nothing else.
+    #[must_use]
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// The sender key `from` the signature must verify under.
+    #[must_use]
+    pub const fn from(&self) -> &[u8; 32] {
+        &self.from
+    }
+
+    /// The bucket chosen.
+    #[must_use]
+    pub const fn bucket(&self) -> Bucket {
+        self.bucket
+    }
+
+    /// Signs the message with `sender` (the convenience path of [`seal`]).
+    fn sign_with(&mut self, sender: &SigningKey) -> Result<[u8; 64], SealError> {
+        let message = typed_message(
+            &self.outer_pubkey,
+            &self.recipient_id,
+            &self.recipient_x25519,
+            &self.msg,
+            &mut self.message,
+        )?;
+        sign_sealed(sender, &message).map_err(|_| SealError::Signing)
+    }
+
+    /// Second phase: checks `sig`, then seals (spec §5.3, §5.1, §5.2).
+    ///
+    /// Steps: `sig` is verified by `from` over the sealed message with criteria V1 to V6 of core
+    /// spec §3.2, as the recipient will (spec §5.3 step 7): nothing is sealed with a bad
+    /// signature; the item `{from, msg, sig}` is encoded in the deterministic profile and padded
+    /// with `0x00` to the bucket's plaintext length (spec §5.3); HPKE base mode seals it with
+    /// `info` and `aad = PubKey ‖ tag` (spec §5.1); the outer payload is encoded and validated
+    /// (spec §5.2).
+    ///
+    /// `rng` provides the HPKE ephemeral key; it MUST be the operating system's secure source
+    /// (spec §5.1). The pending state is consumed on success and on error: after an error, start
+    /// again with [`seal_prepare`] (a new ephemeral key).
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::SenderKey`], [`SealError::Signature`], [`SealError::Hpke`],
+    /// [`SealError::TooLong`] and [`SealError::Encoding`] (not reachable after a successful
+    /// prepare), [`SealError::Signing`] (not reachable).
+    pub fn finish(mut self, sig: &[u8; 64], rng: &mut impl CryptoRng) -> Result<Sealed, SealError> {
+        // spec §5.3 (step 7 on the recipient side): strict V1 to V6, before any sealing.
+        let message = typed_message(
+            &self.outer_pubkey,
+            &self.recipient_id,
+            &self.recipient_x25519,
+            &self.msg,
+            &mut self.message,
+        )?;
+        verify_sealed(&self.from, sig, &message).map_err(|e| match e {
+            SealedSigError::InvalidSenderKey => SealError::SenderKey,
+            SealedSigError::InvalidSignature => SealError::Signature,
+            _ => SealError::Signing,
+        })?;
+
+        // spec §5.3: one deterministic CBOR item, then `0x00` up to the bucket's plaintext length.
+        let item = Value::Map(vec![
+            ("from", Value::Bytes(&self.from)),
+            ("msg", Value::Bytes(&self.msg)),
+            ("sig", Value::Bytes(sig)),
+        ]);
+        // An item over 65,535 bytes is refused by the encoder: it fits no bucket either.
+        let mut plaintext = Zeroizing::new(cbor::encode(&item).map_err(|e| match e {
+            L2Error::PayloadTooLong => SealError::TooLong,
+            e => SealError::Encoding(e),
+        })?);
+        if plaintext.len() > self.bucket.plaintext_len() {
+            return Err(SealError::TooLong);
+        }
+        plaintext.resize(self.bucket.plaintext_len(), 0x00);
+
+        let payload = hpke_seal(&self, &plaintext, rng)?;
+        Ok(Sealed {
+            payload,
+            ephemeral: self.ephemeral,
+            tag: self.tag,
+            bucket: self.bucket,
+        })
+    }
+}
+
+/// HPKE seal of the padded `plaintext`, then the outer payload (spec §5.1, §5.2).
+fn hpke_seal(
+    pending: &PendingSeal,
+    plaintext: &[u8],
+    rng: &mut impl CryptoRng,
+) -> Result<Vec<u8>, SealError> {
     // spec §5.1: base mode, the fixed suite, `info`, `aad = PubKey ‖ tag`. The library rejects
     // an all-zero shared secret (RFC 9180 §7.1.4).
-    let pk = <Kem as hpke::Kem>::PublicKey::from_bytes(request.recipient_x25519)
+    let pk = <Kem as hpke::Kem>::PublicKey::from_bytes(&pending.recipient_x25519)
         .map_err(|_| SealError::Hpke)?;
-    let aad = aad(&outer_pubkey, request.tag);
+    let aad = aad(&pending.outer_pubkey, &pending.tag);
     let (encapped, ct) = hpke::single_shot_seal_with_rng::<Aead, Kdf, Kem>(
         &OpModeS::Base,
         &pk,
         &SEALED_HPKE_INFO,
-        &plaintext,
+        plaintext,
         &aad,
         rng,
     )
@@ -164,18 +368,43 @@ pub fn seal(request: &SealRequest<'_>, rng: &mut impl CryptoRng) -> Result<Seale
         }),
     };
     let payload = outer
-        .encode(&[BlockId(*request.tag)])
+        .encode(&[BlockId(pending.tag)])
         .map_err(SealError::Encoding)?;
     // spec §5.2: payload = 90 bytes + ciphertext, at the bucket length (defence in depth).
-    if payload.len() != bucket.payload_len() {
+    if payload.len() != pending.bucket.payload_len() {
         return Err(SealError::Encoding(L2Error::EncCiphertextLen));
     }
-    Ok(Sealed {
-        payload,
-        ephemeral,
-        tag: *request.tag,
-        bucket,
-    })
+    Ok(payload)
+}
+
+/// Seals `request.msg` to `request.recipient_x25519` under `request.tag`, signing `sig` with
+/// `request.sender`.
+///
+/// The convenience form of [`seal_prepare`] then [`PendingSeal::finish`], with `sig` made by
+/// `request.sender` over [`PendingSeal::message`]; same steps, same checks, and the same output
+/// for the same `rng` stream.
+///
+/// `rng` MUST be the operating system's secure source; a seeded generator is for tests only
+/// (spec §5.1). It provides the ephemeral Ed25519 key and the HPKE ephemeral key.
+///
+/// # Errors
+///
+/// A [`SealError`]; nothing is to be sent.
+pub fn seal(request: &SealRequest<'_>, rng: &mut impl CryptoRng) -> Result<Sealed, SealError> {
+    let from = request.sender.verifying_key().to_bytes();
+    let mut pending = seal_prepare(
+        &PrepareRequest {
+            recipient_x25519: request.recipient_x25519,
+            recipient_id: request.recipient_id,
+            tag: request.tag,
+            from: &from,
+            msg: request.msg,
+            bucket: request.bucket,
+        },
+        rng,
+    )?;
+    let sig = pending.sign_with(request.sender)?;
+    pending.finish(&sig, rng)
 }
 
 /// `aad`: the 64 bytes `PubKey ‖ tag` of the outer block (spec §5.1).
