@@ -1,7 +1,7 @@
 # 0029: Client resource bounds against an untrusted relay
 
 - Status: accepted (by the project owner, 2026-11-19)
-- Amended by: 0030 (rule 15, a `3xx` is a failed request)
+- Amended by: 0030 (rule 15, a `3xx` is a failed request); 0047 (rule 12: an own block stays protected until every relay of the list acknowledges it or is no longer pending, within bounds; eviction order of the local store)
 - Date: 2026-11-19
 - Questions: Q-26, client part only (partially resolved). The peer-exchange part stays open, post-MVP
 - Amends: ADR 0012 rules 10, 14, 16 and 20 (response body ceilings; the members a relay MAY

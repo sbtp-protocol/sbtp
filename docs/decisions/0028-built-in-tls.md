@@ -6,6 +6,9 @@
   server TLS 1.3 only; the 15 MB `small` target applies with TLS off; `tls` bucket values provisional;
   `rustls-native-certs` in the CLI; in-house DER `notAfter` reader reviewed by the security reviewer; both
   deployments documented
+- Amended by: 0048 (rule 1: the one published image also compiles in `replication`; server TLS stays
+  off at run time unless its certificate settings are given, owner decision on Q-70 of 2026-11-21;
+  rule 36: the 15 MB target of `small` applies with the default settings, TLS and replication off)
 - Date: 2026-11-19
 - Questions: Q-30 (single-binary deployment with built-in TLS). Opens Q-34 (built-in ACME client) and
   Q-35 (TLS for a desktop super-peer without a public name)

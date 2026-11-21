@@ -296,6 +296,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
   `200`.
 - A relay MAY evict blocks, by age (`block_ttl_ms`) or by demand (`demand_eviction`), both published by
   `/info`. A `404` does not mean that the block does not exist. (ADR 0013, ADR 0046)
+- A relay that copies blocks from another relay sends `Sbtp-Replication: 1` on its requests. A relay
+  that evicts by demand MUST NOT count such a `GET` or `HEAD` as demand and MUST answer it with
+  `Cache-Control: no-store` and `CDN-Cache-Control: no-store`; another relay SHOULD answer it with
+  the same headers. (ADR 0048)
 - The recipient MUST check that the received block carries the requested `block_id` and validate it
   (§3.4). The `min_pow_difficulty` of `/info` applies to `PUT` only (§3.3).
 
@@ -327,6 +331,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
+- A relay MAY publish `relays`, a relay list (at most 16 relay URLs, each under the rules of a relay
+  hint) chosen by its operator. It is a hint. A client reads an absent member as an empty list and
+  does not send the user's own traffic to a listed relay unless the user chose it. (ADR 0048)
 - A client MUST accept the absence of any member other than `min_pow_difficulty` and `max_future_ms`.
   (ADR 0007, ADR 0012)
 - A relay MAY add members; the body is at most 16,384 bytes. A client MUST ignore members it does not
@@ -469,7 +476,19 @@ poll `/query` with a cursor. `[Q-23]`
   memory and in local storage. At a bound it stops and keeps what it has validated; this is not an
   error. A page with `more = true` may be short or empty.
 - When it drops blocks to stay within its storage budget, a client MUST NOT drop the user's private
-  keys, nor a block the user created that no relay has acknowledged with `200` or `201`.
+  keys, nor a protected block the user created. Such a block is protected while no relay of the
+  client's relay list has acknowledged it with `200` or `201`, or while one has and another relay of
+  the list is still pending for it. It drops blocks fetched from relays first, then own blocks that
+  are not protected. Only to store a new own block, it MAY drop a block of the second kind, oldest
+  first acknowledgement first. (ADR 0029, ADR 0047)
+- A relay stops being pending for a block when it acknowledges it; when it refuses it with an answer
+  that does not change on a repeat (`400` other than `TimestampTooFarInFuture`, `413`, `422`, a
+  `3xx`, another `4xx` other than `408` and `429`); when the client has made a bounded number of
+  attempts to it over at least a bounded time; when a bounded time has passed since the block's first
+  acknowledgement; or when the user removes it from the list. A request not sent because of a
+  back-off is not an attempt. The bounds are client settings. (ADR 0047)
+- A relay added to the list is pending for every block protected at that moment. Acknowledgements
+  by a relay removed from the list no longer count. (ADR 0047)
 - An `/info` response whose `min_pow_difficulty` is not an integer from 0 to 256, or whose
   `max_future_ms` is not a non-negative u64, is a failed request. A sender that mines at the
   difficulty a relay publishes has a maximum it accepts that way; above it, it does not mine for that
@@ -494,7 +513,9 @@ follows from §3.3, §3.4 and the subsections above.
 - A sender that mines once for several relays mines at `D_NET` or at the highest
   `min_pow_difficulty` among them, whichever is higher, each read within its maximum (see "Client
   bounds"); it does not mine for a relay above that maximum. (ADR 0045)
-  `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later.
+- `PUT` is idempotent: a block refused or not reached on one relay MAY be sent again to it later. The
+  client keeps it until each relay of its list has acknowledged it or is no longer pending for it (see
+  "Client bounds").
 - The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
   stays a function of the client's settings. `Retry-After` and the back-off apply to the relay that
   sent them.
@@ -508,6 +529,11 @@ Node A                                  Node B
   | --- 3. Targeted GETs (batched) ---->|
   |<-- 4. Raw binary blocks ------------|  validation then insertion into the local DAG
 ```
+
+The first stage is pull replication between relays (`architecture.md` §2, "Replication"): a relay is
+a client of the peers its operator chooses and walks their `/query` with a cursor. Set reconciliation
+replaces the walk later and keeps the same peer model `[Q-11]`. Client nodes exchange relay lists
+first; peer-to-peer serving over WebRTC is opt-in and specified later `[Q-26]`. (ADR 0048)
 
 1. **Digest exchange** over a time window, either: a Bloom filter with a controlled false-positive
    rate, or *range-based set reconciliation* over a time-based Merkle tree. `[Q-11]`

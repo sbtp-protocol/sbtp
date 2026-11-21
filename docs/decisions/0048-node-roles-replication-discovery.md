@@ -1,18 +1,26 @@
 # 0048: Node roles, pull replication in the relay, relay lists, and a size budget
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21), with the owner choices recorded in
+  "Decisions of the project owner": a copy is not a read (rule 18); a new peer starts at `now`, `all`
+  for archive relays (rule 9); the signed bootstrap list in a later ADR (rule 23); one published image
+  with every network feature compiled in and off by default at run time, no code downloaded at run
+  time (rule 3); server TLS of ADR 0028 off by default at run time (Q-70)
 - Date: 2026-11-21
 - Questions: Q-11 (first stage only: the peer model; set reconciliation stays open), Q-26 (peer bounds
   staged, not decided), Q-68 (format and constraints fixed here; signer and freshness split out)
 - Amends: ADR 0018 rule 35 (one term in the memory bound); ADR 0019 rules 37 and 38 (profile rows and
-  policy settings); ADR 0021 rule 41 (counters). If ADR 0046 is accepted, its rule 10 gains rules 17
-  and 18 below. Nothing else in these ADRs changes
+  policy settings) and rule 39 (memory target of `small` with replication on); ADR 0021 rule 41
+  (counters); ADR 0028 rule 1 (the published artefact also compiles in `replication`; server TLS
+  stays off at run time unless its certificate settings are given) and rule 36 (memory target);
+  ADR 0046 rules 10 and 15 (a request carrying `Sbtp-Replication: 1` is not demand and is answered
+  `no-store`; rules 17 and 18 below). Nothing else in these ADRs changes
 - Depends on: ADR 0024 (cursors and epochs), ADR 0028 (rustls, ring, OS roots), ADR 0029 (client
   bounds), ADR 0030 (no redirects), ADR 0040 rules 4 and 17 (hints, `/.well-known/sbtp`), ADR 0043,
   ADR 0045 (network difficulty), ADR 0046 (keeping, demand eviction)
 - Impact: `architecture.md` §2 and §3; core spec §4 (`/info`, `GET /block`) and §5; `sbtp-relay`
-  (feature `replication`, settings, index table, metrics); CI (size and memory budget job); web
-  client and `cli-demo` (read relay lists); no wire format change, no test vector
+  (default feature `replication`, settings, index table, metrics); `deploy/Dockerfile` (one image,
+  every feature compiled in); CI (size and memory budget job); web client and `cli-demo` (read relay
+  lists); no wire format change, no test vector
 
 ## Context
 
@@ -23,7 +31,7 @@ an island, and a block is on a relay only if a client sent it there. Relays now 
 The owner's direction of 2026-11-21: SBTP is a network of nodes. Relays copy blocks from each other,
 inside the relay program, off by default. Clients are nodes too, with a small budget. The relay stays
 small: today the image is about 2 MB compressed, the binary is static, the computed memory bound of
-`small` is 13.7 MB, and the WASM module is 79 KB gzip.
+`small` is 14,747,092 bytes with ADR 0046 as built, and the WASM module is 79 KB gzip.
 
 ## Decision
 
@@ -36,34 +44,64 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
    |---|---|---|---|
    | **Archive relay** | Every block it accepts; never deletes; `507` when full. | The full relay interface. | `/info` with `"block_ttl_ms": null` and `"demand_eviction": false`; MAY publish `relays` (rule 21). |
    | **Keeping relay** (the default) | Every block until the store reaches the high-water mark, then drops the least recently demanded (ADR 0046). A relay that evicts by age is a variant. | The full relay interface. | `/info` with `"demand_eviction": true`; MAY publish `relays`. |
-   | **Client node** (browser tab, CLI, app) | What the user and application choose, within its client bounds (ADR 0029). Never the user's keys or unacknowledged own blocks. | Nothing in stage 1. Stage 2: cached blocks and chunks to peers over WebRTC, opt-in (rule 27). | Nothing on the network in stage 1. It keeps a local relay list (rule 20). |
+   | **Client node** (browser tab, CLI, app) | What the user and application choose, within its client bounds (ADR 0029). Never the user's keys or protected own blocks (ADR 0047). | Nothing in stage 1. Stage 2: cached blocks and chunks to peers over WebRTC, opt-in (rule 27). | Nothing on the network in stage 1. It keeps a local relay list (rule 20). |
 
+   On a relay the role is configuration: it follows from `block_ttl_ms`, `demand_eviction`, `peers`
+   and `replication_start` (rule 15), with one program and one image (rule 3). This ADR adds no
+   `role` setting. A later ADR MAY add one, including a value `auto` that derives settings from the
+   disk and memory available; such a value MUST NOT download or load code (rule 3, item 5).
 2. **Replication is orthogonal.** Either relay role MAY replicate (rules 4 to 19). A relay that
    replicates MUST NOT set `min_pow_difficulty` above `D_NET` (ADR 0045 rule 3).
 
 ### Lightness
 
 3. **Budget and features.**
-   1. Every function this ADR adds is off by default at run time **and** compiled only with a Cargo
-      feature that is not a default feature (`replication` for rules 4 to 19). The default build of
-      `sbtp-relay` and its image do not change. A setting that needs a feature absent from the build
-      stops the start-up with `config_error` (it is never ignored).
-   2. CI checks a budget on every pull request, for the default build and for the build with every
-      network feature on. A pull request that exceeds a limit fails.
+   1. **One published image.** The published `sbtp-relay` image and binary are built with every
+      network feature compiled in: `replication` (rules 4 to 19) and `tls` (ADR 0028). Both are
+      default Cargo features. Every function of this ADR is **off by default at run time** and is
+      enabled by configuration only: replication by a non-empty `peers`, `/info` `relays` by a
+      non-empty `announce_relays`. Server TLS stays off unless its certificate settings are given
+      (`tls_mode = "files"`, `tls_cert_file`, `tls_key_file`; ADR 0028 rules 2, 6 and 57, unchanged).
+      With the default settings the published relay behaves as a relay without this ADR, except for
+      the answer of rule 18. The Cargo features remain for an operator who builds a smaller binary
+      (`--no-default-features`, then the features wanted); such a build is not published, and CI
+      builds and tests it (ADR 0028 rule 1). A setting that needs a feature absent from the build stops
+      the start-up with `config_error` (it is never ignored).
+   2. **Budget.** CI checks a budget on every pull request, on the one published image. A pull request
+      that exceeds a limit fails.
 
       | Measure | Limit | How CI measures it |
       |---|---|---|
-      | Relay image, compressed | < 5,000,000 bytes | Build with `deploy/Dockerfile` (`docker buildx build --output type=oci,dest=…`, gzip layers); sum of the layer `size` fields of the image manifest, base layers included. This is what a registry stores and a host pulls. |
+      | Relay image, compressed, every feature compiled in | < 5,000,000 bytes | Build with `deploy/Dockerfile` (`docker buildx build --output type=oci,dest=…`, gzip layers); sum of the layer `size` fields of the image manifest, base layers included. This is what a registry stores and a host pulls. |
       | Relay binary | < 8,000,000 bytes | `stat` of `/out/sbtp-relay` from the `export` stage of the same build (release profile, static, stripped). |
-      | Relay memory, `small` | < 15,000,000 bytes | (a) A test asserts `memory_bound_bytes()` of the `small` profile, every feature on, with the terms of rule 16. (b) A Linux job starts the relay with `small`, every feature on, one peer (a second relay in the job), runs a fixed load of `PUT`, `GET` and `/query` for 60 seconds while replication runs, and reads `VmHWM` from `/proc/<pid>/status`. |
+      | Relay memory, `small`, default settings | < 15,000,000 bytes | (a) A test asserts `memory_bound_bytes()` of the `small` profile with the default settings (`peers` empty, TLS off). (b) A Linux job starts the relay with `small` and the default settings, runs a fixed load of `PUT`, `GET` and `/query` for 60 seconds, and reads `VmHWM` from `/proc/<pid>/status`. |
+      | Relay memory, `small`, replication on | < 16,000,000 bytes | (a) The same test with `peers` not empty and TLS off; the bound counts `replication_max_peers` peers (rule 16). (b) The same job with one peer (a second relay in the job), the load running while replication runs. |
+      | Relay memory, `small`, server TLS on | reported, no limit | The test of (a) only, with `tls_mode = "files"`. ADR 0028 rule 36: with TLS on, `small` has no fixed target and the relay logs its computed bound. |
       | WASM module | < 100,000 bytes gzip | The `sbtp-wasm` release pipeline of `crates/sbtp-wasm/README.md` (wasm-bindgen, then `wasm-opt`), then `gzip -9 -c sbtp_wasm_bg.wasm | wc -c`. |
 
-      The job writes the four figures and their change against `main` to the job summary. The ADR 0013
-      benchmark (one million blocks) stays the release gate; the 60-second run is the per-PR check.
+      The job writes the figures and their change against `main` to the job summary.
+
+      **Memory with replication on.** The terms of rule 16 are 723,077 bytes on `small`. With the
+      ADR 0046 bound as built (14,747,092 bytes) the total is 15,470,169 bytes, above 15,000,000. The
+      `small` rows cannot shrink enough: `replication_max_in_flight` is already 1, and the root store
+      term does not depend on a setting. Therefore the 15 MB target of ADR 0019 rule 39 applies to
+      `small` with the default settings (replication and server TLS off), and `small` with replication
+      on and TLS off has its own bound of 16,000,000 bytes, 529,831 bytes above the computed total.
+      That margin covers the estimates of rule 16 only; the measure of Q-70 replaces them. The
+      packaged unit keeps `MemoryMax=128M` for `small` (ADR 0019 rule 37).
+
+      The ADR 0013 benchmark (one million blocks) stays the release gate; the 60-second runs are the
+      per-PR check. The ADR 0013 binary limit (5,000,000 bytes on the binary that ships, ADR 0017) is
+      stricter than the per-PR limit above, and the binary that ships now has every feature compiled
+      in; whether the 5,000,000-byte gate still holds is part of Q-70.
    3. Every function has bounds per profile (`small`, `standard`, `large`, ADR 0019 rule 37) and its
       memory is a term of the bound of ADR 0018 rule 35.
    4. The relay never embeds a TURN server or any media relay. Help with WebRTC signalling is a later
       stage (rule 26), behind its own feature.
+   5. **No code loaded at run time.** The relay never downloads, loads or runs code at run time: no
+      plugin, no dynamic library, no script from a peer, a relay list or a URL. A function that is not
+      compiled in is absent. Every function the published image can run went through the reviewed and
+      pinned build (`Cargo.lock`, `cargo deny`).
 
 ### Pull replication
 
@@ -90,7 +128,7 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
    table is empty and rule 9 applies. Rows of peers no longer configured are removed at start-up.
 9. **Start and peer epochs.** A peer without a cursor is walked from `replication_start`: `now` (the
    default: `since` = the time the peer was first seen, minus `replication_resync_margin_ms`) or `all`
-   (no `since`, the full history; for an archive relay). On `400` `InvalidCursor` (a new index epoch of
+   (no `since`, the full history; the setting for an archive relay). On `400` `InvalidCursor` (a new index epoch of
    the peer, ADR 0024), the relay drops the cursor and walks again from `since` = the local time of its
    last complete page of that peer, minus `replication_resync_margin_ms`. The margin covers clock
    differences between relays; re-listed blocks cost one index read each (rule 6).
@@ -151,10 +189,11 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
     + replication_max_peers × 1,024                                       (peer state)
     ```
 
-    `small`: 318,981 + 400,000 + 4,096 = 723,077 bytes. On top of the ADR 0046 worst case
-    (13,805,012 bytes) it gives 14,528,089 bytes, under 15,000,000. The bound holds with replication on;
-    the ADR 0028 caveat ("`small` with TLS off") applies to the server side only. The terms count only
-    when the feature is compiled and `peers` is not empty.
+    `small`: 318,981 + 400,000 + 4,096 = 723,077 bytes. On top of the ADR 0046 bound as built
+    (14,747,092 bytes, ADR 0046 clarification D7) it gives 15,470,169 bytes: above the 15 MB target of
+    the default settings, under the 16,000,000-byte bound of `small` with replication on (rule 3,
+    item 2). The terms count only when the feature is compiled and `peers` is not empty. With server
+    TLS on as well, ADR 0028 rule 36 applies: no fixed target, the relay logs its computed bound.
 
 ### What a replicated block counts as
 
@@ -163,13 +202,16 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
     epoch, and its held parents refreshed (ADR 0046 rule 10). It is protected for `3 × E` like any new
     block, then ages by local demand. A keeping relay is therefore a recent window of what its peers
     hold, plus what its own clients read.
-18. **On the source.** A replica sends `Sbtp-Replication: 1` on each `GET /block` and `/query`. A relay
-    that evicts by demand MUST NOT count a `GET` carrying it as demand, and MUST answer it with
-    `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, so that no shared cache keeps an entry
-    filled by a request the origin did not count (ADR 0046 rule 7 would no longer hold). A relay
-    without demand eviction ignores the header. The header can only make a request count less; a
-    client that sends it falsely only stops its own reads from keeping blocks warm. A response served
-    to a replica from a shared cache is fine: it neither reaches nor misleads the origin.
+18. **On the source: a copy is not a read.** A replica sends `Sbtp-Replication: 1` on each
+    `GET /block` and `/query`. A relay that evicts by demand MUST NOT count a `GET` or `HEAD` of
+    `/block` carrying it as demand (ADR 0046 rule 10), and MUST answer it with
+    `Cache-Control: no-store` and `CDN-Cache-Control: no-store` in place of the headers of ADR 0046
+    rule 15, so that no shared cache keeps an entry filled by a request the origin did not count
+    (ADR 0046 rule 7 would no longer hold). A relay without demand eviction has no demand to skip and
+    SHOULD answer it with the same `no-store` headers; `sbtp-relay` does so in every mode. The header
+    can only make a request count less; a client that sends it falsely only stops its own reads from
+    keeping blocks warm. A response served to a replica from a shared cache is fine: it neither
+    reaches nor misleads the origin.
 19. **Outbound TLS.** The client side uses the crates of ADR 0028: `rustls` (provider `ring`, TLS 1.3
     only, as on the server side, no `dangerous` API, hostname checked), `tokio-rustls`, `rustls-native-certs`
     for the operating system store, and hyper's low-level HTTP/1.1 client (`hyper` feature `client`,
@@ -233,10 +275,12 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
   work, within `replication_blocks_per_min`, `replication_bytes_per_hour`, its round-robin share and
   the high-water pause. The worst it does is fill the replica's window with valid blocks that age out
   by demand. The operator removes the peer; metrics per peer show it.
-- **Size.** The default image and binary are unchanged. The `replication` build adds `rustls`, `ring`,
-  `tokio-rustls`, `rustls-native-certs` and hyper's client code, of the order of 1 MB to the binary
-  (estimate). The server TLS of ADR 0028 adds most of the same crates; the two share them. The CI job
-  of rule 3 gives the real figure.
+- **Size.** One published image. `replication` adds `rustls-native-certs` and hyper's client code to
+  what `tls` (ADR 0028) compiles in (`rustls`, `ring`, `tokio-rustls`); both together are of the order
+  of 1 MB of binary (estimate). None of it runs while the settings leave it off. The CI job of rule 3
+  gives the real figure.
+- **Memory.** `small` keeps its 15 MB target with the default settings. An operator who turns
+  replication on in `small` accepts a bound of 16 MB (rule 3, item 2).
 - **Privacy.** A replica's address is seen by its peers, like any client's. Replication copies public
   and sealed blocks alike; it does not change what a relay already sees. `/info` `relays` reveals only
   the operator's choices.
@@ -249,10 +293,10 @@ small: today the image is about 2 MB compressed, the binary is static, the compu
 
 | Stage | Work | Owner | Effort (rough) | Security review |
 |---|---|---|---|---|
-| 0 | CI budget job of rule 3 (image, binary, memory bound test, 60 s `VmHWM` run, WASM gzip); two image variants built, default and `replication` | relay-engineer | 1 day | No |
-| 1 | Feature `replication`: settings and checks (rules 5, 14, 15), outbound client (rule 19), walker with held check, PoW pre-check and skips (rules 6, 7), cursor table (rules 8, 9), bounds and back-off (rules 10 to 13), memory terms (rule 16), metrics and events; tests with two in-process relays: loop, restart mid-page, peer `InvalidCursor`, `429` with `Retry-After`, `3xx`, oversize body, invalid blocks, high-water pause, private address refused | relay-engineer | 4 to 6 days | **Yes**, before merge |
+| 0 | CI budget job of rule 3 (image, binary, memory bound tests with the defaults, with replication on and with TLS on, 60 s `VmHWM` runs with the defaults and with one peer, WASM gzip); one image, built with every feature compiled in | relay-engineer | 1 day | No |
+| 1 | Feature `replication` (a default feature): settings and checks (rules 5, 14, 15), outbound client (rule 19), walker with held check, PoW pre-check and skips (rules 6, 7), cursor table (rules 8, 9), bounds and back-off (rules 10 to 13), memory terms (rule 16), metrics and events; tests with two in-process relays: loop, restart mid-page, peer `InvalidCursor`, `429` with `Retry-After`, `3xx`, oversize body, invalid blocks, high-water pause, private address refused | relay-engineer | 4 to 6 days | **Yes**, before merge |
 | 2 | `/info` `relays` and `announce_relays` (rule 21); web client and `cli-demo` read `/info` `relays` and `/.well-known/sbtp` into their relay list (rules 20, 22) | relay-engineer, wasm-engineer | 1 day | No |
-| 3 | `Sbtp-Replication` on the source (rule 18), with ADR 0046 | relay-engineer | 0.5 day | With ADR 0046 |
+| 3 | `Sbtp-Replication` on the source (rule 18): not demand, `no-store` in every mode | relay-engineer | 0.5 day | With ADR 0046 |
 | Later | Bootstrap list ADR (Q-68); RBSR (Q-11); WebSocket (Q-23); WebRTC peers (Q-26, Q-21) | spec-architect first | | Each |
 
 **Security-auditor review of stage 1:** the new dependencies and their features (no `aws-lc-rs`, no
@@ -269,10 +313,30 @@ bounded and the URL is not repeated): `replication_blocks_stored_total`, `replic
 `replication_cursor_resets_total`. Events: `replication_peer_backoff`, `replication_paused`,
 `replication_cursor_reset` (rate-capped, ADR 0021).
 
+## Decisions of the project owner (2026-11-21)
+
+1. **A copy is not a read.** Replication downloads carry `Sbtp-Replication: 1`, are answered
+   `no-store` and do not count as demand (rule 18).
+2. **Start point.** A new peer starts at `now` by default; `all` is the setting for archive relays
+   (rule 9).
+3. **Signed bootstrap list.** Split into a later ADR (rule 23); Q-68 stays open.
+4. **One published image.** Two images and plugins downloaded at run time are rejected. The one image
+   compiles in every network feature; everything is off by default at run time and enabled by
+   configuration. Cargo features remain for minimal builds. The node role is configuration (rules 1
+   and 3).
+5. **Memory with replication on.** `small` with replication on gets its own bound, 16,000,000 bytes;
+   the `small` replication rows do not shrink (rule 3, item 2).
+6. **Q-70, server TLS.** ADR 0028 is amended: `tls` is compiled into the published image and server
+   TLS is inactive unless its certificate settings are given (rule 3, item 1). This was already the
+   run-time default of ADR 0028 rules 2 and 4 (`tls_mode = "off"`); the feature stays a default
+   feature.
+
 ## Spec change on acceptance
 
-`architecture.md`, new §2 part after "Admission control" (it absorbs the "Replication" part proposed by
-ADR 0045):
+Applied on acceptance (2026-11-21). The "Replication" part of `architecture.md` §2 written for
+ADR 0045 is replaced in place by the text below.
+
+`architecture.md`, §2 "Replication":
 
 > ### Replication
 > - A relay MAY copy blocks from peers that its operator lists in `peers` (relay URLs, `https` only).
@@ -280,19 +344,37 @@ ADR 0045):
 >   its `min_pow_difficulty`, fetches the others with `GET`, validates each as a `PUT` body (F1 to F9,
 >   P1, C1, C2, C3) and R1, and stores it as an accepted block. It never re-mines, re-signs or alters a
 >   block, never follows a redirect and never adds a peer from what it receives. (ADRs 0045, 0048)
-> - Replication runs within its own bounds per profile, obeys the peer's `Retry-After`, and stores
->   nothing while the store is above the high-water mark. A replicating relay does not set
->   `min_pow_difficulty` above `D_NET`. (ADR 0048)
-> - A mirror outside the relay MAY copy blocks by `PUT` instead; ADR 0045 rule 6 applies to it.
+> - Replication is off by default (`peers` empty). It runs within its own bounds per profile, obeys
+>   the peer's `Retry-After`, and stores nothing while the store is above the high-water mark. A
+>   replicating relay does not set `min_pow_difficulty` above `D_NET`. (ADR 0048)
+> - A copy is not a read: replication requests carry `Sbtp-Replication: 1`, and a source that evicts
+>   by demand does not count them as demand (core spec §4, `GET /sbtp/v1/block/{block_id}`).
+>   (ADR 0048)
+> - A mirror outside the relay MAY copy blocks by a `PUT` of the same bytes instead. It never
+>   re-mines, re-signs or alters a block. A block below the target's `min_pow_difficulty` is skipped
+>   for that target and counted; it is not an error of the source. (ADR 0045)
+> - When `D_NET` is raised, clients mine at the new value from its announcement and relays raise their
+>   floor at its effective date. Blocks mined earlier stay where they are held. (ADR 0045)
+
+`architecture.md` §2, "Admission control", the bullet on `profile`, last sentence replaced by: "The
+15 MB worst-case memory target applies to `small` with the default settings (server TLS and
+replication off); with replication on and TLS off, the bound of `small` is 16 MB. (ADR 0019, ADR 0028,
+ADR 0048)"
 
 `architecture.md` §3, tier 1 row, role column: "Universal access. Discovery through relay lists; P2P
 serving while the tab is open is a later, opt-in stage (ADR 0048)."
 
+`architecture.md` §3, tier 2 row: runtime column "Self-hosted micro-relays (one Rust image under 5 MB
+compressed, < 15 MB RAM with the default profile `small` and the default settings)"; role column
+starts with "Backbone. Built-in TLS and replication are compiled in and off until configured
+(ADR 0028, ADR 0048)."
+
 Core spec §4, `GET /sbtp/v1/block/{block_id}`, new bullet:
 
 > - A relay that copies blocks from another relay sends `Sbtp-Replication: 1` on its requests. A relay
->   that evicts by demand does not count such a `GET` as demand and answers it with
->   `Cache-Control: no-store` and `CDN-Cache-Control: no-store`. (ADR 0048)
+>   that evicts by demand MUST NOT count such a `GET` or `HEAD` as demand and MUST answer it with
+>   `Cache-Control: no-store` and `CDN-Cache-Control: no-store`; another relay SHOULD answer it with
+>   the same headers. (ADR 0048)
 
 Core spec §4, `GET /sbtp/v1/info`, new bullet:
 
@@ -316,8 +398,12 @@ Core spec §5, after the diagram, new paragraph:
   queue per peer that a slow peer makes grow; with pull, the slow side paces itself.
 - **Automatic peering from announced lists.** Lets any relay steer others' outbound traffic and fill
   their stores; it needs a trust and reputation model this stage does not have.
-- **Compile replication into the default build.** Adds TLS client code to every relay, including those
-  that never replicate, against the owner's size requirement.
+- **Two published images** (a default image and a `replication` image; the proposed text). Rejected by
+  the owner: two artefacts to build, test and document, and an operator who must choose an image
+  before knowing which function it needs. One image with every function off at run time keeps the
+  default behaviour and the size budget of rule 3.
+- **Plugins downloaded at run time.** Rejected by the owner: code fetched by a running relay bypasses
+  the reviewed and pinned build, a supply-chain path (rule 3, item 5).
 - **`webpki-roots`.** Licence outside the allow list and roots fixed at build time; the OS store is in
   the image and `peer_ca_file` covers the rest.
 - **Count replica fetches as demand on the source.** A new replica's first walk would mark every block
