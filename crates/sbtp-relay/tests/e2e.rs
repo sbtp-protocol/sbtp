@@ -413,6 +413,27 @@ fn sighup_reloads_the_deny_list() {
     assert!(!log.contains(MARKER));
 }
 
+/// Deny review I-1: on a relay without `deny_file`, `SIGHUP` (`systemctl reload`) is ignored:
+/// the relay keeps serving, stops cleanly afterwards, and logs one throttled `config_warning`
+/// for several signals.
+#[test]
+fn sighup_without_a_deny_file_is_ignored() {
+    let relay = RelayProcess::start(&tmp_dir("e2e-hup"));
+    let pid = relay.child.as_ref().unwrap().id().to_string();
+    for _ in 0..3 {
+        let sent = Command::new("kill").args(["-HUP", &pid]).status().unwrap();
+        assert!(sent.success());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut c = relay.connect();
+    let (bytes, _) = mined(43, MARKER.as_bytes(), &[], DIFFICULTY);
+    assert_eq!(put_block(&mut c, &bytes).status, 201, "still serving");
+    drop(c);
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{status}\n{log}");
+    assert_eq!(log.matches("code=sighup_ignored").count(), 1, "{log}");
+}
+
 /// Security review 2026-11-21 (archive copy), L-1: a value pasted into a `*_ref` setting
 /// instead of a variable name, which passes the name check, stops the start-up before any
 /// `setting` line: it appears in no line of the log.

@@ -119,6 +119,8 @@ where
         format: config::early_log_format(&args, &env),
         ..LogConfig::default()
     });
+    // Deny review I-1: from here on, `SIGHUP` never stops the relay, whatever its settings.
+    guard_hangup()?;
     // ADR 0019 rule 26. The version goes to the log only, never to the network (rule 25).
     log::emit(
         Event::Start,
@@ -494,10 +496,11 @@ where
         // ADR 0050: the archive copy, likewise.
         let mut mirrorer = spawn_mirror(mirror, &relay, &stopped);
         // ADR 0052 rule 4: the reload task and the marking pass, likewise; `SIGHUP` asks for a
-        // reload. Without `deny_file`, `SIGHUP` keeps its default action.
+        // reload. Without `deny_file`, `SIGHUP` is logged (throttled) and ignored (deny review
+        // I-1).
         let batch = usize::try_from(settings.sweep_batch).unwrap_or(index::MAX_QUERY_LIMIT);
+        spawn_hangup(&relay)?;
         let mut denier = if relay.deny().enabled() {
-            spawn_hangup(&relay)?;
             Some(tokio::spawn(deny::run(
                 Arc::clone(&relay),
                 batch,
@@ -559,17 +562,61 @@ where
     })
 }
 
+/// Deny review I-1: installs the process-wide `SIGHUP` handler at the start of start-up, before
+/// the settings are read and the store is reconciled, so that a `SIGHUP` (`systemctl reload`)
+/// never takes its default action, which terminates the process. tokio installs its handler the
+/// first time a signal kind is listened for and keeps it for the life of the process, replacing
+/// the default action (`tokio::signal::unix::signal`, "Caveats"); until [`spawn_hangup`] listens
+/// again, a `SIGHUP` is swallowed. The short-lived runtime only provides the signal driver for
+/// that registration.
+#[cfg(unix)]
+fn guard_hangup() -> Result<(), StartError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let failed = |e| StartError::Io("installing signal handlers", e);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(failed)?;
+    let _in = rt.enter();
+    drop(signal(SignalKind::hangup()).map_err(failed)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // The signature of the unix build.
+fn guard_hangup() -> Result<(), StartError> {
+    Ok(())
+}
+
 /// ADR 0052 rule 4: forwards each `SIGHUP` to the deny list as a reload request, for the life
-/// of the process.
+/// of the process. Without `deny_file` the signal is ignored, with one `config_warning` line per
+/// minute at most (deny review I-1).
 #[cfg(unix)]
 fn spawn_hangup(relay: &Arc<Relay<RedbIndex>>) -> Result<(), StartError> {
     use tokio::signal::unix::{SignalKind, signal};
+    static IGNORED_LOG: log::Throttle = log::Throttle::new();
     let mut hangup = signal(SignalKind::hangup())
         .map_err(|e| StartError::Io("installing signal handlers", e))?;
     let deny = Arc::clone(relay.deny_arc());
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
-            deny.request_reload();
+            if deny.enabled() {
+                deny.request_reload();
+            } else {
+                log::throttled(
+                    &IGNORED_LOG,
+                    Event::ConfigWarning,
+                    &[
+                        ("code", Value::Str("sighup_ignored")),
+                        ("setting", Value::Str("deny_file")),
+                        (
+                            "msg",
+                            Value::Str("SIGHUP ignored: no deny_file is set, nothing to reload"),
+                        ),
+                    ],
+                    None,
+                );
+            }
         }
     });
     Ok(())

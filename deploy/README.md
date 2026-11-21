@@ -375,6 +375,8 @@ deny_file = "/etc/sbtp-relay/deny.txt"
   `ExecReload=/bin/kill -HUP $MAINPID`, or `docker kill --signal HUP`), or wait up to
   `deny_reload_ms`. Write the new list to a temporary file and `mv` it into place, so that the
   relay never reads half a file. A loaded list applies to every request that starts after it.
+  `SIGHUP` never stops the relay: one without `deny_file`, or one still starting, ignores it
+  (the former logs `config_warning code=sighup_ignored`, at most once a minute).
 - **An invalid or missing file never empties the list.** At start-up the relay refuses to start
   (`fatal`, the line number and a fixed reason). On reload it keeps the previous list whole and
   logs `deny_list_invalid line=… reason=…`; fix the file and reload again. Alert on any
