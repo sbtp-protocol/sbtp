@@ -1,0 +1,26 @@
+[package]
+name = "sbtp-seal"
+description = "SBTP layer 2 sealed envelope: HPKE seal and open, length buckets, padding, inner signature, key directory tag. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# No RNG of its own: the caller passes a `CryptoRng` (the OS source, `l2-grammar.md` §5.1).
+# HPKE is `hpke` with the suite fixed by type parameters, single-shot base mode only
+# (docs/security/2026-11-20-hpke-dependency.md, condition 5).
+[dependencies]
+sbtp-core.workspace = true
+sbtp-l2.workspace = true
+blake3.workspace = true
+hpke.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Builds and verifies real outer blocks in the tests (`BlockBuilder::build` needs `std`).
+sbtp-core = { workspace = true, features = ["std"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
