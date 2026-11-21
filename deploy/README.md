@@ -347,11 +347,59 @@ same network); the rule is that of `replication_allow_private`.
 **Logs and metrics.** Counters (served with `/metrics` once it exists, as those of replication;
 the `stats` line does not carry them yet) `mirror_uploaded_total`, `mirror_existing_total`,
 `mirror_failed_total{status}` (`3xx`, `4xx`, `5xx`, `network`), `mirror_missed_total` (evicted
-before its turn), `mirror_damaged_total`, `mirror_poisoned_total`; gauges `mirror_lag_blocks`
+before its turn), `mirror_damaged_total`, `mirror_poisoned_total`, `mirror_denied_total` (on the
+operator deny list, not uploaded); gauges `mirror_lag_blocks`
 (counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed` (status class and delay
 only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on `mirror_lag_ms` above
 `demand_epoch_ms` and on any `mirror_poisoned_total`. **Egress**: allow TCP 443 to the endpoint
 (and to `mirror_public_url`), and DNS.
+
+## Operator deny list
+
+A relay can stop serving and storing given blocks, or every block of a given public key, without
+breaking clients (ADR 0052; core spec §4, "Denied blocks"). Off by default.
+
+```toml
+# A UTF-8 text file, one entry per line: `block <block_id>` or `key <public key>`, 64 lowercase
+# hexadecimal characters, then optionally ` hide` (the default) or ` purge`. Empty lines and
+# lines starting with `#` are ignored. Single spaces, `\n` line ends, at most 256 bytes a line.
+deny_file = "/etc/sbtp-relay/deny.txt"
+# deny_max_entries = 2048     # 65,536 on standard, 1,048,576 on large
+# deny_reload_ms = 10000      # how often the file's modification time and size are checked
+```
+
+- **The file holds identifiers of denied content.** Mode `0600`, owned by the relay's service
+  account (in the image, the non-root user), outside the data directory. The relay logs its path
+  (`setting`) and its counts (`deny_list_loaded blocks=… keys=… purge=…`), never an entry.
+- **Reload.** Edit the file, then send `SIGHUP` to the relay (`systemctl reload` with
+  `ExecReload=/bin/kill -HUP $MAINPID`, or `docker kill --signal HUP`), or wait up to
+  `deny_reload_ms`. Write the new list to a temporary file and `mv` it into place, so that the
+  relay never reads half a file. A loaded list applies to every request that starts after it.
+- **An invalid or missing file never empties the list.** At start-up the relay refuses to start
+  (`fatal`, the line number and a fixed reason). On reload it keeps the previous list whole and
+  logs `deny_list_invalid line=… reason=…`; fix the file and reload again. Alert on any
+  `deny_list_invalid`.
+- **What clients see.** `451` with error `Denied` on `GET` and `HEAD` (never `304`), `Denied` or
+  `DeniedKey` on `PUT`, a `length = 0` record in a batch; `/query` leaves the block out (by key,
+  once the background marking pass has reached it: `deny_marking_pending` falls to 0). `/info`
+  says `"deny_list": true`, nothing more. Denied requests are counted (`denied_total{route,match}`,
+  and `denied` on the `stats` line), never logged, with no client tag.
+- **`hide` and `purge`.** `hide` keeps the file and serves the block again, at its original
+  position, as soon as the entry is removed. `purge` deletes the block in the marking pass; it is
+  gone for good on this relay, and comes back only by a new `PUT`. Make any copy you must keep
+  (for example by a `GET`) before loading a `purge` entry.
+- **Copies the relay cannot reach.**
+  - A CDN keeps `200` responses up to a year: purge `/sbtp/v1/block/<block_id>` from it after each
+    new block entry. For a key entry, purge each held block of that key. A command that lists
+    them is not part of this version yet: until then, list the blocks with `/query` and keep those
+    whose header carries the key (bytes 19 to 50 of each block).
+  - The archive copy never uploads a denied block, but never deletes from the bucket either.
+    Removing an object already uploaded is an operator task, with credentials the relay does not
+    hold (the relay's own allow `PutObject` only): delete
+    `{prefix}sbtp/v1/block/<block_id>`, then purge it from the bucket's CDN. The bucket then
+    answers `403` or `404`, which readers handle as "not here".
+  - Replicas run by other operators, and clients, keep their copies. A denial does not propagate:
+    a peer's `451` is a skip for replication, never an entry here.
 
 ## Alerts
 
