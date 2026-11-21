@@ -303,6 +303,25 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - The recipient MUST check that the received block carries the requested `block_id` and validate it
   (§3.4). The `min_pow_difficulty` of `/info` applies to `PUT` only (§3.3).
 
+### `POST /sbtp/v1/blocks`
+
+- Batch read. Body: 1 to 256 distinct `block_id` values, 32 raw bytes each, concatenated,
+  `Content-Type: application/octet-stream`. An empty body, a length that is not a multiple of 32 or a
+  duplicate gets `400` (`InvalidParameter`); a body over 8,192 bytes gets `413` (`BodyTooLarge`) before
+  it is read. The request changes nothing and is safe to repeat.
+- Response: `200`, `application/octet-stream`, `Cache-Control: no-store`. One record per requested
+  identifier, in request order: `length` (u32, big-endian) then `length` bytes of the block.
+  `length = 0`: the block is not served. The relay serves only bytes it would serve with `GET /block`
+  and MAY end the body after any complete record (at least one); the client requests the rest again. A
+  relay MUST NOT start a record that brings the body above 1,048,576 bytes.
+- The recipient checks each record as a requested block (§3.4, R1 against the identifier at that
+  position). A `length` above 65,909 makes the response a failed request. A body that ends inside a
+  record is a failed request; the complete records before it MAY be used.
+- Each served block counts as demand once per epoch, except with `Sbtp-Replication: 1`, which also gets
+  `CDN-Cache-Control: no-store`. `If-None-Match` does not apply.
+- `GET /block` is the cacheable form. A client SHOULD use it for the blocks of a view and SHOULD use
+  batches for walks and bulk fetches. A `read_only` URL has no batch route. (ADR 0051)
+
 ### `GET /sbtp/v1/info`
 
 - Response: `200 OK`, `application/json`, a JSON object with at least:
@@ -332,6 +351,11 @@ path prefix. The routes of this section are under it. (ADR 0030)
   for example a bucket of static objects. A client MUST NOT send `PUT` or `/query` to it. For
   `GET /block` on such a URL, any status other than `200` or `304` means that the block is not served
   there. A client MUST read an absent member as `false`. (ADR 0050)
+- `read_api`: integer; `2` when the relay implements `POST /sbtp/v1/blocks` and the `/query`
+  parameters `order`, `fields` and repeated `parent` with the `head` member. A client MUST read an
+  absent member as `1`, and MUST NOT send `POST /blocks`, `order`, `fields`, a repeated `parent` or a
+  per-parent cursor to a relay without `read_api` ≥ 2. The bounds of these routes (256 identifiers,
+  1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051)
 - A relay MAY publish `software` (free string). `sbtp-relay` does not publish it. (ADR 0019)
 - A relay MAY publish `graph_gateway`, the URL of a graph gateway that its operator runs over this
   relay (`graph-access.md` §3, §5). It is a hint, not a guarantee. (ADR 0040)
@@ -344,10 +368,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
   know. A relay MAY change its settings at any time. A sender SHOULD read `/info` before mining.
   (ADR 0007, ADR 0029)
 
-### `GET /sbtp/v1/query?parent={block_id}&since={ms}&limit={n}&cursor={cursor}`
+### `GET /sbtp/v1/query?parent=&since=&limit=&cursor=&order=&fields=`
 
 - Discovery of blocks, and of children in the DAG. All parameters are optional. A parameter that is
-  unknown, repeated or malformed gets `400` (`InvalidParameter`).
+  unknown, repeated (other than `parent`) or malformed gets `400` (`InvalidParameter`).
   - `parent`: only blocks whose Parents Hashes field contains this `block_id`. The relay does not need to
     hold the parent.
   - `since`: decimal u64. Only blocks that the relay stored at or after this Unix time in milliseconds,
@@ -358,8 +382,19 @@ path prefix. The routes of this section are under it. (ADR 0030)
     the same relay. A value outside this syntax is malformed (`InvalidParameter`). A value within it
     that the relay did not issue for its current index epoch gets `400` (`InvalidCursor`), whatever its
     length or alphabet. A relay MUST issue cursors within this syntax. (ADR 0012, clarification K1)
-- Order: the order in which the relay stored the blocks. It is stable on one relay and differs between
-  relays. A client MUST NOT derive application state from it.
+  - `parent` MAY be repeated, 1 to 32 distinct values; then each value is `<block_id>` or
+    `<block_id>.<cursor>`, a per-parent cursor that overrides `cursor`. `limit` applies per parent,
+    lowered to `max(1, ⌊max_query_limit / N⌋)` for `N` parents. A 33rd or a repeated value, or the
+    `.<cursor>` form with a single `parent`, gets `400` (`InvalidParameter`).
+  - `order`: `asc` (default) or `desc` (newest first).
+  - `fields`: `parents`. Adds `parents` (for each block, its Parents Hashes in header order) and `lens`
+    (its length in bytes), aligned with `block_ids`; the page is at most 200 entries. Not allowed with
+    `parent` (`400` `InvalidParameter`). They are hints: a block's own header is authoritative once
+    fetched (§3.4). (ADR 0051)
+- Order: the relay's store order, oldest first with `asc`, newest first with `desc`. It is stable on one
+  relay and differs between relays. A cursor names a gap in that order and is valid in both orders:
+  `asc` returns blocks after it, `desc` before it. `since` and the expiry bound end a `desc` walk. A
+  client MUST NOT derive application state from the order. (ADR 0051)
 - Response: `200 OK`, `application/json`, `Cache-Control: no-store`:
 
   ```json
@@ -368,17 +403,25 @@ path prefix. The routes of this section are under it. (ADR 0030)
 
   - `block_ids`: 0 to `limit` identifiers in order, each at most once.
   - `cursor`: always present. The same request with this cursor returns the matching blocks not returned
-    so far. A cursor is valid with any `parent` and `since`. It survives a clean restart of the relay. After an
+    so far. A cursor is valid with any `parent`, `since`, `order` and `fields`. It survives a clean restart of the relay. After an
     unclean shutdown the relay MAY refuse every earlier cursor with `400` (`InvalidCursor`). A client MUST
     accept `InvalidCursor` on any request; it then walks again without a cursor and deduplicates by
     `block_id`. (ADR 0012, ADR 0024)
   - `more`: `true` if at least one more matching block existed when the response was built.
+  - `head`: always present, a cursor for the gap after the newest position held when the response was
+    built. `asc` from `head` returns exactly the matching blocks stored since. (ADR 0051)
+- With two or more `parent`, the body is `{ "parents": [ {"parent", "block_ids", "cursor", "more"} … ],
+  "head" }`, one entry per requested parent in request order, each with the meaning of a single-parent
+  response. A grouped request is one index read. (ADR 0051)
+- A listing is complete when its `more` is `false`. A client that derives state from the absence of a
+  block MUST use only complete listings, MUST NOT present a listing that ended with `more = true` as
+  complete, and keeps `head` to poll the shown parents. (ADR 0051)
 - A request with no match gets `200` and an empty `block_ids`, an unknown `parent` included. A relay MUST
   NOT answer `404`.
 - To read all children of a block, a client repeats the request with the returned `cursor` until `more`
   is `false`. Repeating it later returns the children stored since. A client MUST deduplicate by
   `block_id` and MUST fetch and validate each block (§3.4); the fetch can return `404`.
-- A relay MUST serve a request with work in `O(log n + limit)`. (ADR 0012, ADR 0013) The response body
+- A relay MUST serve a request with work in `O(log n + limit)`, in both orders. (ADR 0012, ADR 0013) The response body
   is at most 131,072 bytes, members added by the relay included. (ADR 0029)
 - A relay that cannot read its index to build a page answers `500` (`Internal`). This invalidates no
   cursor: only `InvalidCursor` does. The client keeps its cursor and retries later with exponential
@@ -387,7 +430,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
 ### WebSocket
 
 Not specified in this version. A relay MUST NOT expose a WebSocket endpoint under `/sbtp/v1/`. Clients
-poll `/query` with a cursor. `[Q-23]`
+poll `/query` with a cursor. The WebSocket ADR offers a subscription by parent set (ADR 0051 rule 30).
+`[Q-23]`
 
 ### Errors
 
@@ -416,7 +460,7 @@ poll `/query` with a cursor. `[Q-23]`
 - A relay MUST NOT send `Access-Control-Allow-Credentials` and MUST NOT use cookies or HTTP
   authentication on `/sbtp/v1/`.
 - Responses to an allowed origin carry `Access-Control-Expose-Headers: Location, Retry-After`. A preflight
-  from an allowed origin gets a `2xx` with `Access-Control-Allow-Methods: GET, PUT`,
+  from an allowed origin gets a `2xx` with `Access-Control-Allow-Methods: GET, PUT, POST`,
   `Access-Control-Allow-Headers: Content-Type` and `Access-Control-Max-Age: 86400`. (ADR 0012)
 
 ### Redirects
@@ -442,7 +486,9 @@ poll `/query` with a cursor. `[Q-23]`
 - `429 Too Many Requests` (`RateLimited`): this client is over its own allowance, in requests per period
   or in requests in flight. The relay answers before reading the body and SHOULD send `Retry-After` in
   seconds. A relay counts clients by address; an IPv6 /64, or the users of one shared address, are one
-  client. A client SHOULD keep at most 8 requests in flight per relay. A relay MAY also bound the bytes
+  client. A client SHOULD keep at most 8 requests in flight per relay. A `/query` request takes
+  `⌈N/8⌉` tokens of its bucket (`N` parents, 1 when absent) and a batch `⌈N/4⌉` (`N` identifiers),
+  capped at the burst, at admission. (ADR 0051) A relay MAY also bound the bytes
   stored per hour from a network prefix (an IPv6 /56 or /48, an IPv4 /24); a `PUT` over that bound gets
   `429` before its body is read. (ADR 0049)
 - `503 Service Unavailable` (`Unavailable`): the relay is at one of its own limits, starting or
@@ -472,13 +518,13 @@ poll `/query` with a cursor. `[Q-23]`
 - A client treats every relay, proxy and mirror as untrusted. What it spends because of one relay
   (memory, storage, time, mining effort) depends on its own settings, not on what the relay sends.
   The values are client settings; the protocol requires the bounds. (ADR 0029)
-- Body ceilings, after removal of any content coding: `GET /block` 65,909 bytes; `/query` 131,072;
-  `/info` 16,384; any `4xx` or `5xx` 16,384. A relay MUST NOT exceed them. A client MUST accept a
+- Body ceilings, after removal of any content coding: `GET /block` 65,909 bytes; `POST /blocks`
+  1,048,576; `/query` 131,072; `/info` 16,384; any `4xx` or `5xx` 16,384. A relay MUST NOT exceed them. A client MUST accept a
   body at or under its ceiling and MUST stop reading at the ceiling plus one byte. A `2xx` body above
   its ceiling is a failed request; an error body above it is unparseable.
 - Every request has a total time limit that covers the whole body.
 - A `/query` response is a failed request when it is not the object defined under `GET /sbtp/v1/query`, holds more
-  identifiers than the `limit` sent, or holds a malformed identifier or cursor. None of its
+  identifiers than the `limit` sent (per parent in a grouped response), or holds a malformed identifier or cursor. None of its
   identifiers is used.
 - A client MUST bound the pages or identifiers of one walk, the blocks it fetches from hints, the
   blocks visited in one DAG traversal (each `block_id` at most once) and the blocks it keeps in
@@ -528,6 +574,27 @@ follows from §3.3, §3.4 and the subsections above.
 - The bounds of "Client bounds" hold per relay; the number of relays is a client setting, so the total
   stays a function of the client's settings. `Retry-After` and the back-off apply to the relay that
   sent them.
+
+### Fast first catch-up (non-normative)
+
+Nothing in this subsection is a new rule. It is guidance for a client's first start on a large graph,
+and follows from the subsections above. Estimates are in ADR 0051, "Fast first catch-up".
+
+- **Snapshot first.** A client MAY start from a snapshot: blocks cut from one relay walked to
+  `more = false`, with a resume point (that relay's URL, the `head` of its last response and the `Date`
+  of that response). A snapshot is not a protocol object; its format and host are its producer's. One
+  static object behind a CDN is one cacheable `GET`, with no relay rate limit. Every block in it goes
+  through the receipt rule (§3.4), like a block from a relay.
+- **Resume, do not walk again.** `/query` with no `parent`, `asc`, from the snapshot's `head` lists
+  exactly the blocks that relay stored after the cut. On another relay, or after `InvalidCursor`, the
+  client uses `since` with a margin and deduplicates by `block_id`.
+- **Bulk from a bucket mirror.** A `read_only` URL behind a CDN (`/info`) serves `GET /block` with
+  immutable caching: single requests, served from the CDN edge, with no relay allowance spent. It has no
+  `/query`; identifiers come from a relay or the snapshot.
+- **Batches for gaps and recent blocks.** Identifiers that the bucket did not serve, and blocks too
+  recent for it, go to `POST /sbtp/v1/blocks` on a relay with `read_api` ≥ 2.
+- **Order.** Snapshot; `/info` of each relay; `asc` from `head`; the blocks of the current view by single
+  `GET`; the rest of the delta from the bucket, then by batch; then grouped `asc` polls from `head`.
 
 ## 5. P2P synchronisation and gossip
 

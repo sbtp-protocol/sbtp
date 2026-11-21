@@ -1,10 +1,13 @@
 # 0051: Relay read API for large graphs: batch fetch, parent ids, newest first, several parents
 
-- Status: proposed
+- Status: accepted (by the project owner, 2026-11-21), as proposed, with the owner choices recorded in
+  "Decisions of the project owner": batch weight `⌈N/4⌉`; a `POST` batch route; `/info` `read_api: 2`;
+  `fields=parents` refused with `parent` for now; gateway newest first by ingestion order. A
+  non-normative section "Fast first catch-up" is added at acceptance; it adds no rule
 - Date: 2026-11-21
 - Questions: Q-23 (requirements recorded, rule 30; not decided); Q-64 (partially resolved: omission,
-  rules 36 to 38); opens Q-74 and Q-75
-- Amends (on acceptance): ADR 0012 rules 5, 6, 9, 10 and 12 (new parameters, order, cursor as a gap,
+  rules 36 to 38); opens Q-74, Q-75, Q-76 and Q-77
+- Amends: ADR 0012 rules 5, 6, 9, 10 and 12 (new parameters, order, cursor as a gap,
   `head`, grouped response); ADR 0018 rule 21 (request weight in the `query` and `block` buckets);
   ADR 0029 rule 4 (one more body ceiling); ADR 0041 rules 11, 17 and 18 (gateway order, several
   targets, counts, per-node completeness); CORS of core spec §4 (`POST`). Nothing else in these ADRs
@@ -294,7 +297,103 @@ Nothing is released. Old relays answer `400` to the new parameters and `404` or 
 route; clients read `read_api` first (rule 31). Existing cursors and single-parent responses keep
 their encoding and shape; `head` is an added member, which clients already ignore when unknown.
 
+## Decisions of the project owner (2026-11-21)
+
+1. **Accepted as proposed.**
+2. **Batch weight `⌈N / 4⌉`** `block` tokens (rule 7), not the cost-neutral `⌈N / 2⌉`. The divisor is
+   checked by measurement before a public relay publishes `read_api: 2` (Q-74).
+3. **Batch route `POST /sbtp/v1/blocks`** with a raw binary body (rule 1), not a `GET` with identifiers
+   in the query string.
+4. **Discovery by `/info` `read_api: 2`** (rule 31).
+5. **`fields=parents` is refused with `parent`** for now (rule 14); revisited if a client needs it
+   (Q-75).
+6. **Gateway lists newest first by ingestion order** (rule 32), never by the `Timestamp` field.
+7. **Fast first catch-up.** A cold start of 1.8 minutes on `small` is too long for a first start. The
+   section below records how a client starts from a snapshot and a bucket mirror (ADR 0050) with the
+   rules already in force. It is non-normative and adds no rule. One point would need a rule and is
+   left to the owner (Q-76); a shared snapshot format is Q-77.
+
+## Fast first catch-up (non-normative)
+
+Nothing in this section is a new rule. It combines ADR 0050 (bucket mirror), this ADR (`head`, `asc`
+from a cursor, batches) and core spec §3.4 and §4.
+
+**Sources, by role.**
+
+- **Snapshot.** A set of validated blocks, cut from one relay `R` by a producer that walked `R` to
+  `more = false`, with a resume point: the relay URL of `R`, the `head` of its last response, and the
+  `Date` header of that response (the relay's clock). A snapshot is not a protocol object: its format,
+  host and refresh are the producer's (a common format is Q-77). One static object behind a CDN is one cacheable `GET`, with no
+  relay rate limit. It is not placed under `/sbtp/v1/`, whose layout is fixed (ADR 0050 rule 1).
+- **Bucket mirror** (ADR 0050). A read-only relay URL served through a CDN: single `GET /block`, each
+  object `public, max-age=31536000, immutable`, so a CDN serves popular blocks from its edge and the
+  origin relay sees no request and charges no token. It has no `/query`: identifiers come from a relay
+  or from the snapshot. It lags the writer by its uploader.
+- **Relay batch route** (rules 1 to 12). For gaps (identifiers the bucket did not serve) and for recent
+  blocks, which the bucket may not hold yet.
+- **Relay `/query`.** Identifiers only. Resuming from the snapshot's `head` lists exactly the blocks `R`
+  stored after the cut (rule 18): nothing is walked twice.
+
+Every block, from every source, the snapshot included, goes through the receipt rule (§3.4: full
+validation and R1 against the requested or listed `block_id`). A snapshot is an untrusted source like a
+relay; the client bounds of core spec §4 apply to it.
+
+**Order for a client.**
+
+1. Load the snapshot (bundled with the program or one `GET`); validate each block as it arrives, in a
+   background worker; store within the storage budget. Show the current view from it.
+2. Read `/info` of the relays in the list (`read_api`, `read_only`).
+3. Resume on `R`: `/query` with no `parent`, `asc`, from the snapshot's `head`, to `more = false`; keep
+   the last `head`. On another relay, or after `InvalidCursor` on `R` (ADR 0024), use `since` = the
+   snapshot's `Date` minus a margin (the relay's clock on `R`; on another relay the margin also covers
+   its replication delay) and deduplicate by `block_id`; only the margin is walked again.
+   `fields=parents` is used when the client skips blocks it does not need; without it a page holds up to
+   1,000 identifiers.
+4. Fetch the blocks of the current view first: single `GET`s, which shared caches serve (rule 12).
+5. Fetch the rest of the delta. A delta of a few batches goes to the relay batch route directly. A
+   larger one goes first to the bucket by single `GET`; the identifiers it does not serve (any status
+   other than `200` or `304`, ADR 0050 rule 5) go to the relay batch route.
+6. Stay current with a grouped `asc` poll from `head` for the shown parents (rule 29) and a batch for
+   what it lists.
+
+**Completeness.** The producer's walk of `R` to `more = false` is a complete listing of what `R` held
+at the cut; the `asc` walk from `head` to `more = false` extends it to the new `head` (rules 28 and 29).
+State derived from absence is therefore as complete as a full walk of `R`, without the walk. Blocks
+that `R` did not hold are found as on any relay: on another relay of the list.
+
+**Cold-start estimate.** For the 22,807-block graph of the context, with an assumed average block of
+1.5 KiB (about 35 MB; not measured):
+
+| Path | Bound by | Estimate |
+|---|---|---|
+| Today: per-block `GET`, `small` `block` bucket | relay rate limit | 7.6 min |
+| This ADR: `/query` with `fields` and relay batches, `small` | relay rate limit | 1.8 min |
+| Bucket through a CDN, no snapshot, at most 8 requests in flight, 30 ms round trip | latency | about 85 s |
+| Snapshot, one `GET` through a CDN, then a small delta | bandwidth | 35 MB / link rate + delta |
+
+With a snapshot, the start is bandwidth-bound: about 28 s at 10 Mbit/s, 6 s at 50 Mbit/s, 3 s at
+100 Mbit/s. Validation runs in parallel with the download: about 100 µs per block in a browser (an
+estimate: BLAKE3, PoW check and one Ed25519 verification in WebAssembly), about 2.3 s on one core for
+the whole graph. The delta after a recent snapshot costs a few seconds: for 2,000 blocks, 2 `/query`
+pages and 8 batches (500 `block` tokens, about 6 s on `small` after the burst of 200), or the same
+blocks from the bucket at 8 in flight in about 7.5 s. The delta grows with the age of the snapshot, so
+a producer refreshes it on a schedule that keeps the delta to a few batches.
+
+**The point that would need a rule (Q-76).** Without a snapshot, the bucket path is latency-bound
+because a client SHOULD keep at most 8 requests in flight per relay (core spec §4, "Admission
+control"), and a bucket URL is a relay URL in a relay list (ADR 0050 rule 4). That bound protects a
+relay's per-client in-flight allowance (ADR 0019); a static bucket behind a CDN has none. With 64
+streams over HTTP/2 the same fetch would take about 11 s and be bandwidth-bound on links under about
+25 Mbit/s. Exempting `read_only` URLs from the 8-request bound is a change of core spec §4 and is not
+made here. The recommended order (snapshot first) does not depend on it.
+
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21). In `graph-access.md` the gateway order rule is in §3.2 (not §3.1);
+the several-target form of `/children` became §3.9, before the new §3.10. The `/query` text also notes
+that `parent` is exempt from the "repeated parameter" rule and that the client check of `limit` holds
+per parent in a grouped response. Core spec §4 also gains the non-normative subsection "Fast first
+catch-up".
 
 Core spec §4:
 

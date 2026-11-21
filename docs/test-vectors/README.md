@@ -20,7 +20,7 @@ Graph access vectors (planned, ADR 0040, accepted; not generated yet, not frozen
 `sbtp-graph`. The case list is in ADR 0040, "Test vectors". They are frozen only after the ADR is
 accepted and the security review has checked each negative case.
 
-Relay API vectors (planned, ADR 0051, proposed; not generated, not frozen): `relay-v1/` holds `/query`
+Relay API vectors (planned, ADR 0051, accepted 2026-11-21; not generated, not frozen): `relay-v1/` holds `/query`
 parameter cases, ordering and grouped-cursor scenarios over a fixture store, batch-fetch request and record
 cases, and the request weights. Cursors are opaque and relay-specific, so no vector contains a cursor value:
 scenarios name "the cursor of response k, parent j" symbolically. The case list is in ADR 0051, "Test vectors".

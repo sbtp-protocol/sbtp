@@ -1,6 +1,9 @@
 # 0041: Graph gateway: an optional read API over the relay interface
 
 - Status: accepted (2026-11-20, owner)
+- Amended by: 0051 (rules 11, 17 and 18: `order=desc` by ingestion order with cursors as gaps; `count`
+  and several targets on `/children`; `order` and `incomplete` on `/subgraph`; federation and omission
+  added as `graph-access.md` §3.10)
 - Date: 2026-11-20
 - Questions: touches Q-11 (synchronisation, not decided here) and Q-23 (push delivery, not decided
   here); opens Q-64 and Q-65
