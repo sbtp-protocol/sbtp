@@ -28,6 +28,11 @@ Initial public version. Pre-release software: no version is supported for produc
 - Operator deny list (ADR 0052, spec only so far): `451` with `Denied` / `DeniedKey`, `no-store`, denied
   blocks omitted from `/query` and returned as empty records in batches, `/info` `deny_list`; publishers
   never re-send a denied block automatically.
+- Sealing with an external signer (ADR 0055): the inner signature message comes only from the typed
+  builder and MAY be signed by an external signer; an SBTP key never signs under a §3.5 prefix a message
+  not built for it; one ephemeral key per `block_id`. Client clarifications (ADR 0053 S1-S15, ADR 0047
+  D2-D3, ADR 0051 B10): `/info` re-reads, absent `block_versions` reads `[1]`, malformed flags read as
+  absent, deduplicated pages, `read_only` URLs are not publication targets, no stalled `/query` pages.
 - Relay subscriptions (ADR 0054, spec only so far): `GET /sbtp/v1/subscribe` over WebSocket, subprotocol
   `sbtp.subscribe.v1`, subscriptions to 1 to 32 parents or relay-wide, binary deliveries with `/query`
   cursors, gap signalling, client-side catch-up through `/query`; off by default, `/info` `subscribe`.
