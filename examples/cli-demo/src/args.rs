@@ -144,6 +144,11 @@ impl Parsed {
             .transpose()
     }
 
+    /// Every positional argument, in order.
+    pub fn all_positionals(&self) -> &[OsString] {
+        &self.positionals
+    }
+
     /// Exactly `n` positional arguments, or a usage error naming `what`.
     pub fn positionals(&self, n: usize, what: &str) -> Result<&[OsString], Fail> {
         match self.positionals.len().cmp(&n) {

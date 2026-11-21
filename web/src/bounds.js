@@ -8,6 +8,25 @@ export const CEILING = Object.freeze({
   query: 131_072,
   info: 16_384,
   error: 16_384,
+  /** `POST /sbtp/v1/blocks` response (ADR 0051 rule 4). */
+  batch: 1_048_576,
+});
+
+/**
+ * Protocol bounds of the read API of ADR 0051 (rule 31: fixed by the protocol, not relay
+ * settings). Used only with a relay whose /info says `read_api >= 2`.
+ */
+export const READ_API = Object.freeze({
+  /** `read_api` from which the rules of ADR 0051 apply. */
+  version: 2,
+  /** Identifiers in one `POST /sbtp/v1/blocks` (rule 1). */
+  batchMaxIds: 256,
+  /** `parent` values in one `/query` (rule 21). */
+  maxParents: 32,
+  /** Page size with `fields=parents` (rule 14). */
+  fieldsMaxPage: 200,
+  /** Parents Hashes of one block (spec §2: at most 8). */
+  maxParentsPerBlock: 8,
 });
 
 export const LIMITS = Object.freeze({
@@ -37,6 +56,21 @@ export const LIMITS = Object.freeze({
   relayFailThreshold: 3,
   /** Cap of the back-off of a relay left aside, before jitter. */
   relayBackoffCapMs: 300_000,
+  /**
+   * Blocks of one fetch round up to which single GETs are used with a `read_api >= 2` relay: they
+   * are the cacheable form (ADR 0051 rule 12). Above it, and for walks and cold starts, batches.
+   */
+  viewSingleGetMax: 32,
+  /** `POST /blocks` requests in flight per relay. */
+  batchConcurrency: 2,
+  /** Grouped `/query` requests in one grouped walk, whatever the relay answers. */
+  groupMaxRequests: 64,
+  /** Identifiers taken for one parent in one grouped walk: a bigger listing stays incomplete. */
+  groupMaxIdsPerParent: 1_000,
+  /** Children listed per shown item when a view loads (ADR 0051 rule 23 lowers it per parent). */
+  viewChildLimit: 40,
+  /** Newest children of the root that a view shows. */
+  viewSize: 25,
   /** Blocks visited by one DAG traversal (rule 11). */
   traverseMaxVisited: 1_000,
   /** Local store budget (rule 12): blocks fetched from relays are evicted first. */

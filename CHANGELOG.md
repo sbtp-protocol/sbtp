@@ -99,6 +99,26 @@ Initial public version. Pre-release software: no version is supported for produc
   (macOS), `schannel` 0.1.30 (Windows). Computed `small` memory bound with replication on:
   15,634,073 bytes, under the 20 MB budget of every function on. `deploy/README.md` gains a
   "Replication" section.
+- Clients: the relay read API of ADR 0051, used only with a relay whose `/info` says `read_api: 2`
+  (rule 31); any other relay gets exactly the requests of before. Web client: batch fetch
+  (`POST /sbtp/v1/blocks`, length-prefixed records each checked by R1 against the id at its
+  position and fully validated; `length = 0` and invalid records go to the next relay, a prefix is
+  asked again, a record above 65,909 bytes or a body over 1 MiB is a failed request, the complete
+  records before a truncation are kept), packed under 256 ids and 1 MiB from `fields=parents`
+  lengths; single GETs stay the form for up to 32 blocks of a view, batches above that and for
+  walks and cold starts. A batch of N ids counts N in the operation's 800-request bound. The view
+  of a block (`src/view.js`) lists the 25 newest children (`order=desc`, `head` kept), the children
+  of those items in grouped requests (32 parents each, per-parent cursors, `more` as the
+  completeness signal: an item's replies are shown as complete only when every relay asked gave a
+  complete listing), and "Refresh the view" polls the root and the shown items `asc` from `head` in
+  one grouped request per 32. "Descendants" is a cold start: one relay-wide `fields=parents` walk,
+  then batches of the descendants only. Ancestors are fetched one level at a time, in batches. A
+  35-block view takes 38 requests against a fake relay (1 `/info`, 2 `/query`, 35 cacheable GETs),
+  5 with batches; a refresh with nothing new takes 1. `cli-demo`: `get` takes up to 1,024 ids
+  (batches of 256 with failover, `--out-dir`); `query` gains `--desc` (prints `head`), a
+  repeatable `--parent` (2 to 32, `<ID>.<CURSOR>`, prints `<PARENT> <CHILD>` with per-parent
+  completeness and cursors; one plain walk per parent on an older relay) and `--fields parents`
+  (prints length and parents). No new dependency; no change to `sbtp-core` or `sbtp-wasm`.
 
 ### Changed (from a deep review of `sbtp-core` and `sbtp-l2`)
 

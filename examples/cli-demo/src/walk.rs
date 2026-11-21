@@ -38,6 +38,28 @@ pub struct Filter {
     pub since: Option<u64>,
     /// `limit`: page size asked for; the relay may lower it, never raise it.
     pub limit: Option<u32>,
+    /// `order=desc` (ADR 0051 rule 15): newest first. Only for a relay with `read_api >= 2`.
+    pub desc: bool,
+    /// `fields=parents` (ADR 0051 rule 13). Only for a relay with `read_api >= 2`, never with
+    /// `parent` (rule 14).
+    pub fields: bool,
+}
+
+impl Filter {
+    /// Whether the filter uses a form of ADR 0051, which only a `read_api >= 2` relay takes.
+    pub fn needs_read_api(&self) -> bool {
+        self.desc || self.fields
+    }
+}
+
+/// The `fields=parents` members of one entry (ADR 0051 rule 13). Hints only: a block's own header
+/// is authoritative once it is fetched and verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    /// The block's Parents Hashes, in header order (0 to 8).
+    pub parents: Vec<BlockId>,
+    /// The block's length in bytes.
+    pub len: u32,
 }
 
 /// One `200` page of `/query`, already checked (identifiers, cursor syntax, page size).
@@ -49,7 +71,38 @@ pub struct Page {
     pub cursor: String,
     /// `more`.
     pub more: bool,
+    /// `head` (ADR 0051 rule 18), when the relay sent one.
+    pub head: Option<String>,
+    /// With `fields=parents`: one hint per identifier, aligned with `block_ids`.
+    pub hints: Option<Vec<Hint>>,
 }
+
+/// One entry of a grouped `/query` response (ADR 0051 rule 24), already checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEntry {
+    /// The parent, the one requested at this position.
+    pub parent: BlockId,
+    /// Its children on this page.
+    pub block_ids: Vec<BlockId>,
+    /// The cursor to continue this parent's listing.
+    pub cursor: String,
+    /// `more`: `false` means this parent's listing is complete (rule 28).
+    pub more: bool,
+}
+
+/// A grouped `/query` response: one entry per requested parent, in request order, and `head`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The entries.
+    pub entries: Vec<GroupEntry>,
+    /// `head` (rule 18).
+    pub head: String,
+}
+
+/// Most `parent` values in one `/query` (ADR 0051 rule 21).
+pub const MAX_PARENTS: usize = 32;
+/// Largest page with `fields=parents` (ADR 0051 rule 14).
+pub const MAX_FIELDS_PAGE: usize = 200;
 
 /// Why a page could not be read.
 #[derive(Debug)]
@@ -77,6 +130,21 @@ pub trait PageSource {
     ///
     /// See [`PageError`].
     fn page(&mut self, filter: &Filter, cursor: Option<&str>) -> Result<Page, PageError>;
+}
+
+/// Where grouped pages come from (ADR 0051 rule 21): the relay over HTTP, or a script.
+pub trait GroupSource {
+    /// `GET /sbtp/v1/query` with 1 to 32 `parent` values, each with its own cursor, and the
+    /// `since`, `limit` and `desc` of `filter`.
+    ///
+    /// # Errors
+    ///
+    /// See [`PageError`].
+    fn group(
+        &mut self,
+        parents: &[(BlockId, Option<String>)],
+        filter: &Filter,
+    ) -> Result<Group, PageError>;
 }
 
 /// Bounds of one walk.
@@ -124,20 +192,26 @@ const DEFAULT_QUERY_LIMIT: usize = 100;
 const MAX_PAGE_IDS: usize = 1000;
 
 /// The most identifiers a page may hold: the `limit` asked for (default 100), which a relay may
-/// lower but never raise, and never more than 1,000 (ADR 0012 rules 5 and 8).
+/// lower but never raise, and never more than 1,000 (ADR 0012 rules 5 and 8), 200 with
+/// `fields=parents` (ADR 0051 rule 14).
 pub fn page_limit(filter: &Filter) -> usize {
+    let max = if filter.fields {
+        MAX_FIELDS_PAGE
+    } else {
+        MAX_PAGE_IDS
+    };
     filter
         .limit
         .and_then(|l| usize::try_from(l).ok())
         .unwrap_or(DEFAULT_QUERY_LIMIT)
-        .min(MAX_PAGE_IDS)
+        .min(max)
 }
 
 /// What the walk reports while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
-    /// A `block_id` not emitted before by this walker.
-    Id(&'a BlockId),
+    /// A `block_id` not emitted before by this walker, with its hint under `fields=parents`.
+    Id(&'a BlockId, Option<&'a Hint>),
     /// `InvalidCursor`: the walk starts again without a cursor.
     Restart {
         /// Nothing was emitted by this walker yet (a rejected starting `--cursor`): identifiers
@@ -174,6 +248,9 @@ pub struct Walker<S> {
     cursor: Option<String>,
     seen: HashSet<BlockId>,
     policy: Policy,
+    /// `head` of the first page since the walk started or restarted (ADR 0051 rules 18, 19).
+    head: Option<String>,
+    head_taken: bool,
 }
 
 impl<S: PageSource> Walker<S> {
@@ -185,12 +262,25 @@ impl<S: PageSource> Walker<S> {
             cursor,
             seen: HashSet::new(),
             policy,
+            head: None,
+            head_taken: false,
         }
     }
 
     /// The cursor to resume from: the last one the relay returned, or the starting one.
     pub fn cursor(&self) -> Option<&str> {
         self.cursor.as_deref()
+    }
+
+    /// The `head` of the walk's first page (ADR 0051 rule 18), if the relay sent one: an `asc`
+    /// walk from it lists exactly the matching blocks stored since.
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
+    }
+
+    /// Whether the walk lists newest first (`order=desc`).
+    pub fn is_desc(&self) -> bool {
+        self.filter.desc
     }
 
     /// Emits the new identifiers of a `200` page and moves the cursor past it. Returns whether
@@ -213,13 +303,18 @@ impl<S: PageSource> Walker<S> {
                  cursor)",
             ));
         }
+        if !self.head_taken {
+            self.head.clone_from(&page.head);
+            self.head_taken = true;
+        }
         let mut fresh = false;
-        for id in &page.block_ids {
+        for (i, id) in page.block_ids.iter().enumerate() {
             // spec §4 `/query`: a client MUST deduplicate by block_id.
             if self.seen.insert(*id) {
                 fresh = true;
                 summary.new_ids = summary.new_ids.saturating_add(1);
-                on(Event::Id(id))?;
+                let hint = page.hints.as_ref().and_then(|h| h.get(i));
+                on(Event::Id(id, hint))?;
             }
         }
         self.cursor = Some(page.cursor);
@@ -281,6 +376,8 @@ impl<S: PageSource> Walker<S> {
                     // ADR 0024 rule 8: the rejected cursor is never sent again, nor offered for a
                     // resume (security review 2026-11-19 query, L-1).
                     self.cursor = None;
+                    // A head of the rejected epoch says nothing of the new one.
+                    self.head_taken = false;
                     if summary.restarts >= self.policy.max_restarts {
                         return Err(Fail::refused(format!(
                             "the relay rejected the walk's cursor {} times (InvalidCursor); \
@@ -303,31 +400,9 @@ impl<S: PageSource> Walker<S> {
                 Err(PageError::Transient {
                     status,
                     retry_after,
-                    mut fail,
+                    fail,
                 }) => {
-                    if retries >= self.policy.max_retries {
-                        let _ = write!(
-                            fail.message,
-                            "\nGave up after {} attempts on this page.",
-                            retries.saturating_add(1)
-                        );
-                        return Err(fail);
-                    }
-                    let delay = match retry_after {
-                        Some(seconds) => {
-                            let delay = Duration::from_secs(seconds);
-                            if delay > self.policy.max_retry_after {
-                                let _ = write!(
-                                    fail.message,
-                                    "\nThe relay asks to wait {seconds} seconds; not waiting \
-                                     that long."
-                                );
-                                return Err(fail);
-                            }
-                            delay
-                        }
-                        None => backoff(retries, self.policy.backoff_cap, random()),
-                    };
+                    let delay = transient_delay(retries, retry_after, fail, &self.policy, random)?;
                     retries = retries.saturating_add(1);
                     // ADR 0012 K2: a 500 invalidates no cursor; the same request is repeated.
                     on(Event::Wait {
@@ -340,6 +415,280 @@ impl<S: PageSource> Walker<S> {
                 Err(PageError::Fatal(fail)) => return Err(fail),
             }
         }
+    }
+}
+
+/// The wait before repeating a request after a transient failure, or the failure when the walk
+/// gives up: `retries` failures in a row already, or a `Retry-After` above the policy.
+fn transient_delay(
+    retries: u32,
+    retry_after: Option<u64>,
+    mut fail: Fail,
+    policy: &Policy,
+    random: &mut dyn FnMut() -> u64,
+) -> Result<Duration, Fail> {
+    if retries >= policy.max_retries {
+        let _ = write!(
+            fail.message,
+            "\nGave up after {} attempts on this page.",
+            retries.saturating_add(1)
+        );
+        return Err(fail);
+    }
+    match retry_after {
+        Some(seconds) => {
+            let delay = Duration::from_secs(seconds);
+            if delay > policy.max_retry_after {
+                let _ = write!(
+                    fail.message,
+                    "\nThe relay asks to wait {seconds} seconds; not waiting that long."
+                );
+                return Err(fail);
+            }
+            Ok(delay)
+        }
+        None => Ok(backoff(retries, policy.backoff_cap, random())),
+    }
+}
+
+/// What a grouped walk reports while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupEvent<'a> {
+    /// A child of `parent` not emitted before for that parent.
+    Child {
+        /// The parent listed.
+        parent: &'a BlockId,
+        /// The child.
+        id: &'a BlockId,
+    },
+    /// `InvalidCursor`: every listing starts again without a cursor (ADR 0051 rule 27).
+    Restart,
+    /// A transient failure: the walk waits `delay`, then repeats the same request.
+    Wait {
+        /// HTTP status of the failure.
+        status: u16,
+        /// How long the walk waits.
+        delay: Duration,
+        /// Whether `delay` comes from `Retry-After`.
+        retry_after: bool,
+    },
+}
+
+/// The listing of one parent in a grouped walk.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    /// The parent.
+    pub parent: BlockId,
+    /// The cursor to resume this parent's listing from.
+    pub cursor: Option<String>,
+    /// The listing ended with `more = false` (ADR 0051 rule 28): every child the relay held from
+    /// the starting cursor to the end of the walk. Never true for a listing a bound cut.
+    pub complete: bool,
+    /// Children emitted for this parent.
+    pub emitted: u64,
+    seen: HashSet<BlockId>,
+    idle: u64,
+    done: bool,
+}
+
+/// A walk of the children of several parents on one relay with `read_api >= 2`: grouped requests
+/// of at most 32 parents, each with its own cursor, until every listing has `more = false`
+/// (ADR 0051 rules 21 to 29).
+///
+/// - `400 InvalidCursor`: one cursor fails the whole request (rule 27) and an epoch change
+///   invalidates every cursor; every listing starts again without a cursor, deduplicated, at most
+///   `max_restarts` times.
+/// - Transient failures: the same request after `Retry-After` or a back-off, as [`Walker`].
+/// - A parent's listing that brings nothing new for `max_idle_pages` pages, or an empty page with
+///   `more` and an unchanged cursor, stops the walk; so does `max_seen` children over all parents.
+pub struct GroupWalker<S> {
+    source: S,
+    filter: Filter,
+    listings: Vec<Listing>,
+    policy: Policy,
+    head: Option<String>,
+    emitted: usize,
+}
+
+impl<S: GroupSource> GroupWalker<S> {
+    /// A walk of `parents`, each from its own starting cursor.
+    pub fn new(
+        source: S,
+        filter: Filter,
+        parents: Vec<(BlockId, Option<String>)>,
+        policy: Policy,
+    ) -> Self {
+        let listings = parents
+            .into_iter()
+            .map(|(parent, cursor)| Listing {
+                parent,
+                cursor,
+                complete: false,
+                emitted: 0,
+                seen: HashSet::new(),
+                idle: 0,
+                done: false,
+            })
+            .collect();
+        Self {
+            source,
+            filter,
+            listings,
+            policy,
+            head: None,
+            emitted: 0,
+        }
+    }
+
+    /// The listings, in the order given.
+    pub fn listings(&self) -> &[Listing] {
+        &self.listings
+    }
+
+    /// The `head` of the first response since the walk started or restarted (rule 18).
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
+    }
+
+    /// Reads grouped pages until every listing is complete.
+    ///
+    /// # Errors
+    ///
+    /// As [`Walker::walk`].
+    pub fn walk(
+        &mut self,
+        sleep: &mut dyn FnMut(Duration),
+        random: &mut dyn FnMut() -> u64,
+        on: &mut dyn FnMut(GroupEvent<'_>) -> Result<(), Fail>,
+    ) -> Result<u64, Fail> {
+        let mut requests = 0u64;
+        let mut retries = 0u32;
+        let mut restarts = 0u32;
+        let mut head_taken = false;
+        loop {
+            let pending: Vec<usize> = self
+                .listings
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !l.done)
+                .map(|(i, _)| i)
+                .take(MAX_PARENTS)
+                .collect();
+            if pending.is_empty() {
+                return Ok(requests);
+            }
+            let ask: Vec<(BlockId, Option<String>)> = pending
+                .iter()
+                .filter_map(|i| self.listings.get(*i))
+                .map(|l| (l.parent, l.cursor.clone()))
+                .collect();
+            requests = requests.saturating_add(1);
+            match self.source.group(&ask, &self.filter) {
+                Ok(group) => {
+                    retries = 0;
+                    if !head_taken {
+                        self.head = Some(group.head.clone());
+                        head_taken = true;
+                    }
+                    for (i, entry) in pending.iter().zip(group.entries) {
+                        self.take(*i, entry, on)?;
+                    }
+                }
+                Err(PageError::InvalidCursor) => {
+                    if ask.iter().all(|(_, c)| c.is_none()) {
+                        return Err(Fail::refused(
+                            "the relay answered InvalidCursor to a request without a cursor",
+                        ));
+                    }
+                    if restarts >= self.policy.max_restarts {
+                        return Err(Fail::refused(format!(
+                            "the relay rejected the walk's cursors {} times (InvalidCursor); \
+                             giving up",
+                            restarts.saturating_add(1)
+                        )));
+                    }
+                    restarts = restarts.saturating_add(1);
+                    retries = 0;
+                    head_taken = false;
+                    for l in &mut self.listings {
+                        l.cursor = None;
+                        l.complete = false;
+                        l.done = false;
+                        l.idle = 0;
+                    }
+                    on(GroupEvent::Restart)?;
+                }
+                Err(PageError::Transient {
+                    status,
+                    retry_after,
+                    fail,
+                }) => {
+                    let delay = transient_delay(retries, retry_after, fail, &self.policy, random)?;
+                    retries = retries.saturating_add(1);
+                    on(GroupEvent::Wait {
+                        status,
+                        delay,
+                        retry_after: retry_after.is_some(),
+                    })?;
+                    sleep(delay);
+                }
+                Err(PageError::Fatal(fail)) => return Err(fail),
+            }
+        }
+    }
+
+    /// Emits the new children of one entry and moves that parent's cursor past it.
+    fn take(
+        &mut self,
+        i: usize,
+        entry: GroupEntry,
+        on: &mut dyn FnMut(GroupEvent<'_>) -> Result<(), Fail>,
+    ) -> Result<(), Fail> {
+        let max_seen = self.policy.max_seen;
+        let max_idle = self.policy.max_idle_pages;
+        let Some(l) = self.listings.get_mut(i) else {
+            return Ok(());
+        };
+        if entry.more && entry.block_ids.is_empty() && l.cursor.as_deref() == Some(&entry.cursor) {
+            return Err(Fail::failed(format!(
+                "the relay's /query made no progress for parent {} (an empty page with `more` \
+                 and an unchanged cursor)",
+                l.parent
+            )));
+        }
+        let mut fresh = false;
+        for id in &entry.block_ids {
+            if l.seen.insert(*id) {
+                fresh = true;
+                l.emitted = l.emitted.saturating_add(1);
+                self.emitted = self.emitted.saturating_add(1);
+                on(GroupEvent::Child {
+                    parent: &l.parent,
+                    id,
+                })?;
+            }
+        }
+        l.cursor = Some(entry.cursor);
+        if self.emitted > max_seen {
+            return Err(Fail::failed(format!(
+                "more than {max_seen} children in one run, the most this client remembers to \
+                 avoid printing one twice"
+            )));
+        }
+        if !entry.more {
+            l.complete = true;
+            l.done = true;
+            return Ok(());
+        }
+        l.idle = if fresh { 0 } else { l.idle.saturating_add(1) };
+        if l.idle > max_idle {
+            return Err(Fail::failed(format!(
+                "the relay's /query made no progress for parent {}: {} pages in a row with \
+                 `more` and nothing new",
+                l.parent, l.idle
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -411,6 +760,8 @@ mod tests {
                     block_ids: ids.iter().map(|n| id(*n)).collect(),
                     cursor: cursor.to_owned(),
                     more,
+                    head: None,
+                    hints: None,
                 }),
                 Answer::InvalidCursor => Err(PageError::InvalidCursor),
                 Answer::InvalidParameter => Err(PageError::Fatal(Fail::refused(
@@ -440,6 +791,7 @@ mod tests {
             parent: Some(id(0xaa)),
             since: Some(5),
             limit: Some(2),
+            ..Filter::default()
         }
     }
 
@@ -453,7 +805,7 @@ mod tests {
         let mut walker = Walker::new(s, filter(), cursor.map(str::to_owned), policy);
         let result = walker.walk(&mut |d| sleeps.push(d), &mut || 0, &mut |e| {
             match e {
-                Event::Id(i) => r.ids.push(*i),
+                Event::Id(i, _) => r.ids.push(*i),
                 Event::Restart { first_output } => {
                     r.restarts += 1;
                     r.first_output.push(first_output);
@@ -765,7 +1117,7 @@ mod tests {
         for _ in 0..2 {
             walker
                 .walk(&mut |_| {}, &mut || 0, &mut |e| {
-                    if let Event::Id(i) = e {
+                    if let Event::Id(i, _) = e {
                         ids.push(*i);
                     }
                     Ok(())
@@ -813,5 +1165,134 @@ mod tests {
         assert!(!is_cursor_syntax("a+b"));
         assert!(!is_cursor_syntax("a=b"));
         assert!(!is_cursor_syntax("é"));
+    }
+
+    /// A grouped relay: each request answered by `answer(n, parents)` (1-based request number).
+    struct GroupScript<F> {
+        answer: F,
+        requests: Vec<Vec<(BlockId, Option<String>)>>,
+    }
+
+    impl<F> GroupSource for &mut GroupScript<F>
+    where
+        F: FnMut(usize, &[(BlockId, Option<String>)]) -> Result<Group, PageError>,
+    {
+        fn group(
+            &mut self,
+            parents: &[(BlockId, Option<String>)],
+            _filter: &Filter,
+        ) -> Result<Group, PageError> {
+            self.requests.push(parents.to_vec());
+            let n = self.requests.len();
+            (self.answer)(n, parents)
+        }
+    }
+
+    /// ADR 0051 rules 21 to 28: per-parent cursors, only the parents with `more` asked again,
+    /// completeness per parent, `head` of the first response, restart of every listing on
+    /// `InvalidCursor`.
+    #[test]
+    fn grouped_walk_per_parent_cursors_completeness_and_restart() {
+        let (a, b) = (id(1), id(2));
+        let mut s = GroupScript {
+            answer: |n: usize, parents: &[(BlockId, Option<String>)]| {
+                if n == 3 {
+                    return Err(PageError::InvalidCursor);
+                }
+                let entries = parents
+                    .iter()
+                    .map(|(p, _)| GroupEntry {
+                        parent: *p,
+                        block_ids: if *p == id(1) {
+                            vec![id(u8::try_from(100 + n).unwrap())]
+                        } else {
+                            Vec::new()
+                        },
+                        cursor: format!("c{n}"),
+                        more: *p == id(1) && n < 5,
+                    })
+                    .collect();
+                Ok(Group {
+                    entries,
+                    head: format!("h{n}"),
+                })
+            },
+            requests: Vec::new(),
+        };
+        let mut restarts = 0;
+        let mut children = Vec::new();
+        let mut gw = GroupWalker::new(
+            &mut s,
+            Filter::default(),
+            vec![(a, None), (b, Some("start".to_owned()))],
+            Policy::default(),
+        );
+        let requests = gw
+            .walk(&mut |_| {}, &mut || 0, &mut |e| {
+                match e {
+                    GroupEvent::Child { parent, id } => children.push((*parent, *id)),
+                    GroupEvent::Restart => restarts += 1,
+                    GroupEvent::Wait { .. } => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(requests, 5);
+        assert_eq!(restarts, 1);
+        assert!(gw.listings().iter().all(|l| l.complete));
+        assert_eq!(gw.head(), Some("h4"));
+        assert_eq!(
+            children,
+            [(a, id(101)), (a, id(102)), (a, id(104)), (a, id(105))]
+        );
+        let asked: Vec<Vec<Option<&str>>> = s
+            .requests
+            .iter()
+            .map(|r| r.iter().map(|(_, c)| c.as_deref()).collect())
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                vec![None, Some("start")],
+                vec![Some("c1")],
+                vec![Some("c2")],
+                vec![None, None],
+                vec![Some("c4")],
+            ]
+        );
+    }
+
+    /// A relay that keeps answering `more` with an unchanged cursor and nothing new.
+    #[test]
+    fn grouped_walk_stops_without_progress() {
+        let mut s = GroupScript {
+            answer: |_: usize, parents: &[(BlockId, Option<String>)]| {
+                Ok(Group {
+                    entries: parents
+                        .iter()
+                        .map(|(p, _)| GroupEntry {
+                            parent: *p,
+                            block_ids: Vec::new(),
+                            cursor: "same".to_owned(),
+                            more: true,
+                        })
+                        .collect(),
+                    head: "h".to_owned(),
+                })
+            },
+            requests: Vec::new(),
+        };
+        let mut gw = GroupWalker::new(
+            &mut s,
+            Filter::default(),
+            vec![(id(1), None), (id(2), None)],
+            Policy::default(),
+        );
+        let err = gw
+            .walk(&mut |_| {}, &mut || 0, &mut |_| Ok(()))
+            .unwrap_err();
+        assert!(err.message.contains("no progress"), "{}", err.message);
+        assert!(gw.listings().iter().all(|l| !l.complete));
+        assert_eq!(s.requests.len(), 2);
     }
 }

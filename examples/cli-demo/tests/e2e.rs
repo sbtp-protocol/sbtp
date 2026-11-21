@@ -6,7 +6,10 @@
     missing_docs,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::too_many_lines
 )]
 
 use std::ffi::OsString;
@@ -1316,4 +1319,729 @@ fn query_follow_retires_a_relay_whose_walk_failed() {
     let err = stderr(&o);
     assert!(err.contains("not polled again in this run"), "{err}");
     assert!(err.contains("InvalidParameter"), "{err}");
+}
+
+// ---- ADR 0051 read API, against fake relays that follow the ADR ------------------------------
+
+/// A block of the fake relay: its id, bytes and parents (hex).
+#[derive(Clone)]
+struct Held {
+    id: String,
+    bytes: Vec<u8>,
+    parents: Vec<String>,
+}
+
+/// A valid block of the test key with public seed `[seed; 32]`, at difficulty 0.
+fn held(seed: u8, ts: u64, parents: &[&Held]) -> Held {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    let ids: Vec<sbtp_core::BlockId> = parents
+        .iter()
+        .map(|p| sbtp_core::BlockId::from_bytes(<[u8; 32]>::try_from(unhex(&p.id)).unwrap()))
+        .collect();
+    let bytes = BlockBuilder::for_key(&key)
+        .timestamp(ts)
+        .parents(&ids)
+        .payload(format!("block {ts}").as_bytes())
+        .build(&key, 0)
+        .unwrap();
+    let id = sbtp_core::validate_submitted(&bytes, 0)
+        .unwrap()
+        .block_id()
+        .to_string();
+    Held {
+        id,
+        bytes,
+        parents: parents.iter().map(|p| p.id.clone()).collect(),
+    }
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// How a fake relay behaves. `read_api: None`: no `read_api` in /info, and the forms of ADR 0051
+/// are refused as an older relay would (`400`, `405`).
+#[derive(Clone, Default)]
+struct Fake {
+    read_api: Option<u32>,
+    /// Most records per `POST /blocks` answer (rule 3).
+    prefix: Option<usize>,
+    /// Ids answered with `length = 0`.
+    zero: Vec<String>,
+    /// Ids answered with these bytes instead.
+    wrong: Vec<(String, Vec<u8>)>,
+    /// The second record of a batch has a length above the ceiling.
+    over_length: bool,
+    /// The body ends inside the second record.
+    truncate: bool,
+}
+
+/// A fake relay on loopback: store order is insertion order, a cursor `p<N>` is the gap before
+/// position N, `head` the gap after the newest. Returns its URL, its store (to add blocks) and
+/// every request as `METHOD target` (`POST /sbtp/v1/blocks n=<ids>`).
+#[allow(clippy::type_complexity)]
+fn fake_v2(
+    blocks: Vec<Held>,
+    fake: Fake,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Held>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let store = Arc::new(Mutex::new(blocks));
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let (s, h) = (store.clone(), hits.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let mut first = text.lines().next().unwrap_or("").split(' ');
+            let method = first.next().unwrap_or("").to_owned();
+            let target = first.next().unwrap_or("").to_owned();
+            let len: usize = text
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            let _ = stream.read_exact(&mut body);
+            let held = s.lock().unwrap().clone();
+            let (status, ctype, reply) = fake_answer(&held, &fake, &method, &target, &body);
+            h.lock().unwrap().push(if method == "POST" {
+                format!("POST {target} n={}", body.len() / 32)
+            } else {
+                format!("{method} {target}")
+            });
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                reply.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&reply);
+        }
+    });
+    (url, store, hits)
+}
+
+fn fake_answer(
+    held: &[Held],
+    fake: &Fake,
+    method: &str,
+    target: &str,
+    body: &[u8],
+) -> (&'static str, &'static str, Vec<u8>) {
+    let json = |status, v: String| (status, "application/json", v.into_bytes());
+    let bad = |name: &str| json("400 Bad Request", format!(r#"{{"error":"{name}"}}"#));
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let find = |id: &str| held.iter().find(|b| b.id == id);
+    if path == "/sbtp/v1/info" {
+        let api = fake
+            .read_api
+            .map(|v| format!(r#","read_api":{v}"#))
+            .unwrap_or_default();
+        return json(
+            "200 OK",
+            format!(r#"{{"min_pow_difficulty":0,"max_future_ms":300000{api}}}"#),
+        );
+    }
+    if path == "/sbtp/v1/blocks" && method == "POST" {
+        if fake.read_api.is_none() {
+            return json(
+                "405 Method Not Allowed",
+                r#"{"error":"MethodNotAllowed"}"#.into(),
+            );
+        }
+        if body.is_empty() || !body.len().is_multiple_of(32) {
+            return bad("InvalidParameter");
+        }
+        let mut out = Vec::new();
+        for (i, chunk) in body.chunks(32).enumerate() {
+            if fake.prefix.is_some_and(|p| i >= p) {
+                break;
+            }
+            let id = hex(chunk);
+            let rec: Vec<u8> = if fake.zero.contains(&id) {
+                Vec::new()
+            } else if let Some((_, w)) = fake.wrong.iter().find(|(x, _)| *x == id) {
+                w.clone()
+            } else {
+                find(&id).map(|b| b.bytes.clone()).unwrap_or_default()
+            };
+            if i == 1 && fake.over_length {
+                out.extend_from_slice(&65_910u32.to_be_bytes());
+                out.extend_from_slice(&rec);
+                break;
+            }
+            out.extend_from_slice(&u32::try_from(rec.len()).unwrap().to_be_bytes());
+            if i == 1 && fake.truncate {
+                out.extend_from_slice(&rec[..rec.len() / 2]);
+                break;
+            }
+            out.extend_from_slice(&rec);
+        }
+        return ("200 OK", "application/octet-stream", out);
+    }
+    if let Some(id) = path.strip_prefix("/sbtp/v1/block/") {
+        if let Some((_, w)) = fake.wrong.iter().find(|(x, _)| x == id) {
+            return ("200 OK", "application/octet-stream", w.clone());
+        }
+        return match find(id) {
+            Some(b) => ("200 OK", "application/octet-stream", b.bytes.clone()),
+            None => json("404 Not Found", r#"{"error":"NotFound"}"#.into()),
+        };
+    }
+    if path != "/sbtp/v1/query" {
+        return json("404 Not Found", r#"{"error":"NotFound"}"#.into());
+    }
+    let pairs: Vec<(&str, &str)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.split_once('='))
+        .collect();
+    let get = |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+    let parents: Vec<&str> = pairs
+        .iter()
+        .filter(|(n, _)| *n == "parent")
+        .map(|(_, v)| *v)
+        .collect();
+    let desc = get("order") == Some("desc");
+    let fields = get("fields").is_some();
+    if fake.read_api.is_none()
+        && (parents.len() > 1
+            || get("order").is_some()
+            || fields
+            || parents.iter().any(|p| p.contains('.')))
+    {
+        return bad("InvalidParameter");
+    }
+    if fields && !parents.is_empty() {
+        return bad("InvalidParameter");
+    }
+    let n = held.len();
+    let gap = |c: Option<&str>| -> Option<usize> {
+        match c {
+            None => Some(if desc { n } else { 0 }),
+            Some(c) => c.strip_prefix('p')?.parse::<usize>().ok().map(|g| g.min(n)),
+        }
+    };
+    let listing = |parent: Option<&str>,
+                   cursor: Option<&str>,
+                   limit: usize|
+     -> Option<(Vec<usize>, usize, bool)> {
+        let g = gap(cursor)?;
+        let matches = |i: usize| parent.is_none_or(|p| held[i].parents.iter().any(|x| x == p));
+        let order: Vec<usize> = if desc {
+            (0..g).rev().collect()
+        } else {
+            (g..n).collect()
+        };
+        let all: Vec<usize> = order.into_iter().filter(|i| matches(*i)).collect();
+        let page: Vec<usize> = all.iter().copied().take(limit).collect();
+        let next = match (page.last(), desc) {
+            (None, _) => g,
+            (Some(&last), true) => last,
+            (Some(&last), false) => last + 1,
+        };
+        Some((page.clone(), next, all.len() > page.len()))
+    };
+    let ids = |v: &[usize]| {
+        v.iter()
+            .map(|i| format!("\"{}\"", held[*i].id))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let limit: usize = get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+    let head = if fake.read_api.is_some() {
+        format!(r#","head":"p{n}""#)
+    } else {
+        String::new()
+    };
+    if parents.len() >= 2 {
+        let per = limit.min((1000 / parents.len()).max(1));
+        let mut entries = Vec::new();
+        for v in &parents {
+            let (p, c) = match v.split_once('.') {
+                Some((p, c)) => (p, Some(c)),
+                None => (*v, get("cursor")),
+            };
+            let Some((page, next, more)) = listing(Some(p), c, per) else {
+                return bad("InvalidCursor");
+            };
+            entries.push(format!(
+                r#"{{"parent":"{p}","block_ids":[{}],"cursor":"p{next}","more":{more}}}"#,
+                ids(&page)
+            ));
+        }
+        return json(
+            "200 OK",
+            format!(r#"{{"parents":[{}]{head}}}"#, entries.join(",")),
+        );
+    }
+    let limit = if fields { limit.min(200) } else { limit };
+    let Some((page, next, more)) = listing(parents.first().copied(), get("cursor"), limit) else {
+        return bad("InvalidCursor");
+    };
+    let extra = if fields {
+        let ps: Vec<String> = page
+            .iter()
+            .map(|i| {
+                let list: Vec<String> = held[*i]
+                    .parents
+                    .iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect();
+                format!("[{}]", list.join(","))
+            })
+            .collect();
+        let lens: Vec<String> = page
+            .iter()
+            .map(|i| held[*i].bytes.len().to_string())
+            .collect();
+        format!(
+            r#","parents":[{}],"lens":[{}]"#,
+            ps.join(","),
+            lens.join(",")
+        )
+    } else {
+        String::new()
+    };
+    json(
+        "200 OK",
+        format!(
+            r#"{{"block_ids":[{}],"cursor":"p{next}","more":{more}{head}{extra}}}"#,
+            ids(&page)
+        ),
+    )
+}
+
+fn hits_of(h: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+    h.lock().unwrap().clone()
+}
+
+/// `get` with several ids (ADR 0051 rules 1 to 6, 12): batches to a `read_api` 2 relay; wrong
+/// bytes for one id (R1) and `length = 0` move that id to the next relay; one record per answer
+/// (a prefix) gets the rest asked again; `--out-dir` holds every block, each verified.
+#[test]
+fn get_several_ids_batches_with_failover_and_prefixes() {
+    let blocks: Vec<Held> = (0..4).map(|i| held(40, 100 + i, &[])).collect();
+    let other = held(41, 1, &[]);
+    let ids: Vec<String> = blocks.iter().map(|b| b.id.clone()).collect();
+    let (hostile, _, h1) = fake_v2(
+        blocks.clone(),
+        Fake {
+            read_api: Some(2),
+            prefix: Some(1),
+            zero: vec![ids[2].clone()],
+            wrong: vec![(ids[1].clone(), other.bytes.clone())],
+            ..Fake::default()
+        },
+    );
+    let (good, _, h2) = fake_v2(
+        blocks,
+        Fake {
+            read_api: Some(2),
+            ..Fake::default()
+        },
+    );
+    let dir = tmp_dir("batch");
+    let list = format!("{hostile},{good}");
+    let mut args = vec!["get", "--relay", &list, "--out-dir", s(&dir)];
+    args.extend(ids.iter().map(String::as_str));
+    let o = cli(&args);
+    assert_ok(&o);
+    for id in &ids {
+        assert!(
+            stdout(&o).contains(&format!("block_id:   {id}")),
+            "{}",
+            stdout(&o)
+        );
+        let file = std::fs::read(dir.join(format!("{id}.sbtp"))).unwrap();
+        assert_eq!(
+            sbtp_core::validate_submitted(&file, 0)
+                .unwrap()
+                .block_id()
+                .to_string(),
+            *id
+        );
+    }
+    let posts = |h: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| -> Vec<String> {
+        hits_of(h)
+            .into_iter()
+            .filter(|x| x.starts_with("POST"))
+            .collect()
+    };
+    assert_eq!(
+        posts(&h1),
+        (1..=4)
+            .rev()
+            .map(|n| format!("POST /sbtp/v1/blocks n={n}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(posts(&h2), ["POST /sbtp/v1/blocks n=2"]);
+    assert!(
+        !hits_of(&h1)
+            .iter()
+            .any(|x| x.starts_with("GET /sbtp/v1/block/"))
+    );
+}
+
+/// ADR 0051 rules 2 and 6: a length above `MAX_BLOCK_LEN` fails the whole answer; a body that ends
+/// inside a record keeps the complete records before it; the rest comes from the next relay. With
+/// no other relay, the command fails and says why.
+#[test]
+fn get_several_ids_over_length_and_truncated_batches() {
+    let blocks: Vec<Held> = (0..3).map(|i| held(42, 200 + i, &[])).collect();
+    let ids: Vec<String> = blocks.iter().map(|b| b.id.clone()).collect();
+    for (fake, from_broken) in [
+        (
+            Fake {
+                read_api: Some(2),
+                over_length: true,
+                ..Fake::default()
+            },
+            0,
+        ),
+        (
+            Fake {
+                read_api: Some(2),
+                truncate: true,
+                ..Fake::default()
+            },
+            1,
+        ),
+    ] {
+        let (broken, _, hb) = fake_v2(blocks.clone(), fake.clone());
+        let (good, _, hg) = fake_v2(
+            blocks.clone(),
+            Fake {
+                read_api: Some(2),
+                ..Fake::default()
+            },
+        );
+        let list = format!("{broken},{good}");
+        let mut args = vec!["get", "--relay", &list];
+        args.extend(ids.iter().map(String::as_str));
+        let o = cli(&args);
+        assert_ok(&o);
+        assert_eq!(stdout(&o).matches("block_id:").count(), 3);
+        assert_eq!(
+            hits_of(&hb)
+                .iter()
+                .filter(|x| x.starts_with("POST"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            hits_of(&hg)
+                .into_iter()
+                .filter(|x| x.starts_with("POST"))
+                .collect::<Vec<_>>(),
+            [format!("POST /sbtp/v1/blocks n={}", 3 - from_broken)]
+        );
+
+        let (alone, _, _) = fake_v2(blocks.clone(), fake);
+        let mut args = vec!["get", "--relay", &alone];
+        args.extend(ids.iter().map(String::as_str));
+        let o = cli(&args);
+        assert_code(&o, 1);
+        let err = stderr(&o);
+        assert!(err.contains("not fetched"), "{err}");
+        assert!(
+            err.contains("above the largest block") || err.contains("ends inside a record"),
+            "{err}"
+        );
+    }
+}
+
+/// ADR 0051 rule 31: without `read_api` in /info, `get` with several ids sends single GETs, and
+/// with one id it sends exactly the one GET of before (no /info).
+#[test]
+fn get_on_an_old_relay_keeps_single_gets() {
+    let blocks: Vec<Held> = (0..3).map(|i| held(43, 300 + i, &[])).collect();
+    let ids: Vec<String> = blocks.iter().map(|b| b.id.clone()).collect();
+    let (old, _, h) = fake_v2(blocks, Fake::default());
+    let mut args = vec!["get", "--relay", &old];
+    args.extend(ids.iter().map(String::as_str));
+    assert_ok(&cli(&args));
+    let mut want = vec!["GET /sbtp/v1/info".to_owned()];
+    want.extend(ids.iter().map(|i| format!("GET /sbtp/v1/block/{i}")));
+    assert_eq!(hits_of(&h), want);
+    let n = hits_of(&h).len();
+    assert_ok(&cli(&["get", "--relay", &old, &ids[0]]));
+    assert_eq!(hits_of(&h)[n..], [format!("GET /sbtp/v1/block/{}", ids[0])]);
+    let dir = tmp_dir("old-get");
+    let o = cli(&[
+        "get",
+        "--relay",
+        &old,
+        "--out",
+        s(&dir.join("x")),
+        &ids[0],
+        &ids[1],
+    ]);
+    assert_code(&o, 2);
+    assert!(stderr(&o).contains("--out-dir"), "{}", stderr(&o));
+}
+
+/// ADR 0051 rules 15 to 19: `--desc` lists newest first page by page and prints `head`; an
+/// ascending poll from `head` lists exactly what was stored after.
+#[test]
+fn query_desc_pages_and_polls_from_head() {
+    let root = held(44, 1, &[]);
+    let kids: Vec<Held> = (0..5).map(|i| held(44, 10 + i, &[&root])).collect();
+    let mut all = vec![root.clone()];
+    all.extend(kids.iter().cloned());
+    let (url, store, h) = fake_v2(
+        all,
+        Fake {
+            read_api: Some(2),
+            ..Fake::default()
+        },
+    );
+    let o = cli(&[
+        "query", "--relay", &url, "--parent", &root.id, "--desc", "--limit", "2",
+    ]);
+    assert_ok(&o);
+    let newest: Vec<String> = kids.iter().rev().map(|k| k.id.clone()).collect();
+    assert_eq!(stdout(&o), format!("{}\n", newest.join("\n")));
+    let err = stderr(&o);
+    assert!(err.contains("head: p6"), "{err}");
+    assert!(err.contains("--cursor p6"), "{err}");
+    let q: Vec<String> = hits_of(&h)
+        .into_iter()
+        .filter(|x| x.contains("query"))
+        .collect();
+    let base = format!("GET /sbtp/v1/query?parent={}&limit=2&order=desc", root.id);
+    assert_eq!(
+        q,
+        [
+            base.clone(),
+            format!("{base}&cursor=p4"),
+            format!("{base}&cursor=p2")
+        ]
+    );
+
+    let late = held(44, 99, &[&root]);
+    store.lock().unwrap().push(late.clone());
+    let o = cli(&[
+        "query", "--relay", &url, "--parent", &root.id, "--cursor", "p6",
+    ]);
+    assert_ok(&o);
+    assert_eq!(stdout(&o), format!("{}\n", late.id));
+}
+
+/// ADR 0051 rules 21 to 28: several `--parent` in one grouped request, each with its own cursor;
+/// per-parent results, completeness and cursors; `<ID>.<CURSOR>` given back.
+#[test]
+fn query_several_parents_grouped_with_per_parent_cursors() {
+    let a = held(45, 1, &[]);
+    let b = held(45, 2, &[]);
+    let c = held(45, 3, &[]);
+    let mut all = vec![a.clone(), b.clone(), c.clone()];
+    let a_kids: Vec<Held> = (0..5).map(|i| held(45, 10 + i, &[&a])).collect();
+    let b_kid = held(45, 20, &[&b]);
+    all.extend(a_kids.iter().cloned());
+    all.push(b_kid.clone());
+    let (url, _, h) = fake_v2(
+        all,
+        Fake {
+            read_api: Some(2),
+            ..Fake::default()
+        },
+    );
+    let o = cli(&[
+        "query", "--relay", &url, "--parent", &a.id, "--parent", &b.id, "--parent", &c.id,
+        "--limit", "2",
+    ]);
+    assert_ok(&o);
+    let mut want: Vec<String> = a_kids
+        .iter()
+        .map(|k| format!("{} {}", a.id, k.id))
+        .collect();
+    want.push(format!("{} {}", b.id, b_kid.id));
+    assert_eq!(sorted_lines(&stdout(&o)), {
+        let mut w = want.clone();
+        w.sort();
+        w
+    });
+    let err = stderr(&o);
+    for (p, n) in [(&a.id, 5), (&b.id, 1), (&c.id, 0)] {
+        assert!(
+            err.contains(&format!("parent {p}: {n} child(ren), complete.")),
+            "{err}"
+        );
+    }
+    assert!(err.contains(&format!("cursor: {}.p", a.id)), "{err}");
+    assert!(err.contains("head: p9"), "{err}");
+    let q: Vec<String> = hits_of(&h)
+        .into_iter()
+        .filter(|x| x.contains("query"))
+        .collect();
+    assert_eq!(q.len(), 3, "{q:?}");
+    assert!(
+        q[0].contains(&format!(
+            "parent={}&parent={}&parent={}&limit=2",
+            a.id, b.id, c.id
+        )),
+        "{q:?}"
+    );
+    assert!(
+        q[1].contains(&format!("parent={}&limit=2&cursor=p", a.id)),
+        "{q:?}"
+    );
+
+    // Per-parent cursors given back: each parent continues from its own.
+    let n = hits_of(&h).len();
+    let o = cli(&[
+        "query",
+        "--relay",
+        &url,
+        "--parent",
+        &format!("{}.p5", a.id),
+        "--parent",
+        &format!("{}.p9", b.id),
+    ]);
+    assert_ok(&o);
+    assert_eq!(
+        hits_of(&h)[n + 1], // after /info
+        format!("GET /sbtp/v1/query?parent={}.p5&parent={}.p9", a.id, b.id)
+    );
+    assert_eq!(sorted_lines(&stdout(&o)), {
+        let mut w: Vec<String> = a_kids[2..]
+            .iter()
+            .map(|k| format!("{} {}", a.id, k.id))
+            .collect();
+        w.sort();
+        w
+    });
+    // A per-parent cursor with one parent, 33 parents, a parent twice: usage errors.
+    assert_code(
+        &cli(&[
+            "query",
+            "--relay",
+            &url,
+            "--parent",
+            &format!("{}.p5", a.id),
+        ]),
+        2,
+    );
+    assert_code(
+        &cli(&[
+            "query", "--relay", &url, "--parent", &a.id, "--parent", &a.id,
+        ]),
+        2,
+    );
+    let many: Vec<String> = (0..33).map(|i| format!("{i:064x}")).collect();
+    let mut args = vec!["query", "--relay", &url];
+    for m in &many {
+        args.extend(["--parent", m.as_str()]);
+    }
+    assert_code(&cli(&args), 2);
+}
+
+/// ADR 0051 rule 13: `--fields parents` prints each block's length and parents.
+#[test]
+fn query_fields_parents_prints_parent_ids() {
+    let root = held(46, 1, &[]);
+    let kid = held(46, 2, &[&root]);
+    let (url, _, h) = fake_v2(
+        vec![root.clone(), kid.clone()],
+        Fake {
+            read_api: Some(2),
+            ..Fake::default()
+        },
+    );
+    let o = cli(&["query", "--relay", &url, "--fields", "parents"]);
+    assert_ok(&o);
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "{} len={} parents=\n{} len={} parents={}\n",
+            root.id,
+            root.bytes.len(),
+            kid.id,
+            kid.bytes.len(),
+            root.id
+        )
+    );
+    assert!(
+        hits_of(&h)
+            .iter()
+            .any(|x| x == "GET /sbtp/v1/query?fields=parents")
+    );
+    assert_code(
+        &cli(&[
+            "query", "--relay", &url, "--fields", "parents", "--parent", &root.id,
+        ]),
+        2,
+    );
+    assert_code(&cli(&["query", "--relay", &url, "--fields", "children"]), 2);
+}
+
+/// ADR 0051 rule 31: a relay without `read_api` gets none of the new forms. Several `--parent`
+/// fall back to one plain walk per parent; `--desc` and `--fields` are refused for that relay.
+/// A plain `query` sends exactly the requests of before (no /info).
+#[test]
+fn query_on_an_old_relay_falls_back() {
+    let a = held(47, 1, &[]);
+    let b = held(47, 2, &[]);
+    let ka = held(47, 3, &[&a]);
+    let kb = held(47, 4, &[&b]);
+    let (old, _, h) = fake_v2(
+        vec![a.clone(), b.clone(), ka.clone(), kb.clone()],
+        Fake::default(),
+    );
+    let o = cli(&[
+        "query", "--relay", &old, "--parent", &a.id, "--parent", &b.id,
+    ]);
+    assert_ok(&o);
+    assert_eq!(sorted_lines(&stdout(&o)), {
+        let mut w = vec![format!("{} {}", a.id, ka.id), format!("{} {}", b.id, kb.id)];
+        w.sort();
+        w
+    });
+    assert_eq!(
+        hits_of(&h),
+        [
+            "GET /sbtp/v1/info".to_owned(),
+            format!("GET /sbtp/v1/query?parent={}", a.id),
+            format!("GET /sbtp/v1/query?parent={}", b.id),
+        ]
+    );
+    for args in [vec!["--desc"], vec!["--fields", "parents"]] {
+        let mut full = vec!["query", "--relay", &old];
+        full.extend(args);
+        let o = cli(&full);
+        assert_code(&o, 3);
+        assert!(stderr(&o).contains("read_api 2"), "{}", stderr(&o));
+    }
+    assert!(
+        !hits_of(&h)
+            .iter()
+            .any(|x| x.contains("order=") || x.contains("fields=") || x.starts_with("POST"))
+    );
+    let n = hits_of(&h).len();
+    assert_ok(&cli(&["query", "--relay", &old, "--parent", &a.id]));
+    assert_eq!(
+        hits_of(&h)[n..],
+        [format!("GET /sbtp/v1/query?parent={}", a.id)]
+    );
 }

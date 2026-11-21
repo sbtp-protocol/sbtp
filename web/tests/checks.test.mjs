@@ -12,7 +12,7 @@ const ID = "0".repeat(60) + "abcd";
 
 test("info: required members checked, optional ones dropped when out of range", () => {
   const ok = parseInfo(enc({ min_pow_difficulty: 16, max_future_ms: 300000, max_query_limit: 5000, block_ttl_ms: null, x: 1 }));
-  assert.deepEqual({ ...ok }, { minPowDifficulty: 16, maxFutureMs: 300000, blockTtlMs: null });
+  assert.deepEqual({ ...ok }, { minPowDifficulty: 16, maxFutureMs: 300000, blockTtlMs: null, readApi: 1 });
   for (const bad of [
     "[]", "nope", { max_future_ms: 1 }, { min_pow_difficulty: 257, max_future_ms: 1 },
     { min_pow_difficulty: 1.5, max_future_ms: 1 }, { min_pow_difficulty: "16", max_future_ms: 1 },
@@ -52,7 +52,7 @@ test("an explicit difficulty does not read /info (finding 10)", async () => {
 
 test("query page: shape, limit, identifiers and cursor", () => {
   const page = (o) => enc({ block_ids: [ID], cursor: "abc_-9Z", more: false, ...o });
-  assert.deepEqual(parsePage(page({}), 1), { blockIds: [ID], cursor: "abc_-9Z", more: false });
+  assert.deepEqual(parsePage(page({}), 1), { blockIds: [ID], cursor: "abc_-9Z", more: false, head: null, hints: null });
   assert.equal(parsePage(page({ block_ids: [ID, ID] }), 2).blockIds.length, 2); // duplicates allowed
   const bad = [
     [page({ block_ids: [ID, ID] }), 1], // more than the limit sent

@@ -59,9 +59,10 @@ ADR 0047.
 | `src/store.js`, `src/eviction.js`, `src/idb.js` | Local block store and its budget |
 | `src/delivery.js` | Per-relay delivery state of own blocks, protection and bounds (ADR 0047) |
 | `src/http.js` | The only `fetch()` call: redirect policy, deadline, bounded body read |
-| `src/relay.js` | `/info`, `PUT`/`GET /block`, `/query`, response checks, bounded fetch |
-| `src/relays.js`, `src/settings.js` | Several relays: publish to all, failover reads, merged walks, health; the saved list |
-| `src/walk.js`, `src/traverse.js` | `/query` walk, bounded DAG traversal |
+| `src/relay.js` | `/info`, `PUT`/`GET /block`, `/query`, `POST /blocks` (ADR 0051), response checks, bounded fetch |
+| `src/relays.js`, `src/settings.js` | Several relays: publish to all, failover reads (single GETs or batches), merged and grouped walks, health; the saved list |
+| `src/walk.js`, `src/traverse.js` | `/query` walk, grouped walk of several parents, bounded DAG traversal (per block or per level) |
+| `src/view.js` | The view of a block, its refresh, the cold start of its descendants (ADR 0051) |
 | `src/bounds.js` | Every client bound in one place |
 | `src/mine-worker.js`, `src/miner.js` | PoW in a module Web Worker, one worker per job |
 | `src/app.js`, `src/pow.js`, `src/stats.js` | The two pages |
@@ -201,6 +202,26 @@ falls back to `http://127.0.0.1:8080`. Code: `src/relays.js`.
 - **`/query`.** Each relay is walked with its own cursor (ADR 0012, ADR 0024), in parallel; the ids are
   merged round-robin across the relays (so one relay cannot fill the view) and deduplicated by
   `block_id`. A relay whose ids were cut by the overall bound keeps its starting cursor.
+- **Read API (ADR 0051).** Used only with a relay whose `/info` says `read_api: 2`, read once per relay
+  and kept in memory (forgotten if the relay then refuses a form it announced); every other relay gets
+  exactly the requests above. With it:
+  - *Batch fetch*: `POST /sbtp/v1/blocks`, up to 256 ids packed under 1 MiB (from the `lens` of
+    `fields=parents` when known). Each record is validated against the id at its position (R1 and
+    full validation); `length = 0` or an invalid record sends that id to the next relay; a prefix
+    answer gets the rest asked again; a record above 65,909 bytes, a body over 1 MiB or an error is a
+    failed request (the ids go to the next relay); after a truncated body the complete records are
+    kept. A batch of N ids counts N in the 800-request bound of an operation. Single GETs (the
+    cacheable form) stay the rule for up to 32 blocks of a view; batches above that and for walks.
+  - *View* (List with a block id): the 25 newest children (`order=desc`, one page, `head` kept), then
+    in parallel their blocks and a grouped `/query` of their children (32 parents per request, a cursor
+    per parent, `more` as the completeness signal), then the replies. An item's replies are shown as
+    complete only when every relay asked gave a complete listing (rule 29). *Refresh the view* polls
+    the root and every shown item `asc` from `head` (a listing cut by a bound continues from its own
+    cursor) in one grouped request per 32 parents, and fetches only what is new.
+  - *Descendants* (cold start): one relay-wide walk with `fields=parents`, the descendants found from
+    the parent ids alone (other blocks are never fetched), then batches. Without the read API: a
+    bounded traversal over per-parent walks.
+  - *List* without a block id lists newest first; *Ancestors* fetches one level at a time.
 - **Bounds.** Per relay, every bound of the table below; overall: 8 relays, 200 ids merged in a view,
   4 `GET /block` in flight in all, 800 `GET /block` per operation, failovers included.
 - **Health (in memory).** A failed request, a transient refusal or an invalid block counts as a relay

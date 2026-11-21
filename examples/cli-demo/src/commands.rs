@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -16,7 +17,7 @@ use sbtp_core::{
 
 use crate::args::{Kind, Parsed, parse as parse_args};
 use crate::fail::{self, Fail, untrusted};
-use crate::relay::{Relay, Stored};
+use crate::relay::{MAX_BATCH_IDS, READ_API, Relay, Stored};
 use crate::walk::{self, Event, Filter, Policy, Walker};
 use crate::{hex, keyfile, output};
 
@@ -357,8 +358,23 @@ pub fn publish(args: &[OsString]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `get --relay <URL>... <BLOCK_ID> [--out <FILE>] [--payload-out <FILE>] [--difficulty <D>]
-/// [--force]`: asks the relays in order and keeps the first block that passes the receipt rule.
+/// Most block ids one `get` takes.
+const MAX_GET_IDS: usize = 1024;
+
+/// A `<BLOCK_ID>` argument.
+fn block_id_arg(arg: &std::ffi::OsStr) -> Result<BlockId, Fail> {
+    let text = arg.to_str().unwrap_or_default();
+    hex::block_id(text).ok_or_else(|| {
+        Fail::usage(format!(
+            "`{}`: expected a block_id of 64 hexadecimal characters",
+            untrusted(text, 80)
+        ))
+    })
+}
+
+/// `get --relay <URL>... <BLOCK_ID>... [--out <FILE>] [--payload-out <FILE>] [--out-dir <DIR>]
+/// [--difficulty <D>] [--force]`: asks the relays in order and keeps the first block that passes
+/// the receipt rule. Several ids: see [`get_many`].
 pub fn get(args: &[OsString]) -> Result<(), Fail> {
     let p = parse_args(
         args,
@@ -366,21 +382,28 @@ pub fn get(args: &[OsString]) -> Result<(), Fail> {
             ("relay", Kind::Repeated),
             ("out", Kind::Value),
             ("payload-out", Kind::Value),
+            ("out-dir", Kind::Value),
             ("difficulty", Kind::Value),
             ("force", Kind::Switch),
         ],
     )?;
-    let positional = p.positionals(1, "<BLOCK_ID>")?;
-    let id_text = positional
-        .first()
-        .and_then(|a| a.to_str())
-        .unwrap_or_default();
-    let id = hex::block_id(id_text).ok_or_else(|| {
-        Fail::usage(format!(
-            "`{}`: expected a block_id of 64 hexadecimal characters",
-            untrusted(id_text, 80)
-        ))
-    })?;
+    let positional = p.all_positionals();
+    if positional.is_empty() {
+        return Err(Fail::usage("missing argument <BLOCK_ID>"));
+    }
+    if positional.len() > MAX_GET_IDS {
+        return Err(Fail::usage(format!(
+            "{} block ids given; `get` takes at most {MAX_GET_IDS}",
+            positional.len()
+        )));
+    }
+    let mut ids: Vec<BlockId> = Vec::with_capacity(positional.len());
+    for arg in positional {
+        let id = block_id_arg(arg)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
     let relays = required_relays(&p)?;
     // ADR 0026 rules 1 to 3: a local floor, 0 by default, never taken from the relay's /info.
     let difficulty = p.number::<u32>("difficulty")?.unwrap_or(0);
@@ -389,6 +412,12 @@ pub fn get(args: &[OsString]) -> Result<(), Fail> {
             "`--difficulty {difficulty}`: the maximum is {}",
             sbtp_core::MAX_DIFFICULTY
         )));
+    }
+    let [id] = ids[..] else {
+        return get_many(&p, &relays, &ids, difficulty);
+    };
+    if p.value("out-dir").is_some() {
+        return get_many(&p, &relays, &ids, difficulty);
     }
     let several = relays.len() > 1;
     let mut failures = Vec::new();
@@ -482,6 +511,210 @@ fn receipt_fail(relay: &Relay, id: &BlockId, bytes: &[u8], e: &sbtp_core::Error)
     (invalid_from_relay(relay, id, e), false)
 }
 
+/// One block of `get_many` and what the relays asked so far answered for it.
+struct Wanted {
+    id: BlockId,
+    /// Bytes that passed the receipt rule (spec §3.4) for `id`.
+    bytes: Option<Vec<u8>>,
+    /// Below the local floor: no other relay is asked (its PoW is a property of its `block_id`).
+    refused: Option<Fail>,
+    /// One message per relay that did not serve it.
+    tried: Vec<String>,
+    /// A relay served bytes that failed validation for it.
+    invalid: bool,
+}
+
+impl Wanted {
+    fn pending(&self) -> bool {
+        self.bytes.is_none() && self.refused.is_none()
+    }
+
+    /// The receipt rule on bytes a relay served for this block (spec §3.4: R1 against the id
+    /// asked, then full validation at the local floor).
+    fn receive(&mut self, relay: &Relay, bytes: Vec<u8>, difficulty: u32) {
+        match validate_requested(&bytes, difficulty, &self.id) {
+            Ok(_) => self.bytes = Some(bytes),
+            Err(e) => {
+                let (f, local_floor) = receipt_fail(relay, &self.id, &bytes, &e);
+                if local_floor {
+                    self.refused = Some(f);
+                } else {
+                    self.invalid = true;
+                    self.tried.push(f.message);
+                }
+            }
+        }
+    }
+}
+
+/// `get` with several block ids (or `--out-dir`): the relays are asked in order for the blocks
+/// still missing. A relay whose `/info` says `read_api >= 2` gets batches of 256 identifiers
+/// (`POST /sbtp/v1/blocks`, ADR 0051); every other relay, or one whose `/info` fails, gets one
+/// `GET /sbtp/v1/block` per block, as with one id. Each block is checked against the id asked
+/// (R1) and fully validated, whatever relay served it. The blocks fetched are printed (and written
+/// to `--out-dir`); the command fails if one is missing.
+fn get_many(p: &Parsed, relays: &[Relay], ids: &[BlockId], difficulty: u32) -> Result<(), Fail> {
+    if p.value("out").is_some() || p.value("payload-out").is_some() {
+        return Err(Fail::usage(
+            "with several block ids, give `--out-dir <DIR>` (one <BLOCK_ID>.sbtp file per block); \
+             `--out` and `--payload-out` take one block",
+        ));
+    }
+    let mut wanted: Vec<Wanted> = ids
+        .iter()
+        .map(|id| Wanted {
+            id: *id,
+            bytes: None,
+            refused: None,
+            tried: Vec::new(),
+            invalid: false,
+        })
+        .collect();
+    for relay in relays {
+        let pending: Vec<usize> = (0..wanted.len())
+            .filter(|i| wanted.get(*i).is_some_and(Wanted::pending))
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        // ADR 0051 rule 31: a batch only to a relay that announces read_api 2.
+        let batch = relay.info().is_ok_and(|i| i.read_api >= READ_API);
+        if batch {
+            batch_from(relay, &mut wanted, &pending, difficulty);
+        } else {
+            for i in pending {
+                let Some(w) = wanted.get_mut(i) else { continue };
+                match relay.get_block(&w.id) {
+                    Ok(bytes) => w.receive(relay, bytes, difficulty),
+                    Err(f) => w.tried.push(f.message),
+                }
+            }
+        }
+        let served = wanted.iter().filter(|w| w.bytes.is_some()).count();
+        if relays.len() > 1 {
+            eprintln!(
+                "Relay {} asked ({}); {served} of {} block(s) fetched so far.",
+                relay.base(),
+                if batch {
+                    "POST /sbtp/v1/blocks"
+                } else {
+                    "GET /sbtp/v1/block"
+                },
+                wanted.len()
+            );
+        }
+    }
+
+    let fetched: Vec<(&BlockId, &[u8])> = wanted
+        .iter()
+        .filter_map(|w| w.bytes.as_deref().map(|b| (&w.id, b)))
+        .collect();
+    if let Some(dir) = p.path("out-dir") {
+        let paths: Vec<std::path::PathBuf> = fetched
+            .iter()
+            .map(|(id, _)| dir.join(format!("{id}.sbtp")))
+            .collect();
+        let files: Vec<(&Path, &[u8])> = paths
+            .iter()
+            .zip(&fetched)
+            .map(|(path, (_, b))| (path.as_path(), *b))
+            .collect();
+        output::write_all(&files, p.switch("force"))?;
+        eprintln!("{} block(s) written to {}.", files.len(), dir.display());
+    }
+    for (n, (id, bytes)) in fetched.iter().enumerate() {
+        if n > 0 {
+            println!();
+        }
+        if let Ok(v) = validate_requested(bytes, difficulty, id) {
+            print_summary(v.block(), v.block_id(), difficulty);
+        }
+    }
+    let missing: Vec<&Wanted> = wanted.iter().filter(|w| w.bytes.is_none()).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!(
+        "{} of {} block(s) not fetched:",
+        missing.len(),
+        wanted.len()
+    );
+    for w in &missing {
+        let _ = write!(message, "\n- {}:", w.id);
+        if let Some(f) = &w.refused {
+            let _ = write!(message, "\n  {}", f.message.replace('\n', "\n  "));
+        }
+        for t in &w.tried {
+            let _ = write!(message, "\n  {}", t.replace('\n', "\n  "));
+        }
+    }
+    let code = if missing.iter().any(|w| w.invalid || w.refused.is_some()) {
+        fail::EXIT_INVALID
+    } else {
+        fail::EXIT_FAILURE
+    };
+    Err(Fail { code, message })
+}
+
+/// Asks `relay` (`read_api >= 2`) for the blocks at `pending` with `POST /sbtp/v1/blocks`, 256 at
+/// most per request. A record of length 0: not served by this relay. A prefix (ADR 0051 rule 3):
+/// the rest is asked again (each `200` holds at least one record, so this ends). A failed request,
+/// a body over 1 MiB, a record above `MAX_BLOCK_LEN` or a body ending inside a record ends this
+/// relay: the blocks not answered go to the next one; complete records before a truncation are used.
+fn batch_from(relay: &Relay, wanted: &mut [Wanted], pending: &[usize], difficulty: u32) {
+    for chunk in pending.chunks(MAX_BATCH_IDS) {
+        let mut rest: &[usize] = chunk;
+        while !rest.is_empty() {
+            let ask: Vec<BlockId> = rest
+                .iter()
+                .filter_map(|i| wanted.get(*i).map(|w| w.id))
+                .collect();
+            let failed = |wanted: &mut [Wanted], rest: &[usize], why: &str| {
+                for i in rest {
+                    if let Some(w) = wanted.get_mut(*i) {
+                        w.tried.push(why.to_owned());
+                    }
+                }
+            };
+            match relay.post_blocks(&ask) {
+                Err(f) => {
+                    failed(wanted, rest, &f.message);
+                    return;
+                }
+                Ok(batch) => {
+                    let n = batch.records.len();
+                    for (i, record) in rest.iter().zip(batch.records) {
+                        let Some(w) = wanted.get_mut(*i) else {
+                            continue;
+                        };
+                        match record {
+                            None => w.tried.push(format!(
+                                "relay {} does not serve it (length 0 in POST /sbtp/v1/blocks); \
+                                 it may have evicted it",
+                                relay.base()
+                            )),
+                            Some(bytes) => w.receive(relay, bytes, difficulty),
+                        }
+                    }
+                    rest = rest.get(n..).unwrap_or_default();
+                    if batch.truncated {
+                        failed(
+                            wanted,
+                            rest,
+                            &format!(
+                                "relay {} sent a POST /sbtp/v1/blocks body that ends inside a \
+                                 record (a failed request)",
+                                relay.base()
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn invalid_from_relay(relay: &Relay, id: &BlockId, e: &sbtp_core::Error) -> Fail {
     Fail::invalid(format!(
         "relay {} sent an invalid block for {id}: {} ({e}); nothing written",
@@ -503,18 +736,73 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
         args,
         &[
             ("relay", Kind::Repeated),
-            ("parent", Kind::Value),
+            ("parent", Kind::Repeated),
             ("since", Kind::Value),
             ("limit", Kind::Value),
             ("cursor", Kind::Repeated),
             ("follow", Kind::Switch),
             ("interval", Kind::Value),
+            ("desc", Kind::Switch),
+            ("fields", Kind::Value),
         ],
     )?;
     p.positionals(0, "")?;
     let relays = required_relays(&p)?;
-    let filter = query_filter(&p)?;
-    let cursors = query_cursors(&p, &relays)?;
+    let parents = query_parents(&p, relays.len())?;
+    let filter = query_options(&p, &parents)?;
+    if parents.len() > 1 {
+        return query_grouped(&relays, &parents, &filter);
+    }
+    query_walk(&p, &relays, &filter)
+}
+
+/// The filter of `query`, after the checks of the options of ADR 0051 (`--desc`, `--fields`,
+/// several `--parent`) against each other and against `--follow` and `--cursor`. With several
+/// parents the filter has no `parent`: they are listed by [`query_grouped`].
+fn query_options(p: &Parsed, parents: &[(BlockId, Option<String>)]) -> Result<Filter, Fail> {
+    let desc = p.switch("desc");
+    let fields = match p.text("fields")? {
+        None => false,
+        Some("parents") => true,
+        Some(other) => {
+            return Err(Fail::usage(format!(
+                "`--fields {}`: the only value is `parents`",
+                untrusted(other, 40)
+            )));
+        }
+    };
+    if fields && !parents.is_empty() {
+        return Err(Fail::usage(
+            "`--fields parents` lists relay-wide only: it is not combined with `--parent` (ADR \
+             0051 rule 14)",
+        ));
+    }
+    if p.switch("follow") && (desc || parents.len() > 1) {
+        return Err(Fail::usage(
+            "`--follow` polls one ascending listing: it is not combined with `--desc` or several \
+             `--parent`. Poll later with the `head` printed (`--cursor <HEAD>`)",
+        ));
+    }
+    if parents.len() > 1 {
+        if !p.values("cursor").is_empty() {
+            return Err(Fail::usage(
+                "with several `--parent`, give each parent's cursor as `--parent <ID>.<CURSOR>`, \
+                 as printed by an earlier `query`",
+            ));
+        }
+        return query_filter(p, None, desc, false);
+    }
+    if let Some((_, Some(_))) = parents.first() {
+        return Err(Fail::usage(
+            "`--parent <ID>.<CURSOR>` is for several parents; with one, give `--cursor <CURSOR>`",
+        ));
+    }
+    query_filter(p, parents.first().map(|(id, _)| *id), desc, fields)
+}
+
+/// `query` with at most one `--parent`: one walk per relay, each with its own cursor.
+fn query_walk(p: &Parsed, relays: &[Relay], filter: &Filter) -> Result<(), Fail> {
+    let cursors = query_cursors(p, relays)?;
     let follow = p.switch("follow");
     let interval = match p.number::<u64>("interval")? {
         Some(_) if !follow => return Err(Fail::usage("`--interval` needs `--follow`")),
@@ -547,6 +835,9 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
     // 2026-11-21, M-1). The command ends when every relay is retired.
     let mut retired = vec![false; relays.len()];
     let mut retired_failures = Vec::new();
+    if filter.needs_read_api() {
+        retire_without_read_api(relays, &mut retired, &mut retired_failures)?;
+    }
     let mut first = true;
     loop {
         let mut failures = Vec::new();
@@ -572,7 +863,7 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
                 Ok(_) => {}
                 Err(fail) if printed.as_ref().is_some_and(|p| p.full) => {
                     // The bound over all relays: the whole command stops, with every cursor.
-                    print_cursors(&relays, &walkers, false);
+                    print_cursors(relays, &walkers, false);
                     return Err(fail);
                 }
                 Err(mut fail) => {
@@ -593,7 +884,7 @@ pub fn query(args: &[OsString]) -> Result<(), Fail> {
         }
         warn_all(&failures);
         if first {
-            print_cursors(&relays, &walkers, follow);
+            print_cursors(relays, &walkers, follow);
             first = false;
         }
         if !follow {
@@ -679,13 +970,32 @@ impl Printed {
 
 /// The cursors to resume from, on standard error. With several relays each is tied to its relay:
 /// `<RELAY_URL>=<CURSOR>`, so that a cursor is never sent to a relay that did not issue it.
+///
+/// With `--desc` (ADR 0051 rules 16 to 19) the cursor continues the newest-first listing further
+/// back (with `--desc --cursor`), and `head` is printed too: an ascending poll from it lists
+/// exactly the blocks stored since the walk began, so it is the one offered for polling.
 fn print_cursors(relays: &[Relay], walkers: &[Walker<&Relay>], follow: bool) {
+    let poll_from = |w: &Walker<&Relay>| -> Option<String> {
+        if w.is_desc() {
+            w.head().map(str::to_owned)
+        } else {
+            w.cursor().map(str::to_owned)
+        }
+    };
     if let [_] = relays {
-        if let Some(c) = walkers.first().and_then(Walker::cursor) {
+        let Some(walker) = walkers.first() else {
+            return;
+        };
+        if let Some(c) = walker.cursor() {
             eprintln!("cursor: {c}");
-            if !follow {
-                eprintln!("Poll for blocks stored since with `--cursor {c}`.");
-            }
+        }
+        if walker.is_desc()
+            && let Some(h) = walker.head()
+        {
+            eprintln!("head: {h}");
+        }
+        if let (Some(c), false) = (poll_from(walker), follow) {
+            eprintln!("Poll for blocks stored since with `--cursor {c}`.");
         }
         return;
     }
@@ -693,6 +1003,13 @@ fn print_cursors(relays: &[Relay], walkers: &[Walker<&Relay>], follow: bool) {
     for (relay, walker) in relays.iter().zip(walkers) {
         if let Some(c) = walker.cursor() {
             eprintln!("cursor: {}={c}", relay.base());
+        }
+        if walker.is_desc()
+            && let Some(h) = walker.head()
+        {
+            eprintln!("head: {}={h}", relay.base());
+        }
+        if let Some(c) = poll_from(walker) {
             resume.push(format!("--cursor {}={c}", relay.base()));
         }
     }
@@ -702,6 +1019,311 @@ fn print_cursors(relays: &[Relay], walkers: &[Walker<&Relay>], follow: bool) {
             resume.join(" ")
         );
     }
+}
+
+/// `query --parent` given 2 to 32 times (ADR 0051 rules 21 to 29), on each relay in turn.
+///
+/// - A relay whose `/info` says `read_api >= 2`: grouped requests, each parent with its own
+///   cursor (`--parent <ID>.<CURSOR>`), until every listing ends with `more = false`.
+/// - Any other relay: one plain walk per parent, as before; `--desc` cannot be honoured there and
+///   the relay is skipped with a warning.
+///
+/// Standard output: `<PARENT> <CHILD>`, one per line, each pair once over all relays. Standard
+/// error: per parent, whether its listing is complete on that relay (rule 28; only a complete
+/// listing says that a block is absent, rule 29) and its cursor as `cursor: <ID>.<CURSOR>`; then
+/// `head` for the grouped relays.
+fn query_grouped(
+    relays: &[Relay],
+    parents: &[(BlockId, Option<String>)],
+    filter: &Filter,
+) -> Result<(), Fail> {
+    let several = relays.len() > 1;
+    let policy = Policy {
+        max_seen: (walk::MAX_SEEN / relays.len()).max(1),
+        ..Policy::default()
+    };
+    let mut printed: HashSet<(BlockId, BlockId)> = HashSet::new();
+    let mut failures = Vec::new();
+    let mut served = 0usize;
+    for relay in relays {
+        let grouped = match relay.info() {
+            Ok(info) => info.read_api >= READ_API,
+            Err(f) => {
+                failures.push(f);
+                continue;
+            }
+        };
+        if !grouped && filter.desc {
+            failures.push(read_api_fail(relay, "`--desc`"));
+            continue;
+        }
+        let mut closed = false;
+        let (result, listings, head) = walk_parents(
+            relay,
+            grouped,
+            parents,
+            filter,
+            policy,
+            &mut printed,
+            &mut closed,
+        );
+        if closed {
+            return Ok(());
+        }
+        print_listings(relay, several, &listings, head.as_deref());
+        match result {
+            Ok(()) => served = served.saturating_add(1),
+            Err(f) => failures.push(f),
+        }
+    }
+    if served == 0 {
+        return Err(all_failed("the listing failed", failures));
+    }
+    warn_all(&failures);
+    if !several {
+        eprintln!(
+            "Continue each listing with the `--parent <ID>.<CURSOR>` values above; poll for new \
+             children of every parent with `--parent <ID>.<HEAD>`."
+        );
+    }
+    Ok(())
+}
+
+/// The listing of one parent on one relay, for the summary of `query` with several `--parent`.
+struct ParentSummary {
+    parent: BlockId,
+    cursor: Option<String>,
+    complete: bool,
+    emitted: u64,
+}
+
+/// Prints `<PARENT> <CHILD>` once per run (`printed`, bounded by `MAX_SEEN` pairs).
+fn print_pair(
+    printed: &mut HashSet<(BlockId, BlockId)>,
+    parent: &BlockId,
+    id: &BlockId,
+    closed: &mut bool,
+) -> Result<(), Fail> {
+    if printed.contains(&(*parent, *id)) {
+        return Ok(());
+    }
+    if printed.len() >= walk::MAX_SEEN {
+        return Err(Fail::failed(format!(
+            "more than {} distinct parent and child pairs in one run",
+            walk::MAX_SEEN
+        )));
+    }
+    printed.insert((*parent, *id));
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{parent} {id}")
+        .and_then(|()| out.flush())
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                *closed = true;
+            }
+            Fail::failed(format!("cannot write to standard output: {e}"))
+        })
+}
+
+/// Lists `parents` on `relay`: grouped requests when it has the read API (`grouped`), else one
+/// plain ascending walk per parent, exactly as with one parent. Returns the outcome, one summary
+/// per parent reached, and the grouped walk's `head`.
+fn walk_parents(
+    relay: &Relay,
+    grouped: bool,
+    parents: &[(BlockId, Option<String>)],
+    filter: &Filter,
+    policy: Policy,
+    printed: &mut HashSet<(BlockId, BlockId)>,
+    closed: &mut bool,
+) -> (Result<(), Fail>, Vec<ParentSummary>, Option<String>) {
+    if grouped {
+        let mut gw = walk::GroupWalker::new(relay, filter.clone(), parents.to_vec(), policy);
+        let r = gw.walk(
+            &mut std::thread::sleep,
+            &mut walk::jitter_source,
+            &mut |event| match event {
+                walk::GroupEvent::Child { parent, id } => print_pair(printed, parent, id, closed),
+                walk::GroupEvent::Restart => {
+                    eprintln!(
+                        "Relay {} no longer recognises the cursors (InvalidCursor): listing every \
+                         parent again from the start.",
+                        relay.base()
+                    );
+                    Ok(())
+                }
+                walk::GroupEvent::Wait { status, delay, .. } => {
+                    eprintln!(
+                        "Relay {} answered {status}; retrying in {:.1} s.",
+                        relay.base(),
+                        delay.as_secs_f64()
+                    );
+                    Ok(())
+                }
+            },
+        );
+        let listings = gw
+            .listings()
+            .iter()
+            .map(|l| ParentSummary {
+                parent: l.parent,
+                cursor: l.cursor.clone(),
+                complete: l.complete,
+                emitted: l.emitted,
+            })
+            .collect();
+        return (r.map(|_| ()), listings, gw.head().map(str::to_owned));
+    }
+    let mut listings = Vec::new();
+    for (parent, cursor) in parents {
+        let single = Filter {
+            parent: Some(*parent),
+            ..filter.clone()
+        };
+        let mut walker = Walker::new(relay, single, cursor.clone(), policy);
+        let mut emitted = 0u64;
+        let w = walker.walk(
+            &mut std::thread::sleep,
+            &mut walk::jitter_source,
+            &mut |event| match event {
+                Event::Id(id, _) => {
+                    emitted = emitted.saturating_add(1);
+                    print_pair(printed, parent, id, closed)
+                }
+                other => on_walk_event(relay, other, None, closed),
+            },
+        );
+        listings.push(ParentSummary {
+            parent: *parent,
+            cursor: walker.cursor().map(str::to_owned),
+            complete: w.is_ok(),
+            emitted,
+        });
+        if let Err(f) = w {
+            return (Err(f), listings, None);
+        }
+    }
+    (Ok(()), listings, None)
+}
+
+/// Per parent: its count, whether its listing is complete (ADR 0051 rule 28) and its cursor as
+/// `<ID>.<CURSOR>`; then `head`. Prefixed by the relay with several relays.
+fn print_listings(relay: &Relay, several: bool, listings: &[ParentSummary], head: Option<&str>) {
+    let (from, tag) = if several {
+        (
+            format!("relay {}: ", relay.base()),
+            format!("{}=", relay.base()),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    for l in listings {
+        let state = if l.complete {
+            "complete"
+        } else {
+            "INCOMPLETE: do not derive the absence of a block from it"
+        };
+        eprintln!(
+            "{from}parent {}: {} child(ren), {state}.",
+            l.parent, l.emitted
+        );
+        if let Some(c) = &l.cursor {
+            eprintln!("cursor: {tag}{}.{c}", l.parent);
+        }
+    }
+    if let Some(h) = head {
+        eprintln!("head: {tag}{h}");
+    }
+}
+
+/// ADR 0051 rule 31: `order` and `fields` go only to a relay that announces `read_api` 2. Any other
+/// relay is retired from this run, with a warning; the command fails when none is left.
+fn retire_without_read_api(
+    relays: &[Relay],
+    retired: &mut [bool],
+    retired_failures: &mut Vec<Fail>,
+) -> Result<(), Fail> {
+    let mut skipped = Vec::new();
+    for (i, relay) in relays.iter().enumerate() {
+        if let Err(fail) = require_read_api(relay, "`--desc` and `--fields`") {
+            if let Some(r) = retired.get_mut(i) {
+                *r = true;
+            }
+            skipped.push(Fail {
+                code: fail.code,
+                message: fail.message.clone(),
+            });
+            retired_failures.push(fail);
+        }
+    }
+    if retired.iter().all(|r| *r) {
+        return Err(all_failed(
+            "the listing failed",
+            std::mem::take(retired_failures),
+        ));
+    }
+    warn_all(&skipped);
+    Ok(())
+}
+
+/// The failure for a relay that does not announce `read_api >= 2` (ADR 0051 rule 31).
+fn read_api_fail(relay: &Relay, what: &str) -> Fail {
+    Fail::refused(format!(
+        "relay {} does not announce read_api 2 in /sbtp/v1/info (ADR 0051): {what} need it; \
+         not asked",
+        relay.base()
+    ))
+}
+
+/// `Ok` when `relay`'s `/info` says `read_api >= 2`; the failure otherwise.
+fn require_read_api(relay: &Relay, what: &str) -> Result<(), Fail> {
+    if relay.info()?.read_api >= READ_API {
+        Ok(())
+    } else {
+        Err(read_api_fail(relay, what))
+    }
+}
+
+/// The `--parent` values of `query`: 1 to 32 distinct block ids, each `<ID>` or `<ID>.<CURSOR>`
+/// (ADR 0051 rule 21). A per-parent cursor is only accepted with one relay: a cursor belongs to
+/// the relay that issued it.
+fn query_parents(p: &Parsed, relays: usize) -> Result<Vec<(BlockId, Option<String>)>, Fail> {
+    let values = p.values("parent");
+    if values.len() > walk::MAX_PARENTS {
+        return Err(Fail::usage(format!(
+            "{} `--parent` given; one request takes at most {} (ADR 0051 rule 21)",
+            values.len(),
+            walk::MAX_PARENTS
+        )));
+    }
+    let mut out: Vec<(BlockId, Option<String>)> = Vec::new();
+    for v in values {
+        let t = v
+            .to_str()
+            .ok_or_else(|| Fail::usage("`--parent`: the value is not UTF-8"))?;
+        let (id_text, cursor) = match t.split_once('.') {
+            Some((i, c)) => (i, Some(checked_cursor(c)?.to_owned())),
+            None => (t, None),
+        };
+        let id = hex::block_id(id_text).ok_or_else(|| {
+            Fail::usage(format!(
+                "`--parent {}`: expected a block_id of 64 hexadecimal characters, optionally \
+                 followed by `.<CURSOR>`",
+                untrusted(t, 80)
+            ))
+        })?;
+        if out.iter().any(|(o, _)| *o == id) {
+            return Err(Fail::usage(format!("`--parent {id}` given twice")));
+        }
+        if cursor.is_some() && relays > 1 {
+            return Err(Fail::usage(
+                "`--parent <ID>.<CURSOR>` takes one relay: a cursor is only valid on the relay \
+                 that issued it",
+            ));
+        }
+        out.push((id, cursor));
+    }
+    Ok(out)
 }
 
 /// The starting cursor of each relay, in the order of `relays`. With one relay `--cursor <C>` (at
@@ -770,18 +1392,12 @@ fn checked_cursor(c: &str) -> Result<&str, Fail> {
 }
 
 /// The filters of `query`, checked.
-fn query_filter(p: &Parsed) -> Result<Filter, Fail> {
-    let parent = p
-        .text("parent")?
-        .map(|t| {
-            hex::block_id(t).ok_or_else(|| {
-                Fail::usage(format!(
-                    "`--parent {}`: expected a block_id of 64 hexadecimal characters",
-                    untrusted(t, 80)
-                ))
-            })
-        })
-        .transpose()?;
+fn query_filter(
+    p: &Parsed,
+    parent: Option<BlockId>,
+    desc: bool,
+    fields: bool,
+) -> Result<Filter, Fail> {
     let since = p.number::<u64>("since")?;
     let limit = p.number::<u32>("limit")?;
     if limit == Some(0) {
@@ -791,6 +1407,8 @@ fn query_filter(p: &Parsed) -> Result<Filter, Fail> {
         parent,
         since,
         limit,
+        desc,
+        fields,
     })
 }
 
@@ -803,15 +1421,24 @@ fn on_walk_event(
     closed: &mut bool,
 ) -> Result<(), Fail> {
     match event {
-        Event::Id(id) => {
+        Event::Id(id, hint) => {
             // spec §4 `/query`: a client MUST deduplicate by block_id, over every relay it reads.
             if let Some(set) = printed
                 && !set.admit(id)?
             {
                 return Ok(());
             }
+            // `fields=parents` (ADR 0051 rule 13): the length and parents from the relay's
+            // index, hints only until the block is fetched and verified.
+            let line = match hint {
+                None => id.to_string(),
+                Some(h) => {
+                    let parents: Vec<String> = h.parents.iter().map(BlockId::to_string).collect();
+                    format!("{id} len={} parents={}", h.len, parents.join(","))
+                }
+            };
             let mut out = std::io::stdout().lock();
-            writeln!(out, "{id}")
+            writeln!(out, "{line}")
                 .and_then(|()| out.flush())
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
