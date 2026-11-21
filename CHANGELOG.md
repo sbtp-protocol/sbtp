@@ -52,6 +52,11 @@ Initial public version. Pre-release software: no version is supported for produc
   (single-shot, X25519/HKDF-SHA256/ChaCha20Poly1305), padding to the fixed buckets, strict inner
   signature, directory and application tags; `no_std` + `alloc`, `wasm32`. Security review:
   `docs/security/2026-11-21-sbtp-seal.md` (mergeable; L-2 fixed, other low and info findings tracked).
+- `sbtp-relay`: operator deny list (ADR 0052, clarifications L1-L3): `deny_file` reloaded on `SIGHUP` or change
+  (an invalid file keeps the previous list), `451` `Denied` / `DeniedKey` with `no-store`, empty batch
+  records, filtered `/query`, key marking pass, `hide` / `purge`, `/info` `deny_list`; replication and the
+  archive copy skip denied blocks. Security review: `docs/security/2026-11-21-relay-deny-list.md`
+  (mergeable; M-1 fixed in `deploy/README.md`, low findings tracked).
 - `sbtp-relay`: archive copy to S3-compatible object storage (ADR 0050 stage 1, `object-store` feature,
   off by default): conditional `PUT` (`If-None-Match: *`) under `sbtp/v1/block/{id}`, never deletes,
   durable cursor with a window of 256 positions, SigV4 with the `hmac` crate, a static `/info` object with
