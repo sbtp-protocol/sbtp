@@ -7,7 +7,7 @@
 - Amended by: 0052 (rule 2: a denied block is a `length = 0` record; such a record alone never triggers
   a re-submission); 0052 clarification L1, accepted 2026-11-21 (clarification B4: a page whose entries were all denied
   returns the cursor of the entries it read, not the gap it started from)
-- Clarification B10, proposed (2026-11-21), raised by the first TypeScript client (ADR 0053
+- Clarification B10, accepted by the project owner on 2026-11-21, raised by the first TypeScript client (ADR 0053
   clarification S15): a page with no identifier and `more = true` never returns the cursor it was
   asked from; a client MAY treat one that does as a relay fault
 - Date: 2026-11-21
@@ -572,7 +572,7 @@ Spec change (applied with these clarifications): core spec §4, `POST /sbtp/v1/b
 B9), `/query` (B4, B8), "Admission control" (B2, B6). ADR 0019 and ADR 0021 get an "Amended by" entry;
 the ADR 0018 entry for 0051 gains rule 22.
 
-## Clarification B10 (2026-11-21, proposed)
+## Clarification B10 (2026-11-21, accepted by the project owner on 2026-11-21)
 
 Raised by the first TypeScript client (ADR 0053 clarification S15). It strengthens the wording "so
 that a walk always advances" of ADR 0052 clarification L1 and fixes the client's reaction.
@@ -591,8 +591,8 @@ that a walk always advances" of ADR 0052 clarification L1 and fixes the client's
   from one that makes progress through denied or expired entries, and a walk bounded only by pages
   could spend its whole bound on one cursor.
 
-Spec change on acceptance: core spec §4, `GET /sbtp/v1/query`, after the bullet that ends "so that a
-walk always advances. (ADR 0052, clarification L1)":
+Spec change, applied on acceptance (2026-11-21): core spec §4, `GET /sbtp/v1/query`, after the bullet
+that ends "so that a walk always advances. (ADR 0052, clarification L1)":
 
 > - A relay MUST NOT answer a request that carried a cursor for a listing with a page of that listing
 >   that holds no identifier, has `more = true` and returns the same cursor. A client MAY treat such a

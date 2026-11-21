@@ -1,7 +1,6 @@
 # 0055: Sealing with an external signer
 
-- Status: proposed (2026-11-21). Clarifications E1 to E4 are proposed on their own, for the project
-  owner to accept one by one
+- Status: accepted (by the project owner, 2026-11-21), as a whole: E1 to E4 as proposed
 - Date: 2026-11-21
 - Questions: none
 - Clarifies: `l2-grammar.md` §5.2 (ephemeral signer) and §5.3 (inner signature), from ADR 0016; extends
@@ -103,6 +102,8 @@ choice (ADR 0002, "Security").
 - **Compatibility.** No wire change. A sealed block made before this ADR is valid.
 
 ## Spec change on acceptance
+
+Applied on acceptance (2026-11-21).
 
 `l2-grammar.md` §5.3, the sentence "Implementations expose this message through a typed builder only,
 never a generic signature of arbitrary bytes." is replaced by (E1):

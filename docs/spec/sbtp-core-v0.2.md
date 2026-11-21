@@ -151,7 +151,8 @@ of the Version field MUST define new strings. (ADR 0002)
   verification MUST NOT be used to validate a block.
 - A sender SHOULD sign deterministically (RFC 8032 §5.1.6) and SHOULD NOT publish two different signatures
   for the same `block_id`. A layer MUST NOT make any state depend on the signature bytes (sorting, random
-  selection, deduplication). (ADR 0003)
+  selection, deduplication). (ADR 0003) A sender whose signature is made outside the implementation
+  SHOULD verify it with V1 to V6 before it publishes the block. (ADR 0055)
 
 ### 3.3 Proof of work (anti-spam)
 
@@ -221,6 +222,9 @@ the strict verification of §3.2, only the holder of the private key can produce
   `block_id` and is well-formed like any parent (§2.2); relays treat it as any parent.
 - A signature prefix MUST NOT be a prefix of another. A published string never changes and is never reused.
   (ADR 0002)
+- An SBTP key MUST NOT sign a message that starts with a signature prefix of this table and was not
+  built for that prefix's use. A signer outside the implementation receives only such built
+  messages. (ADR 0002, ADR 0055)
 
 ## 4. Dumb relay interface (HTTP)
 
@@ -357,10 +361,13 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - `min_pow_difficulty`: integer from 0 to 256, the difficulty `d` of check C1 (§3.3).
 - `max_future_ms`: integer, in milliseconds. The relay rejects a submitted block whose Timestamp is greater
   than its clock plus this value (P1). Default: 300,000.
-- `block_versions`: array of the Version field values the relay accepts (F4).
+- `block_versions`: array of the Version field values the relay accepts (F4). A client MUST read
+  an absent member as `[1]`. (ADR 0053, clarification S2)
 - `max_query_limit`: integer from 1 to 1,000, the largest page of `/query`.
 - `block_ttl_ms`: integer in milliseconds, or `null` when the relay does not evict by age. A relay never
-  publishes `0`.
+  publishes `0`. A client reads an absent member as unknown: it does not classify the relay as an
+  archive relay (ADR 0048) and has no age-based re-submission schedule for it. (ADR 0053,
+  clarification S14)
 - `demand_eviction`: boolean; `true` when the relay evicts the blocks requested least recently once
   its store is near full (`architecture.md` §2, "Eviction"). A client MUST read an absent member as
   `false`. (ADR 0046)
@@ -372,7 +379,10 @@ path prefix. The routes of this section are under it. (ADR 0030)
   parameters `order`, `fields` and repeated `parent` with the `head` member. A client MUST read an
   absent member as `1`, and MUST NOT send `POST /blocks`, `order`, `fields`, a repeated `parent` or a
   per-parent cursor to a relay without `read_api` ≥ 2. The bounds of these routes (256 identifiers,
-  1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051)
+  1,048,576 bytes, 32 parents, 200 entries with `fields`) are fixed by the protocol. (ADR 0051) A
+  `404`, `405` or `501`, or a `400` (`InvalidParameter`), to one of these forms makes the client read
+  `/info` again before it sends that form to that relay again; if `/info` still announces it, the
+  refusal is a failed request (see "Client bounds"). (ADR 0053, clarification S1)
 - `deny_list`: boolean; `true` when the relay applies a deny list of its operator, whatever its
   entries. A relay without a deny list omits the member. A client MUST read an absent member as
   `false`. (ADR 0052, clarification L2)
@@ -387,7 +397,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
   hint) chosen by its operator. It is a hint. A client reads an absent member as an empty list and
   does not send the user's own traffic to a listed relay unless the user chose it. (ADR 0048)
 - A client MUST accept the absence of any member other than `min_pow_difficulty` and `max_future_ms`.
-  (ADR 0007, ADR 0012)
+  (ADR 0007, ADR 0012) A member it uses that is outside its type or range is read as absent.
+  (ADR 0029, ADR 0053, clarification S13)
 - A relay MAY add members; the body is at most 16,384 bytes. A client MUST ignore members it does not
   know. A relay MAY change its settings at any time. A sender SHOULD read `/info` before mining.
   (ADR 0007, ADR 0029)
@@ -444,9 +455,11 @@ path prefix. The routes of this section are under it. (ADR 0030)
   block MUST use only complete listings, MUST NOT present a listing that ended with `more = true` as
   complete, and keeps `head` to poll the shown parents. (ADR 0051)
 - Over several relays, a listing is complete only when every relay of the client's list was asked and
-  returned a complete listing. A relay skipped because it lacks `read_api` ≥ 2 counts as not asked. A
-  client that merges `fields` hints from several relays MUST take, for each `block_id`, the union of
-  the parents they list: a hint can only add a fetch. (ADR 0051, clarification B8)
+  returned a complete listing. A relay without `read_api` ≥ 2 is asked in the form it supports (one
+  `parent` per request, `asc`, no `fields`); its identifiers then carry no hints. A relay skipped
+  instead counts as not asked. A client that merges `fields` hints from several relays MUST take, for
+  each `block_id`, the union of the parents they list: a hint can only add a fetch. (ADR 0051,
+  clarification B8; ADR 0053, clarification S3)
 - A request with no match gets `200` and an empty `block_ids`, an unknown `parent` included. A relay MUST
   NOT answer `404`.
 - A relay MUST NOT list a block it denies by `block_id`. A block denied by its public key MAY be
@@ -454,6 +467,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
   identifiers, and `more` MAY be `true` when only denied blocks remain. A page whose entries were all
   denied returns the cursor of the entries it read (with `desc`, the gap before the oldest), not the
   gap it started from, so that a walk always advances. (ADR 0052, clarification L1)
+- A relay MUST NOT answer a request that carried a cursor for a listing with a page of that listing
+  that holds no identifier, has `more = true` and returns the same cursor. A client MAY treat such a
+  page as a fault of that relay: the listing ends incomplete there. (ADR 0051, clarification B10)
 - To read all children of a block, a client repeats the request with the returned `cursor` until `more`
   is `false`. Repeating it later returns the children stored since. A client MUST deduplicate by
   `block_id` and MUST fetch and validate each block (§3.4); the fetch can return `404`.
@@ -614,7 +630,9 @@ path prefix. The routes of this section are under it. (ADR 0030)
   connection bound. Its client key is the one of its upgrade request. (ADR 0054)
 - A client MUST NOT repeat the request before `Retry-After` has elapsed. Without the header, it SHOULD
   back off exponentially with jitter, starting at 1 second. After `408` or a closed connection it MAY
-  retry once at once, then backs off. Every request of this interface is safe to repeat (`PUT` is
+  retry once at once, then backs off. A closed connection is one the relay or the network closed
+  before the response was complete; the expiry of the client's own time limit is a failed request,
+  followed by back-off. (ADR 0053, clarification S6) Every request of this interface is safe to repeat (`PUT` is
   idempotent). A `Retry-After` that is not a number of seconds gives no delay: the client backs off as
   without it, or gives up the operation on that relay. A client MAY give up on a relay whose
   `Retry-After` exceeds its maximum wait; it still does not repeat the request to it earlier. (ADR 0029)
@@ -637,7 +655,8 @@ path prefix. The routes of this section are under it. (ADR 0030)
 - Every request has a total time limit that covers the whole body.
 - A `/query` response is a failed request when it is not the object defined under `GET /sbtp/v1/query`, holds more
   identifiers than the `limit` sent (per parent in a grouped response), or holds a malformed identifier or cursor. None of its
-  identifiers is used.
+  identifiers is used. A duplicate identifier is not a failure: the client deduplicates it. (ADR 0029,
+  ADR 0053, clarification S5)
 - A client MUST bound the pages or identifiers of one walk, the blocks it fetches from hints, the
   blocks visited in one DAG traversal (each `block_id` at most once) and the blocks it keeps in
   memory and in local storage. At a bound it stops and keeps what it has validated; this is not an
@@ -657,6 +676,12 @@ path prefix. The routes of this section are under it. (ADR 0030)
   attempts to it over at least a bounded time; when a bounded time has passed since the block's first
   acknowledgement; or when the user removes it from the list. A request not sent because of a
   back-off is not an attempt. The bounds are client settings. (ADR 0047)
+- Every `5xx` answer to a `PUT` is transient: the relay stays pending, within the bounds above.
+  (ADR 0047, amendment D2)
+- A `read_only` URL is not a target of publication and is never pending. A relay whose
+  `min_pow_difficulty` the block's `block_id` does not meet, or whose `block_versions` lacks the
+  block's Version, stops being pending without a request: the answer would be a final refusal. A
+  failed `/info` request made before a `PUT` counts as an attempt. (ADR 0047, amendment D3)
 - A relay added to the list is pending for every block protected at that moment. Acknowledgements
   by a relay removed from the list no longer count. (ADR 0047)
 - An `/info` response whose `min_pow_difficulty` is not an integer from 0 to 256, or whose

@@ -361,7 +361,9 @@ the envelope through the tags it defines (§5.4).
 - **Ephemeral signer.** The PubKey MUST be a fresh Ed25519 key from a secure random source, used for this
   block only. The sender SHOULD erase its private key after signing, and MUST NOT use its identity key,
   an encryption key or another sealed block's key. A recipient MUST ignore a sealed block whose PubKey
-  equals the `from` of its plaintext.
+  equals the `from` of its plaintext. The key signs exactly one `block_id`. A sender that seals again,
+  after a failure or for any other reason, draws a new key; submitting the same block bytes again is
+  not a new use. (ADR 0055)
 - **Length buckets.** Payload Len MUST be 512, 2,048, 8,192 or 65,535 bytes. The payload is 90 bytes plus
   the ciphertext, and the ciphertext is the plaintext plus 16 bytes: plaintexts are 406, 1,942, 8,086 or
   65,429 bytes. Sealed blocks are 662 to 65,685 bytes.
@@ -384,8 +386,13 @@ the envelope through the tags it defines (§5.4).
   `recipient_id` is fixed by the application that defines the tag (§5.4), for example the recipient's
   identity key, or the `block_id` of a block that names the recipient. The recipient
   builds this message with its own `recipient_id` and the key that opened the block, and verifies it
-  with criteria V1 to V6 of core spec §3.2. Implementations expose this message through a typed builder
-  only, never a generic signature of arbitrary bytes.
+  with criteria V1 to V6 of core spec §3.2. An implementation MUST build this message with a typed
+  builder from these fields, and MUST NOT offer a function that signs bytes chosen by its caller as
+  `sig`. It MAY hand exactly the built message to an external signer that holds the private key of
+  `from`. (ADR 0055)
+- A sender SHOULD check, before it asks for `sig`, that `from` passes V1 and V2 of core spec §3.2 and
+  is the key of the signer it asks. It SHOULD verify `sig` with V1 to V6 before it seals the
+  plaintext. (ADR 0055)
 - `msg` is validated as a payload in a block with 0 parents: it MUST NOT carry a causal edge. Its kind
   MUST be one that the outer tag allows (§5.4) and MUST NOT be `sbtp.enc`.
 - **Order of checks.** The first failure makes the recipient ignore the block silently, and it tells no

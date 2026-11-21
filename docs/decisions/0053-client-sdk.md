@@ -12,14 +12,14 @@
   publishes `subscribe` with a version the SDK implements and the transport allows WebSocket, polls
   otherwise and after a refused upgrade, holds at most one subscription connection per relay, and
   reports completeness the same way, ADR 0054 rule 44)
-- Clarifications: S1 to S15, proposed (2026-11-21), raised by the first TypeScript implementation:
-  `/info` re-read triggers, absent `block_versions`, `read_api` 1 fallback for `fields`, relays not
-  sent to (ADR 0047 D3), duplicates in a page, own time limit, other `5xx` (ADR 0047 D2), re-submission
-  schedule base, cut batch record, `follow` without `head`, bad `relays` member, `451` on a
-  `read_only` URL, malformed flags, absent `block_ttl_ms`, a page that does not advance (ADR 0051
-  B10); S16 to S19, proposed (2026-11-21): candidate relays serve fetches by `block_id` only, bad
-  `/.well-known/sbtp` list, no redirect of `/.well-known/sbtp`, the first 4 URI hints counted before
-  validation
+- Clarifications: S1 to S15, accepted by the project owner on 2026-11-21 and applied to the spec,
+  raised by the first TypeScript implementation: `/info` re-read triggers, absent `block_versions`,
+  `read_api` 1 fallback for `fields`, relays not sent to (ADR 0047 D3), duplicates in a page, own
+  time limit, other `5xx` (ADR 0047 D2), re-submission schedule base, cut batch record, `follow`
+  without `head`, bad `relays` member, `451` on a `read_only` URL, malformed flags, absent
+  `block_ttl_ms`, a page that does not advance (ADR 0051 B10). S16 to S19, proposed (2026-11-21):
+  candidate relays serve fetches by `block_id` only, bad `/.well-known/sbtp` list, no redirect of
+  `/.well-known/sbtp`, the first 4 URI hints counted before validation
 - Date: 2026-11-21
 - Questions: none resolved; opens Q-78 and Q-79. Refers to Q-23 (subscriptions, `follow`), Q-26
   (peer-to-peer serving) and Q-77 (snapshot format)
@@ -532,14 +532,16 @@ Applied on acceptance (2026-11-21).
 - **A two-person release rule now.** With the current maintainers it would block every release. It
   is reconsidered when maintainers are added (rule 32).
 
-## Clarifications S1 to S19 (2026-11-21, proposed)
+## Clarifications S1 to S19 (2026-11-21)
 
-Raised by the first TypeScript implementation of this ADR. Each clarification is proposed on its own,
+S1 to S15 are accepted by the project owner on 2026-11-21 and applied to the spec. S16 to S19 are proposed.
+
+Raised by the first TypeScript implementation of this ADR. Each clarification was proposed on its own,
 for the project owner to accept one by one. None changes the wire format of a block, the relay
 interface beyond the sentences quoted, or a frozen vector set. Three of them amend the rules of
 another ADR and are written there: S4 is ADR 0047 amendment D3, S7 is ADR 0047 amendment D2, S15 is
 ADR 0051 clarification B10. Spec changes are listed under "Spec change on acceptance of S1 to S15"
-and applied only for the clarifications accepted.
+and applied only for the clarifications accepted (S1 to S15: applied 2026-11-21).
 
 - **S1. When `/info` is read again (rule 5).** A failure "that may follow a settings change" is:
   - a `PUT` answered `400` with `InsufficientPow`, `UnsupportedVersion` or
@@ -696,6 +698,8 @@ and applied only for the clarifications accepted.
   conforms.
 
 ### Spec change on acceptance of S1 to S19
+
+Applied on acceptance for S1 to S15 (2026-11-21). Not applied for S16 to S19, which are proposed.
 
 Core spec §4, `GET /sbtp/v1/info`:
 

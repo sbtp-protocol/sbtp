@@ -9,7 +9,7 @@
   2 and 4: a `451` to a presence check of an acknowledged block is an availability event; delivery
   stays `acknowledged`, the relay no longer counts as holding the block, the second bound of rule 4
   does not restart)
-- Amended by: 0053, proposed (2026-11-21): amendments D2 (rule 3: every other `5xx` is transient) and
+- Amended: 2026-11-21, accepted by the project owner on 2026-11-21 (raised by ADR 0053 S4 and S7): amendments D2 (rule 3: every other `5xx` is transient) and
   D3 (rules 2, 3 and 7: a `read_only` URL is not a publication target; a relay the block cannot
   satisfy is `refused` without a request; a failed `/info` read is an attempt)
 - Date: 2026-11-21
@@ -203,9 +203,9 @@ and §4, "Denied blocks", after "MUST NOT send that block to that relay again au
 > When that relay had already acknowledged the block, the `451` changes the block's availability on
 > that relay, not its delivery: see "Client bounds".
 
-## Amendments D2 and D3 (2026-11-21, proposed)
+## Amendments D2 and D3 (2026-11-21, accepted by the project owner on 2026-11-21)
 
-Raised by the first TypeScript client (ADR 0053 clarifications S4 and S7). Each is proposed on its own.
+Raised by the first TypeScript client (ADR 0053 clarifications S4 and S7). Both accepted.
 No wire format, relay interface or frozen vector set changes.
 
 - **D2. Other `5xx` (rule 3).** Every `5xx` status that rule 3 does not name (`501`, `505`, `506`,
@@ -235,8 +235,8 @@ No wire format, relay interface or frozen vector set changes.
   *Reason:* each of these relays would otherwise keep a block protected for up to `publish_max_wait`
   (7 days by default) with no request that could deliver it.
 
-Spec change on acceptance: core spec §4, "Client bounds", after the bullet "A relay stops being
-pending for a block when…":
+Spec change, applied on acceptance (2026-11-21): core spec §4, "Client bounds", after the bullet "A
+relay stops being pending for a block when…":
 
 > - Every `5xx` answer to a `PUT` is transient: the relay stays pending, within the bounds above.
 >   (ADR 0047, amendment D2)
