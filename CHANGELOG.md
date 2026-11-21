@@ -25,6 +25,11 @@ Initial public version. Pre-release software: no version is supported for produc
   vector isolating one rejection rule; Ed25519 cases cross-checked against a second implementation.
 - Relay API: `PUT /sbtp/v1/block`, `GET /sbtp/v1/block/{block_id}` (immutable, cacheable),
   `GET /sbtp/v1/query` with cursors, `GET /sbtp/v1/info`.
+- Operator deny list (ADR 0052, spec only so far): `451` with `Denied` / `DeniedKey`, `no-store`, denied
+  blocks omitted from `/query` and returned as empty records in batches, `/info` `deny_list`; publishers
+  never re-send a denied block automatically.
+- Client implementations (ADR 0053, non-normative): boundary of a client library, shared conformance cases
+  (`client-v1/`, planned), packaging and release policy for first-party packages.
 
 ### Layer 2
 
@@ -44,6 +49,11 @@ Initial public version. Pre-release software: no version is supported for produc
   (single-shot, X25519/HKDF-SHA256/ChaCha20Poly1305), padding to the fixed buckets, strict inner
   signature, directory and application tags; `no_std` + `alloc`, `wasm32`. Security review:
   `docs/security/2026-11-21-sbtp-seal.md` (mergeable; L-2 fixed, other low and info findings tracked).
+- `sbtp-relay`: archive copy to S3-compatible object storage (ADR 0050 stage 1, `object-store` feature,
+  off by default): conditional `PUT` (`If-None-Match: *`) under `sbtp/v1/block/{id}`, never deletes,
+  durable cursor with a window of 256 positions, SigV4 with the `hmac` crate, a static `/info` object with
+  `read_only`; 4 lanes on `small` (amendments U1-U3). Measurements: `docs/benchmarks/2026-11-21-mirror-measurements.md`.
+  Security review: `docs/security/2026-11-21-relay-object-mirror.md` (mergeable; low findings tracked).
 - `sbtp-relay`, ADR 0051 stage 1 (read API for large graphs): `POST /sbtp/v1/blocks`, a batch read
   of 1 to 256 raw identifiers (body of at most 8,192 bytes with `Content-Length`; chunked or
   unannounced bodies get `400` and the connection closed), answered `no-store` with one
