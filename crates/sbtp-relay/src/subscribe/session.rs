@@ -229,8 +229,15 @@ async fn drive(
                 }
                 if now >= ping_at {
                     // Rule 31: a ping, and a `tick` when nothing else was sent.
+                    // Security review 2026-11-22, L-3: raced against shutdown like an item
+                    // send, so that a client that does not read cannot hold the drain.
                     let ping = timeout(2 * lim.ping, socket.send(Message::Ping(Vec::new().into())));
-                    if !matches!(ping.await, Ok(Ok(()))) {
+                    let r = tokio::select! {
+                        biased;
+                        _ = stopping.changed() => return End::Drop,
+                        r = ping => r,
+                    };
+                    if !matches!(r, Ok(Ok(()))) {
                         return End::Drop;
                     }
                     pong_due = Some(now + lim.ping);
