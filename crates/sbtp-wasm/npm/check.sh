@@ -16,6 +16,9 @@ die() { echo "check.sh: $*" >&2; exit 1; }
 [ $# -eq 1 ] || die "usage: check.sh <tarball>"
 tgz=$1
 [ -f "$tgz" ] || die "no such file: $tgz"
+for tool in cargo node tar gzip grep; do
+  command -v "$tool" > /dev/null || die "$tool not found in PATH"
+done
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 tools="$here/tools.mjs"
