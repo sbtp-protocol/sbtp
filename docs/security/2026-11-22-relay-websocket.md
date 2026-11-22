@@ -278,3 +278,82 @@ size, not security, and go away when axum moves to a `tokio-tungstenite` on `sha
 - Load and `VmHWM` measurements of the memory terms (rule 35), and fuzzing of the client-message
   parser (it is `serde_json` with a 4,096-byte bound and a fixed member list).
 - The client SDK side of ADR 0054 (`follow`, resume points), apart from the spec note L-7.
+
+## Re-review (2026-11-22)
+
+- Scope: the six fix commits after the rebase on `main` `1f76b1c`, `git diff 36d62c7..124f188 --
+  crates/sbtp-relay` (`64738ac` M-1, `8555066` L-3, `c9d80e8` L-8, `bd7963f` L-2, `9665cc2` L-6,
+  `124f188` L-1); range confirmed with `git log`. The findings L-4, L-5 and L-7 are not addressed by
+  these commits and are not re-reviewed here.
+- Commands, in the branch worktree at `124f188`: `cargo test -p sbtp-relay` (green),
+  `cargo test -p sbtp-relay --features object-store` (green, the full suite this time),
+  `cargo clippy -p sbtp-relay --all-targets --all-features -- -D warnings` (green),
+  `cargo deny --offline check` (`advisories ok, bans ok, licenses ok, sources ok`). The cancellation
+  behaviour of a send was checked against the `tokio-tungstenite` 0.29.0 and `axum` 0.8.9 sources in
+  the local cargo registry. No remote endpoint was contacted.
+
+### Status of the findings
+
+| Finding | Status | Notes |
+|---|---|---|
+| M-1 | **Closed** | Every loop turn checks the age, idle and 1008 deadlines before popping an item, and every item send is raced against the earliest of them. On the read path the wake time includes the same deadline. The ping send is bounded by its own `2 × tick_ms` timeout. The 1008 clock stops only once the queue is empty and no gap is owed, so a client that flushes a gap now and then under steady traffic keeps its clock running; `a_slow_reader_under_steady_traffic_gets_1008` covers that case. One edge case remains (L-9 below). |
+| L-1 | **Closed** | Deliveries, gaps and ticks are bounded by `WS_SEND_BYTES - REPLY_RESERVE`; replies may use the whole bound. A client message is read only on the empty-queue path with `can_read()`, the session reads one message per turn, and each message yields at most one reply, so the reply always fits. `subscribe` queues `subscribed` before registering, all under the `reg` lock, so no fan-out batch can come in between. The lock order (`reg` then `q`) matches `evaluate` and `unsubscribe`. There is no deadlock and no starvation of replies: replies are FIFO in the same queue. The test checks that the largest frame of one batch fits outside the reserve, so a delivery can never be refused for good. |
+| L-2 | **Closed** | `hub.start()` runs in `serve` after the listener is bound and before the accept loop serves, and `upgrade` no longer starts it. A failed `head` read now fails start-up (`NewError::Head`, then `StartError::Io`) instead of starting from position 0, and the index pool is still shut down on that path. Entries committed between the `head` read and `start()` (replication is spawned earlier in `serve`) wait in the 256-entry channel, so no gap is expected. See I-12 and I-13 for test coverage. |
+| L-3 | **Closed** | The ping send is raced against `stopping.changed()` like an item send. Not tested (I-13). |
+| L-6 | **Closed** | Each item is charged its heap capacity (after `shrink_to_fit`) plus `ITEM_OVERHEAD = 2 × size_of::<Out>() + 32`. Per item, the real cost is at most two ring-buffer slots (a `VecDeque` grows by doubling and keeps its capacity, so its capacity stays below about twice the largest item count the bound allows), the payload, and at most 31 bytes of glibc header and rounding (a 32-byte minimum chunk for tiny payloads). That stays within the charge for any payload length, including frames smaller than the 81-byte delivery used in the test, because the charge grows with the payload and the overhead is a fixed upper bound. The charge is computed once, after `shrink`, and the same `cost()` is released when the item leaves the queue, so the accounting is consistent. The codec's write buffer (`max_write_buffer_size`) is a separate term, unchanged. See I-14 for other allocators. |
+| L-8 | **Closed** | `group_of` passes `client_ipv6_prefix` (validated to 32..=64, so the `unwrap_or(64)` cannot be reached) and uses `<`. Tested with a prefix of 48. |
+
+### New findings
+
+#### L-9 (low): a deadline that interrupts the last send can skip the 1008 close
+
+- File: `crates/sbtp-relay/src/subscribe/session.rs`, lines 171 to 188 (the `None` arm after
+  `sleep_until(ending)`).
+- Scenario: the 1008 deadline (`slow_at`) fires while the session is sending the last queued item,
+  for example the queued `gap` itself, with no other gap owed. `release()` then finds the queue empty
+  with no gap owed and clears `overflow_since`. At the next turn `ended()` sees no `slow_at`, so the
+  connection that rule 20 says to close with 1008 stays open. It is closed later only by a new
+  overflow, by the item or ping send timeout (`2 × tick_ms`), or by the maximum age, so this is
+  bounded. Second effect: in `tokio-tungstenite` 0.29, a cancelled send drops its message if it is
+  cancelled in `poll_ready`, which happens only when an earlier cancelled send left `ready = false`.
+  After two such interruptions without a close, a delivery or `gap` frame can be lost with no `gap`
+  reported, which breaks the delivery contract of rule 34 for that client. Only the slow client
+  itself is affected, and the timing is narrow. There is no cross-client impact and nothing for an
+  attacker to gain.
+- Fix: when the deadline arm wins, close at once using the deadlines read at the top of the turn,
+  for example `None => return ended(Instant::now(), age_at, idle_at, slow_at).unwrap_or(End::Close(1008))`,
+  instead of calling `release` and continuing. A cancelled send is never reused after that.
+
+#### Info
+
+- **I-10** (pre-existing, author's note): the session reads client messages only on the
+  empty-queue path. Under steady traffic, an `unsubscribe` or a close frame from the client is not
+  read until its queue drains. Liveness (rule 32) is also judged only there. This does not let a
+  client stay connected without bound. A client that never answers pings and keeps its queue
+  non-empty either reads TCP (each send completes) or does not (a send times out after
+  `2 × tick_ms`, and the session is dropped). If it reads more slowly than the traffic arrives, it
+  overflows and gets 1008. In every case the maximum age closes it, now that M-1 checks the age on
+  every turn. Only the client's own subscription is affected. A pong that arrives while the queue is
+  busy is read before the liveness timeout is judged, because `recv` comes before `sleep_until` in
+  the biased `select!`, so a busy but live client is not closed with 1001 for that reason.
+- **I-11**: the ping send is not raced against the age or idle deadlines, only against shutdown. A
+  connection can outlive `ws_max_age_ms` by at most `2 × ws_ping_interval_ms`. This is bounded.
+  Nothing to do unless the age becomes a hard guarantee.
+- **I-12**: the start-up error drops the cause (`"index read failed"`). If the index reader already
+  logs `index_read_failed`, this is harmless; otherwise, carry the index error kind into
+  `StartError` so that an operator can tell a corrupt index from an I/O error.
+- **I-13** (test coverage, author's notes): there is no test for L-3 or for the failed-head branch.
+  The L-2 integration test passes on the old code because `tests/common/mod.rs` calls `hub.start()`
+  itself rather than going through `sbtp_relay::run`/`serve`. A regression that removes the call
+  from `serve` would therefore not be caught. A startup test through `run` that opens a subscription
+  after more than 256 accepted blocks, and checks that no `fanout` gap is reported, would pin it.
+- **I-14**: `ALLOC_SLACK = 32` is argued for glibc. musl's mallocng and jemalloc have different size
+  classes. jemalloc rounds 81 bytes up to 96, which is still within the slack. If the image changes
+  allocator, re-check the constant or measure `VmHWM` as rule 35 already plans.
+
+### Verdict of the re-review
+
+**Mergeable.** M-1 and L-1, L-2, L-3, L-6 and L-8 are closed. The fixes introduce one low finding
+(L-9, a skipped 1008 close in a narrow timing window, harmful only to the slow client itself) and
+info notes. None is blocking. L-9 is a one-line fix and can be made before the merge or parked in
+"Relay hardening (parked)" with the info items.
