@@ -23,6 +23,16 @@ wasm-opt -Os --strip-debug --strip-producers --strip-target-features \
 `wasm-opt` needs no feature flags: it reads them from the `target_features` section, which is why the
 release profile does not set `strip` (it would drop that section).
 
+### npm package `@sbtp/wasm` (ADR 0053)
+
+`crates/sbtp-wasm/npm/build.sh` builds the npm package from a clean tree into
+`dist-npm/sbtp-wasm-<version>.tgz` and prints its SHA-256 and integrity string; `check.sh` checks a
+tarball's contents (file list, no script, no local path, size budget). The tools are pinned in
+`build.sh` (rustc from `rust-toolchain.toml`, wasm-bindgen from `Cargo.lock`, binaryen 133, Node.js
+22.23.4 with npm 10.9.9). The package ships one module and one glue (`--target web`) with a Node.js
+entry (`npm/node.js`) that instantiates the module synchronously; see `npm/README.md`. Packages are
+published by CI only (`.github/workflows/release-npm.yml`), never from a workstation.
+
 ### Features and size (Q-78)
 
 | Cargo features | `.wasm` raw | `.wasm` gzip -9 | JS glue raw / gzip -9 |
