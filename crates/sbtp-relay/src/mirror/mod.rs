@@ -988,6 +988,21 @@ fn log_failed(class: Class, delay: Duration) {
 mod tests {
     use super::*;
 
+    /// ADR 0054 rules 5 and 43: the read-only URL of the bucket has no subscription route, so
+    /// its `/info` never publishes `subscribe`, whatever `ws_enabled` says.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    fn the_read_only_info_has_no_subscribe_member() {
+        let s = Settings::load(
+            Vec::<std::ffi::OsString>::new(),
+            [("SBTP_RELAY_WS_ENABLED".into(), "true".into())],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&info_body(&s)).unwrap();
+        assert_eq!(v["read_only"], true);
+        assert!(v.get("subscribe").is_none());
+    }
+
     /// The window's share of the memory bound (`EST_MIRROR_WINDOW` in `config.rs`) counts 96
     /// bytes per slot.
     #[test]

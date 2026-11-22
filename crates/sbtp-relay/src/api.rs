@@ -47,6 +47,13 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
     let batches = Router::new()
         .route(batch::PATH, post(post_blocks::<I>))
         .with_state(Arc::new(BatchState::new(settings, Arc::clone(&relay))));
+    // ADR 0054 rules 5 and 30: the route exists only with `ws_enabled`; otherwise `404`.
+    let subscribe = match relay.subscriptions() {
+        Some(hub) => Router::new()
+            .route(crate::subscribe::PATH, get(crate::subscribe::upgrade))
+            .with_state(Arc::clone(hub)),
+        None => Router::new(),
+    };
     let blocks = Router::new()
         .route("/sbtp/v1/block", put(put_block::<I>))
         .route("/sbtp/v1/block/{id}", get(get_block::<I>))
@@ -77,6 +84,7 @@ pub fn routes<I: IndexBackend + 'static>(settings: &Settings, relay: Arc<Relay<I
         .merge(blocks)
         .merge(batches)
         .merge(queries)
+        .merge(subscribe)
         .fallback(|| async { ApiError::not_found() })
 }
 
@@ -102,6 +110,13 @@ fn info_body(s: &Settings) -> String {
         && let Some(o) = info.as_object_mut()
     {
         o.insert("deny_list".into(), true.into());
+    }
+    // ADR 0054 rule 5: with `ws_enabled`; this relay publishes `read_api` 2 and is never
+    // `read_only` (the read-only URL of ADR 0050 is the bucket, whose `/info` has no member).
+    if let Some(m) = crate::subscribe::info_member(s)
+        && let Some(o) = info.as_object_mut()
+    {
+        o.insert("subscribe".into(), m);
     }
     info.to_string()
 }

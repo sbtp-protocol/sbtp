@@ -22,18 +22,21 @@ pub enum Route {
     Info,
     /// `POST /sbtp/v1/blocks` (ADR 0051).
     Blocks,
+    /// `GET /sbtp/v1/subscribe` (ADR 0054): the upgrade request.
+    Subscribe,
     /// Any other path (`404`).
     Other,
 }
 
 impl Route {
     /// Every route, in order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Block,
         Self::BlockId,
         Self::Query,
         Self::Info,
         Self::Blocks,
+        Self::Subscribe,
         Self::Other,
     ];
 
@@ -46,6 +49,7 @@ impl Route {
             Self::Query => "/sbtp/v1/query",
             Self::Info => "/sbtp/v1/info",
             Self::Blocks => "/sbtp/v1/blocks",
+            Self::Subscribe => "/sbtp/v1/subscribe",
             Self::Other => "other",
         }
     }
@@ -59,6 +63,7 @@ impl Route {
             Some("/sbtp/v1/query") => Self::Query,
             Some("/sbtp/v1/info") => Self::Info,
             Some("/sbtp/v1/blocks") => Self::Blocks,
+            Some("/sbtp/v1/subscribe") => Self::Subscribe,
             _ => Self::Other,
         }
     }
@@ -88,10 +93,17 @@ pub enum Refused {
     QueryRate,
     /// `429`, the `put` token bucket is empty.
     PutRate,
+    /// `429`, the client key holds `ws_max_connections_per_client` subscription connections
+    /// (ADR 0054 rule 25, step 6).
+    WsClient,
+    /// `429`, the network group holds its share of `ws_max_connections` (ADR 0054 rule 28).
+    WsGroup,
+    /// `503`, the relay holds `ws_max_connections` subscription connections.
+    WsFull,
 }
 
 impl Refused {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::InFlight,
         Self::RequestTimeout,
         Self::PutInFlight,
@@ -101,6 +113,9 @@ impl Refused {
         Self::BlockRate,
         Self::QueryRate,
         Self::PutRate,
+        Self::WsClient,
+        Self::WsGroup,
+        Self::WsFull,
     ];
 
     /// The HTTP status.
@@ -111,8 +126,14 @@ impl Refused {
             | Self::PutInFlight
             | Self::BlockRate
             | Self::QueryRate
-            | Self::PutRate => 429,
-            Self::RequestTimeout | Self::PutQueue | Self::BlockQueue | Self::IndexQueue => 503,
+            | Self::PutRate
+            | Self::WsClient
+            | Self::WsGroup => 429,
+            Self::RequestTimeout
+            | Self::PutQueue
+            | Self::BlockQueue
+            | Self::IndexQueue
+            | Self::WsFull => 503,
         }
     }
 
@@ -129,6 +150,9 @@ impl Refused {
             Self::BlockRate => "block",
             Self::QueryRate => "query",
             Self::PutRate => "put",
+            Self::WsClient => "ws_client",
+            Self::WsGroup => "ws_group",
+            Self::WsFull => "ws_full",
         }
     }
 }
@@ -983,7 +1007,6 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
             .map(|r| refused_total(*r))
             .fold(0, u64::saturating_add)
     };
-    #[allow(unused_mut)] // Extended in the `object-store` build.
     let mut v = vec![
         ("requests_2xx", class(0)),
         ("requests_4xx", class(1)),
@@ -1028,6 +1051,8 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("connections_open", CONNECTIONS_OPEN.load(Relaxed)),
         ("connections_refused", CONNECTIONS_REFUSED.load(Relaxed)),
     ];
+    // ADR 0054 rule 38: the subscription counters, with `ws_enabled`.
+    v.extend(crate::subscribe::metrics::stats());
     // Mirror review L-4: the archive copy's counters, while it runs.
     #[cfg(feature = "object-store")]
     v.extend(crate::mirror::metrics::stats());

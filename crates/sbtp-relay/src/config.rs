@@ -201,12 +201,21 @@ int_settings! {
     // ADR 0052 rule 21: a profile row, then a policy setting.
     deny_max_entries: 1, 16_777_216, Some(2_048);
     deny_reload_ms: 1_000, 3_600_000, Some(10_000);
+    // ADR 0054 rule 30: profile rows, then policy settings. `ws_max_connections` is at most
+    // `⌊max_connections / 2⌋` and `ws_max_connections_per_client` at most `ws_max_connections`:
+    // constraints.
+    ws_max_connections: 1, 32_767, Some(16);
+    ws_max_connections_per_client: 1, 32_767, Some(4);
+    ws_max_subscriptions: 1, 64, Some(4);
+    ws_group_share_pct: 1, 100, Some(25);
+    ws_ping_interval_ms: 5_000, 120_000, Some(30_000);
+    ws_max_age_ms: 60_000, 86_400_000, Some(3_600_000);
 }
 
 /// ADR 0019 rule 37: the settings a profile sets, and no others, with their `standard` and
 /// `large` values. The `small` column is the built-in default of `int_settings!` (rule 36.5).
 /// `max_blocking_threads` is computed from them (rule 36.3). A change here is a new ADR.
-const PROFILE_VALUES: [(&str, [u64; 2]); 28] = [
+const PROFILE_VALUES: [(&str, [u64; 2]); 31] = [
     ("max_connections", [256, 4_096]),
     ("max_connections_per_client", [16, 32]),
     ("index_max_queue", [128, 256]),
@@ -241,6 +250,10 @@ const PROFILE_VALUES: [(&str, [u64; 2]); 28] = [
     ("mirror_max_in_flight", [4, 8]),
     // ADR 0052 rule 21 (amends rule 37).
     ("deny_max_entries", [65_536, 1_048_576]),
+    // ADR 0054 rule 30 (amends rule 37).
+    ("ws_max_connections", [128, 2_048]),
+    ("ws_max_connections_per_client", [8, 16]),
+    ("ws_max_subscriptions", [8, 8]),
 ];
 
 /// `profile` (ADR 0019 rule 35).
@@ -308,7 +321,7 @@ impl fmt::Display for Source {
 }
 
 /// Non-integer settings.
-const OTHER_KEYS: [&str; 28] = [
+const OTHER_KEYS: [&str; 29] = [
     "profile",
     "listen",
     "data_dir",
@@ -340,6 +353,8 @@ const OTHER_KEYS: [&str; 28] = [
     "mirror_allow_private",
     // ADR 0052 rule 21.
     "deny_file",
+    // ADR 0054 rule 30.
+    "ws_enabled",
 ];
 
 /// `mirror_url_style` (ADR 0050 rule 28).
@@ -625,6 +640,15 @@ pub struct Settings {
     pub deny_file: Option<PathBuf>,
     pub deny_max_entries: u64,
     pub deny_reload_ms: u64,
+    // ADR 0054 rule 30.
+    /// Serve `GET /sbtp/v1/subscribe`; default `false`.
+    pub ws_enabled: bool,
+    pub ws_max_connections: u64,
+    pub ws_max_connections_per_client: u64,
+    pub ws_max_subscriptions: u64,
+    pub ws_group_share_pct: u64,
+    pub ws_ping_interval_ms: u64,
+    pub ws_max_age_ms: u64,
     /// The source of every setting (ADR 0019 rule 36.6).
     sources: BTreeMap<&'static str, Source>,
 }
@@ -855,6 +879,7 @@ impl Settings {
         )?;
         let client_ip_header = parse_client_ip_header(other("client_ip_header"))?;
         let demand_eviction = parse_bool(other("demand_eviction"), "demand_eviction")?;
+        let ws_enabled = parse_bool(other("ws_enabled"), "ws_enabled")?;
         let peers = parse_peers(other("peers"))?;
         let mirror_endpoint = parse_url(other("mirror_endpoint"), "mirror_endpoint")?;
         let max_blocking_threads = *ints.max_blocking_threads.get_or_insert(blocking_floor(
@@ -1017,6 +1042,13 @@ impl Settings {
             deny_file,
             deny_max_entries: v(ints.deny_max_entries),
             deny_reload_ms: v(ints.deny_reload_ms),
+            ws_enabled: ws_enabled.unwrap_or(false),
+            ws_max_connections: v(ints.ws_max_connections),
+            ws_max_connections_per_client: v(ints.ws_max_connections_per_client),
+            ws_max_subscriptions: v(ints.ws_max_subscriptions),
+            ws_group_share_pct: v(ints.ws_group_share_pct),
+            ws_ping_interval_ms: v(ints.ws_ping_interval_ms),
+            ws_max_age_ms: v(ints.ws_max_age_ms),
             sources,
         };
         s.check_constraints()?;
@@ -1094,6 +1126,7 @@ impl Settings {
                             .unwrap_or_default(),
                     ),
                     "mirror_allow_private" => Some(self.mirror_allow_private.to_string()),
+                    "ws_enabled" => Some(self.ws_enabled.to_string()),
                     // ADR 0052 rule 20: the path, never the content of the file.
                     "deny_file" => Some(
                         self.deny_file
@@ -1165,7 +1198,13 @@ impl Settings {
             ingest_group56_share_pct,
             mirror_max_in_flight,
             mirror_request_timeout_ms,
-            mirror_max_backoff_s
+            mirror_max_backoff_s,
+            ws_max_connections,
+            ws_max_connections_per_client,
+            ws_max_subscriptions,
+            ws_group_share_pct,
+            ws_ping_interval_ms,
+            ws_max_age_ms
         )
     }
 
@@ -1383,6 +1422,18 @@ impl Settings {
                 Err(ConfigError::Constraint(m.to_owned()))
             }
         };
+        // ADR 0054 rule 30, checked only with `ws_enabled`: a relay with the function off and
+        // `max_connections = 1` keeps starting.
+        if self.ws_enabled {
+            c(
+                self.ws_max_connections <= self.max_connections / 2,
+                "ws_max_connections must not exceed half of max_connections",
+            )?;
+            c(
+                self.ws_max_connections_per_client <= self.ws_max_connections,
+                "ws_max_connections_per_client must not exceed ws_max_connections",
+            )?;
+        }
         c(
             self.queue_timeout_ms < self.request_timeout_ms,
             "queue_timeout_ms must be less than request_timeout_ms",
@@ -1658,6 +1709,33 @@ impl Settings {
             } else {
                 0
             },
+            // ADR 0054 rule 35: only with `ws_enabled`.
+            if self.ws_enabled {
+                self.subscription_bytes()
+            } else {
+                0
+            },
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
+
+    /// ADR 0054 rules 29 and 35: the subscription registry, the fan-out queue and the network
+    /// group counts, plus, for each subscription connection, what its buffers take beyond the
+    /// per-connection term of ADR 0018 rule 35.
+    #[must_use]
+    pub fn subscription_bytes(&self) -> u64 {
+        let per_conn = crate::subscribe::CONNECTION_BYTES;
+        let term = self.max_header_bytes + EST_LARGEST_RESPONSE;
+        [
+            self.ws_max_connections
+                .saturating_mul(self.ws_max_subscriptions)
+                .saturating_mul(crate::subscribe::EST_SUBSCRIPTION),
+            crate::subscribe::FANOUT_QUEUE as u64 * crate::subscribe::EST_FANOUT_ENTRY,
+            self.ws_max_connections
+                .saturating_mul(crate::subscribe::EST_GROUP_COUNT),
+            self.ws_max_connections
+                .saturating_mul(per_conn.saturating_sub(term)),
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -2132,9 +2210,9 @@ mod tests {
         for n in INT_NAMES {
             assert!(raw.slot(n).is_some(), "{n}");
         }
-        // 61 integer settings plus the 28 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
-        // 0046, 0048, 0049, 0050 and 0052.
-        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 89);
+        // 67 integer settings plus the 29 others: ADRs 0007, 0012, 0013, 0018, 0019, 0021, 0044,
+        // 0046, 0048, 0049, 0050, 0052 and 0054.
+        assert_eq!(INT_NAMES.len() + OTHER_KEYS.len(), 96);
     }
 
     /// ADR 0050 rule 28: without `object-store`, a `mirror_*` setting given at its default is

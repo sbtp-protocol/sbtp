@@ -37,6 +37,7 @@ pub mod query;
 pub mod replication;
 pub mod server;
 pub mod store;
+pub mod subscribe;
 pub mod sweep;
 
 use std::ffi::OsString;
@@ -230,9 +231,14 @@ where
                 drop(kept);
                 drain.map(|d| (d, until))
             }
-            Err(e) => Err(StartError::Io(
+            Err(blocks::NewError::Alloc(e)) => Err(StartError::Io(
                 "allocating the demand set",
                 std::io::Error::new(std::io::ErrorKind::OutOfMemory, e),
+            )),
+            // ADR 0054 rule 14, security review 2026-11-22 L-2: never from position 0.
+            Err(blocks::NewError::Head) => Err(StartError::Io(
+                "reading the newest position for subscriptions",
+                std::io::Error::other("index read failed"),
             )),
         },
         Err(e) => Err(e),
@@ -545,6 +551,12 @@ where
         } else {
             None
         };
+        // ADR 0054 rule 34, security review 2026-11-22 L-2: the fan-out runs from start-up, so
+        // that entries offered before the first subscription are evaluated and discarded as
+        // they come, and the first subscriber's `start` is the current head.
+        if let Some(hub) = relay.subscriptions() {
+            hub.start();
+        }
         let mut sweeper = tokio::spawn(sweep::run(
             relay,
             std::time::Duration::from_millis(settings.sweep_interval_ms),
