@@ -73,7 +73,7 @@ ADR 0047.
 - **Choice.** The identity is a Web Crypto Ed25519 key pair generated with `extractable: false`. The
   `CryptoKey` is stored in IndexedDB by structured clone. Its secret never enters memory a script can
   read: no seed, no JWK, no `exportKey`. Signing uses the external path of `sbtp-wasm`:
-  `signingMessage` (49 bytes, `SIG_PREFIX ‖ block_id`) → `crypto.subtle.sign` → `attachSignature`, which
+  `signingMessage` (a `SigningMessage` whose 49 `bytes` are `SIG_PREFIX ‖ block_id`) → `crypto.subtle.sign` → `attachSignature`, which
   verifies the result strictly in `sbtp-core`. On load and after generation, a test block is signed and
   verified the same way, so a corrupted record or a browser signing differently is caught at once.
 - **`exportSeed` and `DemoSigningKey` are not used.** There is no fallback to a key in WASM or JS memory:

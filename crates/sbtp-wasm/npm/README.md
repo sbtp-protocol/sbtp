@@ -63,6 +63,19 @@ Worker in a browser.
 demos and tests. A real client keeps its identity in a non-extractable Web Crypto Ed25519 key and signs
 through `signingMessage` / `attachSignature`, or `sealPrepare` / `finish` for sealing.
 
+Those two builders return a `SigningMessage` (`bytes`, `kind`: `"block"` or `"sealed"`, `free()`),
+never bare bytes, and nothing else creates one: there is no constructor or factory. An external signer
+should accept only a `SigningMessage` (`instanceof` at run time; the `.d.ts` brands the type, so a
+`Uint8Array` does not type-check) and sign its `bytes`, so that it never signs bytes its caller chose
+(ADR 0055 E1).
+
+```js
+const message = sbtp.signingMessage(minedBlock);   // or pending.message, kind "sealed"
+const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, message.bytes));
+message.free();
+const signed = sbtp.attachSignature(minedBlock, sig); // verified before it returns
+```
+
 ## Runtimes
 
 - Node.js 22 and later (the release lines in active or maintenance long-term support).

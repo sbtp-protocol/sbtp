@@ -38,7 +38,7 @@ test("build, mine, sign with a non-extractable Web Crypto key, verify", { skip }
   assert.throws(() => w.verifyFetched(signed, 8, "00".repeat(32)), { name: "BlockIdMismatch" });
   assert.throws(() => w.verifySubmitted(signed, 255), { name: "InsufficientPow" });
   const other = await newKey();
-  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", other.privateKey, w.signingMessage(block)));
+  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", other.privateKey, w.signingMessageBytes(block)));
   assert.throws(() => w.attachSignature(block, sig), { name: "InvalidSignature" });
   // A bad argument converted in JS is a plain error and does not poison the module (finding 8).
   assert.throws(() => w.verifyFetched(signed, 8, "not hex"), TypeError);

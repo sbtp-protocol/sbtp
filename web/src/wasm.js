@@ -86,7 +86,18 @@ export const verifySubmitted = guard((bytes, difficulty) => plain(raw.validateSu
 
 export const buildUnsignedBlock = guard(raw.buildUnsignedBlock);
 export const mineSlice = guard(raw.mineSlice);
-export const signingMessage = guard(raw.signingMessage);
+/**
+ * The 49 bytes to sign for a mined block (SIG_PREFIX ‖ block_id), read out of the SigningMessage
+ * sbtp-wasm builds (ADR 0055 E1: the signer only receives builder output) and freed at once.
+ */
+export const signingMessageBytes = guard((block) => {
+  const message = raw.signingMessage(block);
+  try {
+    return message.bytes;
+  } finally {
+    message.free();
+  }
+});
 /** Inserts an external signature; sbtp-core verifies it (C2, C3, strict) before returning. */
 export const attachSignature = guard(raw.attachSignature);
 const rawBlockId = guard(raw.blockId);

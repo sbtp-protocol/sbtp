@@ -2,6 +2,7 @@
 // installed the tarball): resolution through package.json "exports", the Node.js entry, and a
 // seal, mine, sign, validate, open round trip. Test keys from public seeds only.
 import assert from "node:assert/strict";
+import { createPrivateKey, createPublicKey, sign as ed25519Sign } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import init, * as sbtp from "@sbtp/wasm";
@@ -62,5 +63,47 @@ const other = sbtp.EncKeyPair.fromSecret(fill(32, 0x44));
 assert.throws(() => sbtp.openSealed(other, info.publicKey, info.parent(0), info.payload, recipientId,
   "app.note"), (e) => e.name === "OpenFailed");
 
-for (const o of [opened, outer, info, env, recipient, other, sender]) o.free();
-console.log(`ok   @sbtp/wasm ${manifest.version}: exports, Node.js entry, seal/open and validate round trip`);
+// The external signer path (ADR 0055 E1): the signer accepts only a SigningMessage, which only
+// the typed builders produce; it signs `bytes` with a key outside WASM (node:crypto Ed25519 from a
+// public test seed), and the result verifies end to end.
+const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"),
+  Buffer.from(fill(32, 0x5e))]);
+const identityKey = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+const identityPublic = new Uint8Array(
+  Buffer.from(createPublicKey(identityKey).export({ format: "jwk" }).x, "base64url"));
+function externalSign(message) {
+  if (!(message instanceof sbtp.SigningMessage)) throw new TypeError("not a SigningMessage");
+  return new Uint8Array(ed25519Sign(null, message.bytes, identityKey));
+}
+assert.throws(() => externalSign(new Uint8Array(49)), TypeError);
+assert.deepEqual(Object.getOwnPropertyNames(sbtp.SigningMessage).filter(
+  (n) => !["length", "name", "prototype", "__wrap"].includes(n)), []); // no factory
+
+// Block: build, mine, sign the "block" message outside, attach (verified), validate.
+const own = sbtp.buildUnsignedBlock(identityPublic, BigInt(Date.now()), 0n, new Uint8Array(0), NOTE);
+let ownId;
+while ((ownId = sbtp.mineSlice(own, 8, 1 << 12)) === undefined) { /* next slice */ }
+const blockMessage = sbtp.signingMessage(own);
+assert.equal(blockMessage.kind, "block");
+const ownSigned = sbtp.attachSignature(own, externalSign(blockMessage));
+blockMessage.free();
+const ownInfo = sbtp.validateRequested(ownSigned, 8, ownId);
+assert.deepEqual(ownInfo.publicKey, identityPublic);
+
+// Seal: the "sealed" message signed outside, finish (verified), then open on the other side.
+const pending = sbtp.sealPrepare(identityPublic, recipient.publicKey, recipientId, tag, NOTE);
+const sealedMessage = pending.message;
+assert.equal(sealedMessage.kind, "sealed");
+const env2 = pending.finish(externalSign(sealedMessage));
+sealedMessage.free();
+const block2 = env2.unsignedBlock(BigInt(Date.now()));
+while (sbtp.mineSlice(block2, 8, 1 << 12) === undefined) { /* next slice */ }
+const info2 = sbtp.validateSubmitted(env2.signBlock(block2), 8);
+const opened2 = sbtp.openSealed(recipient, info2.publicKey, info2.parent(0), info2.payload,
+  recipientId, "app.note");
+assert.deepEqual(opened2.from, identityPublic);
+assert.deepEqual(opened2.msg, NOTE);
+
+for (const o of [opened2, info2, env2, pending, ownInfo, opened, outer, info, env, recipient, other,
+  sender]) o.free();
+console.log(`ok   @sbtp/wasm ${manifest.version}: exports, Node.js entry, seal/open and validate round trip, SigningMessage signed outside and verified`);

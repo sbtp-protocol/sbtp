@@ -1,12 +1,12 @@
 // The user's identity: a Web Crypto Ed25519 key pair whose private key is NON-EXTRACTABLE, kept in
 // IndexedDB as a structured clone of the CryptoKey. The secret never enters script-readable
 // memory: no seed, no JWK, no export. sbtp-wasm's DemoSigningKey and exportSeed are not used.
-// Signing goes through the external signature path: signingMessage (SIG_PREFIX ‖ block_id, always
+// Signing goes through the external signature path: signingMessageBytes (SIG_PREFIX ‖ block_id, always
 // domain-separated) → crypto.subtle.sign → attachSignature, which verifies strictly in sbtp-core.
 // Threat model: web/README.md, "Key storage".
 
 import { tx } from "./idb.js";
-import { attachSignature, buildUnsignedBlock, signingMessage } from "./wasm.js";
+import { attachSignature, buildUnsignedBlock, signingMessageBytes } from "./wasm.js";
 
 const SLOT = "identity";
 
@@ -25,7 +25,7 @@ export class KeyUnsupported extends Error {
  */
 async function selfCheck(privateKey, publicKey) {
   const block = buildUnsignedBlock(publicKey, 0n, 0n, new Uint8Array(0), new Uint8Array(0));
-  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, signingMessage(block)));
+  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, signingMessageBytes(block)));
   attachSignature(block, sig); // throws InvalidSignature on a mismatch
 }
 
@@ -72,7 +72,7 @@ export function deleteIdentity(db) {
 
 /** Signs a mined block (spec §3.2) and returns the signed, verified copy. */
 export async function signBlock(identity, block) {
-  const message = signingMessage(block);
+  const message = signingMessageBytes(block);
   const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identity.privateKey, message));
   return attachSignature(block, sig);
 }

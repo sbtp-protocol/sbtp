@@ -39,9 +39,9 @@ published by CI only (`.github/workflows/release-npm.yml`), never from a worksta
 |---|---|---|---|
 | `--no-default-features` (layer 0 only) | 139,170 | 78,512 | 23,315 / 5,530 |
 | `--no-default-features --features l2` | 165,304 | 89,918 | 27,029 / 6,133 |
-| default (`seal`, which includes `l2`) | 244,078 | 122,212 | 46,876 / 9,581 |
+| default (`seal`, which includes `l2`) | 245,177 | 122,377 | 49,149 / 9,990 |
 
-Bytes, measured 2026-11-21 after `wasm-opt -Os --strip-debug --strip-producers --strip-target-features`
+Bytes, measured 2026-11-21 (default row: 2026-11-22, with `SigningMessage`) after `wasm-opt -Os --strip-debug --strip-producers --strip-target-features`
 (binaryen 133, wasm-bindgen 0.2.130). The full module uses 61 % of the 200,000-byte gzip budget of
 ADR 0048, so the layer 2 grammar and the sealed envelope ship **in the core module**, behind the
 features `l2` and `seal`, both on by default; there is no second module. An application that needs
@@ -85,10 +85,22 @@ info.free(); // BlockInfo lives in WASM memory
 // Send, with a key held outside WASM (Web Crypto Ed25519, extractable: false):
 const block = sbtp.buildUnsignedBlock(publicKey, BigInt(Date.now()), 0n, parents, payload);
 while (sbtp.mineSlice(block, difficulty, 1 << 16) === undefined) { /* yield; in a Worker */ }
-const message = sbtp.signingMessage(block);              // 49 bytes: SIG_PREFIX || block_id
-const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, message));
+const message = sbtp.signingMessage(block);  // SigningMessage, kind "block": SIG_PREFIX || block_id
+const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, message.bytes));
+message.free();
 const signed = sbtp.attachSignature(block, signature);   // verified (C2, C3) before it returns
 ```
+
+### Signing messages (ADR 0055 E1)
+
+`signingMessage(block)` and `SealPending.message` return a `SigningMessage`, not bytes: `bytes` (a
+copy, 49 bytes for kind `"block"`, the spec §5.3 message for kind `"sealed"`), `kind` (`"block"` or
+`"sealed"`), `free()`. It has no constructor and no factory: only these two typed builders make one, so
+a signer that takes a `SigningMessage` and checks `message instanceof SigningMessage` never signs bytes
+its caller chose. The shipped `.d.ts` also brands it, so a `Uint8Array` or an object literal does not
+type-check where a `SigningMessage` is expected. A sealed message holds `msg`: free it after signing,
+and `fill(0)` the `bytes` copy. This is an API shape, not a sandbox: a script running in the page can
+still call `crypto.subtle.sign` on the key handle directly (see the threat model below).
 
 `parents` is the concatenation of 0 to 8 distinct 32-byte identifiers. `mineSlice` mines in place and
 returns the `block_id` once found, `undefined` when the slice is spent (call it again: the block holds the
@@ -147,7 +159,9 @@ env.free();
 
 // Sender whose identity is a non-extractable Web Crypto key: two phases, the signature made outside.
 const pending = sbtp.sealPrepare(identityPublicKey, recipientX25519, recipientId, tag, msg);
-const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, pending.message));
+const toSign = pending.message;    // SigningMessage, kind "sealed"
+const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, toSign.bytes));
+toSign.free();
 const env2 = pending.finish(sig);  // verifies sig (strict) before sealing; once only
 pending.free();
 // ...then unsignedBlock, mine, signBlock as above.
@@ -172,7 +186,7 @@ try {
   is not an array on purpose: reading an array runs JS getters while the key is borrowed, and in the
   glue an array-like with a huge `length` can overwrite the instance's memory.
 - `sealPrepare(from, ...)` draws the ephemeral key and returns a `SealPending`; `pending.message` is
-  the exact sealed signature message of `l2-grammar.md` §5.3 (`SBTP-v1-sealed-sig ‖ outer_pubkey ‖
+  a `SigningMessage` whose `bytes` are the exact sealed signature message of `l2-grammar.md` §5.3 (`SBTP-v1-sealed-sig ‖ outer_pubkey ‖
   recipient_id ‖ recipient_x25519 ‖ msg`), built in WASM by the typed builder. Sign it, and nothing else,
   with the key of `from`. `pending.finish(signature)` verifies the signature with criteria V1 to V6
   (`InvalidPublicKey`, `InvalidSignature`) and only then seals. It runs once: the state is consumed even
@@ -208,7 +222,7 @@ an error message.
 
 Cannot be wiped from WASM:
 - the caller's arguments: `msg` given to `seal` or `sealPrepare`, `secret` given to `EncKeyPair.fromSecret`;
-- every value a getter returns, which is a fresh JS copy: `SealPending.message` (it contains `msg`),
+- every value a getter returns, which is a fresh JS copy: `SigningMessage.bytes` of `SealPending.message` (it contains `msg`),
   `OpenedMessage.msg`, `.from`, `.kind`, and
   `EncKeyPair.exportSecret()`. `fill(0)` the typed arrays once done; a JS string (`kind`) cannot be
   wiped at all;
