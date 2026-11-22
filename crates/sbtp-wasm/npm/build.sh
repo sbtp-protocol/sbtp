@@ -5,7 +5,7 @@
 #
 # Steps: check the pinned tool versions; build the release module with the default features (`l2`
 # and `seal`); wasm-bindgen --target web and wasm-opt -Os with the flags of web/build.sh; assemble
-# the package in target/npm/package/; `npm pack` with scripts disabled;
+# the package in target/npm/package/; `npm pack` with scripts disabled; run check.sh on the tarball;
 # print its SHA-256 and its integrity string.
 #
 # Reproducibility (Q-79): every tool is pinned below, the tree must be clean (the tarball is then the
@@ -102,6 +102,7 @@ packed=$(node "$tools" pack-integrity < "$root/target/npm/pack.json")
 [ "${packed%% *}" = "sbtp-wasm-$version.tgz" ] || die "npm pack wrote ${packed%% *}"
 
 # --- Check and report -------------------------------------------------------------------------
+sh "$here/check.sh" "$tarball"
 integrity=$(node "$tools" digest "$tarball" | sed -n 's/^integrity //p')
 [ "$integrity" = "${packed#* }" ] || die "npm pack reported ${packed#* }, the file hashes to $integrity"
 
