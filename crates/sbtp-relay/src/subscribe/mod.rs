@@ -99,6 +99,8 @@ pub struct Limits {
     pub max_age: Duration,
     /// `shed_retry_after_s`, the `Retry-After` of the `503`.
     pub shed_retry_after_s: u64,
+    /// `client_ipv6_prefix` (rule 28).
+    pub ipv6_prefix: u8,
 }
 
 impl Limits {
@@ -116,6 +118,7 @@ impl Limits {
             idle: Duration::from_millis(s.idle_timeout_ms),
             max_age: Duration::from_millis(s.ws_max_age_ms),
             shed_retry_after_s: s.shed_retry_after_s,
+            ipv6_prefix: u8::try_from(s.client_ipv6_prefix).unwrap_or(64),
         }
     }
 }
@@ -685,7 +688,7 @@ pub async fn upgrade(
             let Some(slot) = per_client.try_acquire(client) else {
                 return refused(crate::metrics::Refused::WsClient);
             };
-            let group = group_of(client).map(|g| adm.groups.try_acquire(g));
+            let group = group_of(client, hub.limits.ipv6_prefix).map(|g| adm.groups.try_acquire(g));
             match group {
                 Some(None) => return refused(crate::metrics::Refused::WsGroup),
                 Some(Some(g)) => (Some(slot), Some(g)),
@@ -733,13 +736,14 @@ pub async fn upgrade(
 
 use axum::extract::FromRequestParts as _;
 
-/// Rule 28: the network group of a client key: its IPv6 /48 or its IPv4 /24, when it is not
-/// longer than the key.
-fn group_of(k: ClientKey) -> Option<ClientKey> {
-    k.groups(64)
+/// Rule 28: the network group of a client key: its IPv6 /48 or its IPv4 /24. A level not
+/// shorter than the key is skipped (security review 2026-11-22, L-8): with
+/// `client_ipv6_prefix = 48` an IPv6 key has no group, so only its per-client bound applies.
+fn group_of(k: ClientKey, ipv6_prefix: u8) -> Option<ClientKey> {
+    k.groups(ipv6_prefix)
         .into_iter()
         .flatten()
-        .find(|g| matches!(g.prefix(), 24 | 48) && g.prefix() <= k.prefix())
+        .find(|g| matches!(g.prefix(), 24 | 48) && g.prefix() < k.prefix())
 }
 
 #[cfg(test)]
@@ -913,8 +917,22 @@ mod tests {
             .unwrap(),
         );
         let v4 = p.key("192.0.2.7".parse().unwrap()).unwrap();
-        assert_eq!(group_of(v4).unwrap().prefix(), 24);
+        assert_eq!(group_of(v4, 64).unwrap().prefix(), 24);
         let v6 = p.key("2001:db8:1:2::7".parse().unwrap()).unwrap();
-        assert_eq!(group_of(v6).unwrap().prefix(), 48);
+        assert_eq!(group_of(v6, 64).unwrap().prefix(), 48);
+        // L-8: with `client_ipv6_prefix = 48` the /48 is the key itself, a level not shorter
+        // than the key: no group.
+        let p48 = crate::client::ClientPolicy::from_settings(
+            &crate::config::Settings::load(
+                Vec::<std::ffi::OsString>::new(),
+                [("SBTP_RELAY_CLIENT_IPV6_PREFIX".into(), "48".into())],
+            )
+            .unwrap(),
+        );
+        let v6 = p48.key("2001:db8:1:2::7".parse().unwrap()).unwrap();
+        assert_eq!(v6.prefix(), 48);
+        assert!(group_of(v6, 48).is_none());
+        let v4 = p48.key("192.0.2.7".parse().unwrap()).unwrap();
+        assert_eq!(group_of(v4, 48).unwrap().prefix(), 24);
     }
 }
