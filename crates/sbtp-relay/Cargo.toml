@@ -32,6 +32,8 @@ sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 # ADR 0050 rule 22: the archive copy's credentials are wiped on drop. Already in the graph.
 zeroize.workspace = true
+# ADR 0054: the error type of the WebSocket codec axum's `ws` feature uses.
+tungstenite.workspace = true
 
 [features]
 # ADR 0048 rule 3: compiled into the published binary, off at run time unless `peers` is set.

@@ -33,7 +33,11 @@ zerocopy = { version = "0.8.63", features = ["derive"] }
 
 # Relay
 tokio = { version = "1.54.1", features = ["full"] }
-axum = "0.8.9"
+# ADR 0054 rule 29: `ws` adds the WebSocket upgrade (tokio-tungstenite and tungstenite 0.29.0, sha1
+# and base64 for the handshake). `tungstenite` is named for its error type (the close code of a
+# failed read) and the test client; it is the version axum pulls in.
+axum = { version = "0.8.9", features = ["ws"] }
+tungstenite = { version = "0.29.0", default-features = false }
 tower-http = { version = "0.7.1", default-features = false, features = ["cors", "catch-panic"] }
 # ADR 0018 accept loop: hyper's HTTP/1.1 server builder (no HTTP/2: rule 27) and hyper-util's tokio
 # adapters. Both were already in the graph through axum. `hyper_util::server::conn::auto` is not
