@@ -62,6 +62,10 @@ Initial public version. Pre-release software: no version is supported for produc
   `openSealed` with one opaque `OpenFailed`, `EncKeyPair`, tags); one module behind the `l2` and `seal`
   features (122 KB gzip). `sbtp-seal`: two-phase API, in-place item encoding (review L-1). Security
   review: `docs/security/2026-11-21-wasm-seal.md` (mergeable; low findings tracked).
+- `sbtp-relay`: `SIGHUP` never stops the relay (ignored without `deny_file`); deny-list reload detects a file
+  changed during the read, `purge` survives interruption, pre-sized maps; the archive copy keeps only its
+  three credential variables and wipes them; `sbtp-relay key-blocks <key>` lists a denied key's held
+  blocks for CDN purges. Security review: `docs/security/2026-11-22-relay-hardening-2.md` (mergeable).
 - `sbtp-relay`: operator deny list (ADR 0052, clarifications L1-L3): `deny_file` reloaded on `SIGHUP` or change
   (an invalid file keeps the previous list), `451` `Denied` / `DeniedKey` with `no-store`, empty batch
   records, filtered `/query`, key marking pass, `hide` / `purge`, `/info` `deny_list`; replication and the
