@@ -80,7 +80,10 @@ await check("82 frozen vectors through the JS API", () => {
       throwsNamed(run, v.expect.error);
     }
     if (v.expect.block_id !== null) {
-      assert.equal(toHex(sbtp.signingMessage(block)), v.expect.signed_message_hex, file);
+      const message = sbtp.signingMessage(block);
+      assert.equal(message.kind, "block", file);
+      assert.equal(toHex(message.bytes), v.expect.signed_message_hex, file);
+      message.free();
     }
   }
 });
@@ -112,7 +115,11 @@ await check("external signer: Web Crypto Ed25519, signing bytes out, signature i
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
   const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
   const block = minedBlock(publicKey, 4, "webcrypto");
-  const message = sbtp.signingMessage(block);
+  const built = sbtp.signingMessage(block);
+  assert.ok(built instanceof sbtp.SigningMessage);
+  assert.equal(built.kind, "block");
+  const message = built.bytes;
+  built.free();
   assert.equal(message.length, 49);
   const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", pair.privateKey, message));
   const signed = sbtp.attachSignature(block, signature);
@@ -120,6 +127,18 @@ await check("external signer: Web Crypto Ed25519, signing bytes out, signature i
   // A signature over something else is refused at attach time.
   const wrong = new Uint8Array(await crypto.subtle.sign("Ed25519", pair.privateKey, block));
   throwsNamed(() => sbtp.attachSignature(block, wrong), "InvalidSignature");
+});
+
+await check("SigningMessage: built by the typed builders only (ADR 0055 E1)", () => {
+  // No public constructor and no static factory: only wasm-bindgen's internal __wrap.
+  const statics = Object.getOwnPropertyNames(sbtp.SigningMessage)
+    .filter((n) => !["length", "name", "prototype", "__wrap"].includes(n));
+  assert.deepEqual(statics, []);
+  // `new` gives an object with no WASM state: reading it traps, it never yields bytes.
+  assert.throws(() => new sbtp.SigningMessage().bytes);
+  assert.throws(() => Object.create(sbtp.SigningMessage.prototype).bytes);
+  // A plain Uint8Array is not one.
+  assert.ok(!(new Uint8Array(49) instanceof sbtp.SigningMessage));
 });
 
 await check("item 1: end of the nonce space throws NonceSpaceExhausted", () => {
@@ -334,7 +353,11 @@ await check("sealPrepare, external Ed25519 signature, finish: round trip", async
   const id = fill(32, 0x33);
   const tag = sbtp.applicationTag("app 2026-11-21 test inbox", id);
   const pending = sbtp.sealPrepare(identity.publicKey, recipient.publicKey, id, tag, NOTE);
-  const message = pending.message;
+  const built = pending.message;
+  assert.ok(built instanceof sbtp.SigningMessage);
+  assert.equal(built.kind, "sealed");
+  const message = built.bytes;
+  built.free();
   // spec §5.3: SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖ recipient_x25519 ‖ msg.
   assert.equal(new TextDecoder().decode(message.subarray(0, 18)), "SBTP-v1-sealed-sig");
   assert.deepEqual(message.subarray(50, 82), id);
@@ -370,11 +393,11 @@ await check("sealPrepare and finish: named errors", () => {
   const prepare = () => sbtp.sealPrepare(identity.publicKey, key.publicKey, id, tag, NOTE);
   // A signature by another key, then a tampered one: never sealed, the state is consumed.
   let pending = prepare();
-  throwsNamed(() => pending.finish(other.sign(pending.message)), "InvalidSignature");
+  throwsNamed(() => pending.finish(other.sign(pending.message.bytes)), "InvalidSignature");
   throwsNamed(() => pending.finish(new Uint8Array(64)), "PendingSealUsed");
   pending.free();
   pending = prepare();
-  const bad = identity.sign(pending.message); bad[5] ^= 1;
+  const bad = identity.sign(pending.message.bytes); bad[5] ^= 1;
   throwsNamed(() => pending.finish(bad), "InvalidSignature");
   pending.free();
   // Argument shapes do not consume the state.
@@ -382,12 +405,12 @@ await check("sealPrepare and finish: named errors", () => {
   throwsNamed(() => pending.finish(new Uint8Array(63)), "InvalidLength");
   throwsNamed(() => pending.finish("sig"), "InvalidArgument");
   assert.equal(pending.used, false);
-  pending.finish(identity.sign(pending.message)).free();
+  pending.finish(identity.sign(pending.message.bytes)).free();
   pending.free();
   // `from` not a usable key (the identity point, small order).
   const point = new Uint8Array(32); point[0] = 1;
   pending = sbtp.sealPrepare(point, key.publicKey, id, tag, NOTE);
-  throwsNamed(() => pending.finish(identity.sign(pending.message)), "InvalidPublicKey");
+  throwsNamed(() => pending.finish(identity.sign(pending.message.bytes)), "InvalidPublicKey");
   pending.free();
   // Prepare-side errors.
   throwsNamed(() => sbtp.sealPrepare(new Uint8Array(31), key.publicKey, id, tag, NOTE),
@@ -397,7 +420,7 @@ await check("sealPrepare and finish: named errors", () => {
   throwsNamed(() => sbtp.sealPrepare(identity.publicKey, key.publicKey, id, tag, NOTE, 1000),
     "InvalidArgument");
   pending = sbtp.sealPrepare(identity.publicKey, new Uint8Array(32), id, tag, NOTE);
-  throwsNamed(() => pending.finish(identity.sign(pending.message)), "InvalidRecipientKey");
+  throwsNamed(() => pending.finish(identity.sign(pending.message.bytes)), "InvalidRecipientKey");
   pending.free(); key.free();
 });
 

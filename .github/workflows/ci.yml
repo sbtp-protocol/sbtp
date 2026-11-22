@@ -139,6 +139,81 @@ jobs:
           python3 -I web/wasm-budget.py \
             target/wasm32-unknown-unknown/release/sbtp_wasm.wasm "$MAX_CORE_WASM_GZIP_BYTES"
 
+  # The npm package @sbtp/wasm (ADR 0053 rule 35): built from this clean checkout by
+  # crates/sbtp-wasm/npm/build.sh with the tool versions it pins, then its contents checked
+  # (file list, no script, no local path, module under 200,000 bytes gzip). No new action: Node.js
+  # and binaryen are official release archives checked against pinned SHA-256 values,
+  # wasm-bindgen-cli is built from crates.io with `--locked` like cargo-deny. Nothing is published
+  # and no secret is used; the release is .github/workflows/release-npm.yml.
+  npm-package:
+    name: npm package (build, contents check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The versions crates/sbtp-wasm/npm/build.sh checks; it fails on any other. Node.js 22.23.4
+      # (npm 10.9.9) was released on 2026-10-20 and binaryen 133 on 2026-09-21; wasm-bindgen-cli
+      # is the wasm-bindgen version of Cargo.lock.
+      NODE_VERSION: v22.23.4
+      NODE_SHA256: 1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+      BINARYEN_VERSION: "133"
+      BINARYEN_SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+      WASM_BINDGEN_VERSION: 0.2.130
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+
+      - name: Install Node.js (pinned archive)
+        run: |
+          set -euo pipefail
+          archive="node-$NODE_VERSION-linux-x64.tar.xz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$RUNNER_TEMP/$archive" "https://nodejs.org/dist/$NODE_VERSION/$archive"
+          echo "$NODE_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/node-$NODE_VERSION-linux-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Install binaryen (pinned archive)
+        run: |
+          set -euo pipefail
+          archive="binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$archive"
+          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+
+      - name: Tests of the packaging tools
+        run: node --test crates/sbtp-wasm/npm/*.test.mjs
+
+      - name: Build the package
+        run: sh crates/sbtp-wasm/npm/build.sh dist-npm
+
+      - name: Contents check
+        run: sh crates/sbtp-wasm/npm/check.sh "dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz"
+
+      # Tampered copies of the tarball (manifest keys, Node.js entry, README, licences, sizes) must
+      # each fail the contents check.
+      - name: Contents check refuses tampered tarballs
+        run: |
+          SBTP_NPM_TARBALL="dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz" \
+            node --test crates/sbtp-wasm/npm/tamper.test.mjs
+
+      # Installs the tarball into a scratch project (scripts disabled, offline) and runs a
+      # seal, open and validate round trip through the package's own exports.
+      - name: Smoke test of the installed package
+        run: sh crates/sbtp-wasm/npm/smoke.sh "dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz"
+
   deny:
     name: cargo deny (workspace and fuzz)
     runs-on: ubuntu-24.04

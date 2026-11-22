@@ -24,14 +24,15 @@
 //! | `blockId(bytes)` | The 32-byte `block_id`. |
 //! | `buildUnsignedBlock(publicKey, timestamp, nonce, parents, payload)` | Encodes a block, signature zeroed; `parents` is the concatenation of 0 to 8 ids. |
 //! | `mineSlice(block, difficulty, maxAttempts)` | Mines in place, returns the `block_id` or `undefined` (call again). |
-//! | `signingMessage(block)` | The 49 bytes to sign with an external Ed25519 key. |
+//! | `signingMessage(block)` | A `SigningMessage` (kind `"block"`): its 49 `bytes` are signed with an external Ed25519 key. |
 //! | `attachSignature(block, signature)` | Inserts an external signature, verified before returning. |
 //! | `DemoSigningKey.generate()`, `.fromSeed(seed)` | In-WASM key, demo and CLI-like use only. |
 //! | `key.publicKey`, `key.signBlock(block)`, `key.exportSeed()`, `key.free()` | |
 //! | `validateL2Payload(parents, payload)` | Layer 2 grammar validation (feature `l2`), returns an `L2Payload`. |
 //! | `seal(sender, recipientX25519, recipientId, tag, msg, bucket?)` | Sealed envelope (feature `seal`), returns a `SealedEnvelope`. |
 //! | `sealPrepare(from, recipientX25519, recipientId, tag, msg, bucket?)` | Two-phase seal for an identity key outside WASM: returns a `SealPending`. |
-//! | `pending.message`, `pending.finish(signature)` | The bytes to sign; the signature is verified, then sealed into a `SealedEnvelope` (once). |
+//! | `pending.message`, `pending.finish(signature)` | A `SigningMessage` (kind `"sealed"`) to sign; the signature is verified, then sealed into a `SealedEnvelope` (once). |
+//! | `message.bytes`, `message.kind`, `message.free()` | No constructor: only the two builders above make one (ADR 0055 E1). |
 //! | `env.unsignedBlock(timestamp)`, `env.signBlock(block)` | The outer block; the ephemeral key signs once, then is wiped. |
 //! | `openSealed(key, outerPublicKey, tag, payload, recipientId, allowedKinds)` | Opens, returns an `OpenedMessage`; every failure is `OpenFailed`. |
 //! | `EncKeyPair.generate()`, `.fromSecret(secret)`, `.publicKey`, `.exportSecret()` | X25519 key of `sbtp.enc_key`. |
@@ -56,6 +57,7 @@ mod error;
 mod key;
 #[cfg(feature = "l2")]
 mod l2;
+mod message;
 #[cfg(feature = "seal")]
 mod seal;
 
@@ -73,6 +75,7 @@ pub use error::{BindError, names};
 pub use key::DemoSigningKey;
 #[cfg(feature = "l2")]
 pub use l2::{L2Payload, validate_l2_payload};
+pub use message::{MessageKind, SigningMessage};
 #[cfg(feature = "seal")]
 pub use seal::{
     EncKeyPair, OpenedMessage, SealPending, SealedEnvelope, open_sealed, prepare_seal, seal_message,
@@ -328,9 +331,11 @@ pub fn mine_slice_js(
     Ok(result?.map(|id| id.as_bytes().to_vec()))
 }
 
-/// The 49 bytes to sign for `block`: `SIG_PREFIX ‖ block_id` (spec §3.2). For a key held outside
-/// WASM (Web Crypto Ed25519, `extractable: false`): sign them with plain Ed25519, then call
-/// `attachSignature`. Take them after mining.
+/// The message to sign for `block`, as a [`SigningMessage`] of kind `"block"`: its `bytes` are
+/// `SIG_PREFIX ‖ block_id` (spec §3.2, 49 bytes). For a key held outside WASM (Web Crypto Ed25519,
+/// `extractable: false`): sign `bytes` with plain Ed25519, then call `attachSignature`. Take it
+/// after mining. A typed value rather than bytes, so that a signer can refuse anything not built
+/// here (ADR 0055 E1).
 ///
 /// # Errors
 ///
@@ -338,8 +343,9 @@ pub fn mine_slice_js(
 #[wasm_bindgen(js_name = signingMessage)]
 pub fn signing_message_js(
     #[wasm_bindgen(unchecked_param_type = "Uint8Array")] block: &JsValue,
-) -> Result<Vec<u8>, JsValue> {
-    Ok(signing_message(&block_in(block)?)?.to_vec())
+) -> Result<SigningMessage, JsValue> {
+    let bytes = signing_message(&block_in(block)?)?;
+    Ok(SigningMessage::new(MessageKind::Block, &bytes))
 }
 
 /// Returns a copy of `block` carrying `signature` (64 bytes), after verifying it under the block's

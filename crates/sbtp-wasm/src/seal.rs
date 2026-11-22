@@ -50,6 +50,7 @@ use zeroize::Zeroizing;
 
 use crate::api::build_unsigned;
 use crate::error::{BindError, names};
+use crate::message::{MessageKind, SigningMessage};
 use crate::{DemoSigningKey, bytes_in, exact_into, integer_in, u64_in};
 
 /// Largest `applicationTag` input copied into WASM memory. Only bounds the copy: tag inputs are
@@ -552,16 +553,19 @@ impl SealPending {
 
 #[wasm_bindgen]
 impl SealPending {
-    /// A copy of the exact bytes to sign with the sender's identity key (Web Crypto
-    /// `sign("Ed25519", key, message)`): `SBTP-v1-sealed-sig ‖ outer_pubkey ‖ recipient_id ‖
-    /// recipient_x25519 ‖ msg` (spec §5.3). Sign nothing else for this seal.
+    /// The message to sign with the sender's identity key, as a [`SigningMessage`] of kind
+    /// `"sealed"` (ADR 0055 E1): its `bytes` are `SBTP-v1-sealed-sig ‖ outer_pubkey ‖
+    /// recipient_id ‖ recipient_x25519 ‖ msg` (spec §5.3), for Web Crypto
+    /// `sign("Ed25519", key, message.bytes)`. Sign nothing else for this seal. Each read is a new
+    /// object holding a copy of `msg`: `free()` it after signing.
     ///
     /// # Errors
     ///
     /// `PendingSealUsed` once finished.
     #[wasm_bindgen(getter)]
-    pub fn message(&self) -> Result<Vec<u8>, JsValue> {
-        Ok(self.message_bytes().ok_or_else(pending_used)?.to_vec())
+    pub fn message(&self) -> Result<SigningMessage, JsValue> {
+        let bytes = self.message_bytes().ok_or_else(pending_used)?;
+        Ok(SigningMessage::new(MessageKind::Sealed, bytes))
     }
 
     /// Whether `finish` was already called (the state is gone).
