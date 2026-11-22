@@ -176,7 +176,13 @@ async fn drive(
             };
             lock(&conn.q).release(len);
             match r {
-                None => {}
+                // L-9 (re-review 2026-11-22): close now with the deadline that fired. Releasing the
+                // last item could clear the overflow clock, and continuing would let the connection
+                // outlive its 1008 close and lose a cancelled frame without a gap.
+                None => {
+                    return ended(Instant::now(), age_at, idle_at, slow_at)
+                        .unwrap_or(End::Close(1008));
+                }
                 Some(Ok(Ok(()))) => {
                     sent = true;
                     if let Some(n) = entries {
