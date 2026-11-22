@@ -161,7 +161,7 @@ async fn drive(
         // The queue, one item at a time; its bytes stay counted until it is written.
         let item = lock(&conn.q).out.pop_front();
         if let Some(out) = item {
-            let len = out.len();
+            let len = out.cost();
             let (msg, entries) = match out {
                 Out::Text(t) => (Message::Text(t.into()), None),
                 Out::Binary(b) => {

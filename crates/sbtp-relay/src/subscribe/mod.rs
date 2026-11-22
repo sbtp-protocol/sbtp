@@ -184,11 +184,32 @@ enum Out {
     Binary(Vec<u8>),
 }
 
+/// Security review 2026-11-22, L-6: what one queued item takes beyond its heap bytes, charged in
+/// the queue bound so that the bound counts memory, not payload: two slots of the `VecDeque` (its
+/// ring buffer grows by doubling and keeps its capacity) and [`ALLOC_SLACK`]. With it, a queue of
+/// one-entry frames of 81 bytes holds fewer than half the items it held when only payload was
+/// counted (about 800), and its memory stays within [`WS_SEND_BYTES`], so the per-connection term
+/// of rule 29 is unchanged.
+const ITEM_OVERHEAD: usize = 2 * std::mem::size_of::<Out>() + ALLOC_SLACK;
+/// The allocator's header and size rounding of one heap allocation: at most 24 bytes for the
+/// glibc allocator of the relay's image (an 8-byte header, rounded up to 16).
+const ALLOC_SLACK: usize = 32;
+
 impl Out {
-    fn len(&self) -> usize {
+    /// What the item is charged in the queue bound: its heap capacity and [`ITEM_OVERHEAD`].
+    fn cost(&self) -> usize {
+        ITEM_OVERHEAD
+            + match self {
+                Self::Text(t) => t.capacity(),
+                Self::Binary(b) => b.capacity(),
+            }
+    }
+
+    /// Gives back spare capacity, so that the item is charged its length.
+    fn shrink(&mut self) {
         match self {
-            Self::Text(t) => t.len(),
-            Self::Binary(b) => b.len(),
+            Self::Text(t) => t.shrink_to_fit(),
+            Self::Binary(b) => b.shrink_to_fit(),
         }
     }
 }
@@ -197,7 +218,7 @@ impl Out {
 #[derive(Debug, Default)]
 struct Queue {
     out: VecDeque<Out>,
-    /// Queued bytes, the frame being sent included.
+    /// Queued bytes, the frame being sent included, each item charged [`Out::cost`].
     bytes: usize,
     subs: HashMap<u32, Sub>,
     /// The gap after the last position evaluated for this connection (rule 31).
@@ -212,11 +233,13 @@ impl Queue {
         WS_SEND_BYTES.saturating_sub(self.bytes)
     }
 
-    fn push(&mut self, out: Out) -> bool {
-        if out.len() > self.room() {
+    fn push(&mut self, mut out: Out) -> bool {
+        out.shrink();
+        let cost = out.cost();
+        if cost > self.room() {
             return false;
         }
-        self.bytes += out.len();
+        self.bytes += cost;
         self.out.push_back(out);
         true
     }
@@ -241,7 +264,7 @@ impl Queue {
         }
     }
 
-    /// The item of `len` bytes was written (or given up): its bytes leave the queue, owed gaps are
+    /// The item charged `len` bytes was written (or given up): its bytes leave the queue, owed gaps are
     /// queued while they fit, and the slow-consumer clock of rule 20 stops once the queue is
     /// empty with no gap owed. Security review 2026-11-22, M-1: a client that reads slowly under
     /// steady traffic never empties its queue, though it flushes a gap now and then; its clock
@@ -872,6 +895,39 @@ mod tests {
             "then live delivery"
         );
         assert!(!lock(&c.q).gap_pending());
+    }
+
+    /// Security review 2026-11-22, L-6: a queue filled with the smallest delivery frames stays
+    /// within `WS_SEND_BYTES` of memory: its ring buffer, and each item's heap allocation with
+    /// the allocator's header and rounding (8 bytes, to 16).
+    #[test]
+    fn the_queue_bound_counts_memory() {
+        assert!(ITEM_OVERHEAD >= 2 * std::mem::size_of::<Out>() + 24);
+        let item = Item {
+            id: &BlockId([1; 32]),
+            mask: None,
+            fields: None,
+        };
+        let frame = proto::delivery(1, &"c".repeat(40), &[item]).unwrap();
+        assert_eq!(frame.len(), 81);
+        let mut q = Queue::default();
+        while q.push(Out::Binary(frame.clone())) {}
+        let heap: usize = q
+            .out
+            .iter()
+            .map(|o| match o {
+                Out::Text(t) => t.capacity(),
+                Out::Binary(b) => b.capacity(),
+            })
+            .map(|c| (c + 8).next_multiple_of(16))
+            .sum();
+        let memory = q.out.capacity() * std::mem::size_of::<Out>() + heap;
+        assert!(
+            memory <= WS_SEND_BYTES,
+            "{memory} bytes for {} items",
+            q.out.len()
+        );
+        assert!(q.bytes <= WS_SEND_BYTES);
     }
 
     /// ADR 0054 rule 34: a full writer queue gives every open subscription a gap, and later
