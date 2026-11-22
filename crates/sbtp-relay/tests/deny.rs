@@ -561,3 +561,122 @@ fn a_failed_purge_deletion_keeps_the_block_unlisted() {
     assert_eq!(get(&mut c, &path(&b.1), "").status, 404, "purged");
     assert_eq!(listed(&mut c, ""), Vec::<String>::new());
 }
+
+/// ADR 0051 clarification B10: a request that carried cursor `C` for a listing never gets a page
+/// of that listing with no identifier, `more = true` and `C` again, through runs of denied
+/// blocks (by `block_id` and by key), with `limit=1`, in both orders, for one parent and for a
+/// grouped request with per-parent cursors. Every walk ends with `more = false` and lists every
+/// block that is not denied.
+#[test]
+#[allow(clippy::too_many_lines)] // Four walks of one store.
+fn a_walk_always_advances_past_denied_blocks() {
+    let (relay, file) = start(
+        "",
+        &[
+            ("RATE_QUERY_BURST", "100000"),
+            ("RATE_QUERY_PER_MIN", "1000000"),
+        ],
+    );
+    let mut c = relay.connect();
+    let p1 = block(20, b"parent one", &[]);
+    let p2 = block(20, b"parent two", &[]);
+    store(&mut c, &p1);
+    store(&mut c, &p2);
+    let mut kept = Vec::new();
+    let mut by_id = Vec::new();
+    for n in 0..9u8 {
+        // Runs of three denied blocks (two by key, one by id) around each kept one.
+        let parents = [p1.1, p2.1];
+        let seed = if n % 3 == 2 { 22 } else { 21 };
+        let b = block(seed, &[b'c', n], &parents);
+        store(&mut c, &b);
+        if n % 3 == 1 {
+            by_id.push(b.1);
+        } else if seed == 22 {
+            kept.push(b.1.to_string());
+        }
+    }
+    let list = by_id
+        .iter()
+        .fold(String::new(), |l, id| l + &format!("block {id}\n"));
+    deny(&relay, &file, &format!("{list}key {}\n", key_hex(21)));
+    assert!(relay.mark());
+    let walk = |c: &mut TcpStream, base: &str| {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let q = match &cursor {
+                Some(k) => format!("{base}&cursor={k}"),
+                None => base.to_owned(),
+            };
+            let r = get(c, &format!("/sbtp/v1/query?{q}"), "");
+            assert_eq!(r.status, 200, "{q}: {}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            let page: Vec<String> = v["block_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i.as_str().unwrap().to_owned())
+                .collect();
+            let next = v["cursor"].as_str().unwrap().to_owned();
+            if let Some(k) = &cursor {
+                assert!(
+                    !(page.is_empty() && v["more"] == true && next == *k),
+                    "{q}: an empty page with more and the same cursor"
+                );
+            }
+            ids.extend(page);
+            if v["more"] == false {
+                return ids;
+            }
+            cursor = Some(next);
+        }
+        panic!("{base}: the walk did not end");
+    };
+    let kids: Vec<String> = walk(&mut c, &format!("limit=1&parent={}", p1.1));
+    assert_eq!(kids, kept);
+    let mut desc = walk(&mut c, &format!("limit=1&order=desc&parent={}", p2.1));
+    desc.reverse();
+    assert_eq!(desc, kept);
+    let all = walk(&mut c, "limit=1");
+    assert_eq!(
+        all,
+        [&[p1.1.to_string(), p2.1.to_string()][..], &kept].concat()
+    );
+    // Grouped: each listing carries its own cursor; check every listing of every page.
+    let mut cursors = [None::<String>, None];
+    for _ in 0..100 {
+        let ps: Vec<String> = [p1.1, p2.1]
+            .iter()
+            .zip(&cursors)
+            .map(|(p, k)| match k {
+                Some(k) => format!("parent={p}.{k}"),
+                None => format!("parent={p}"),
+            })
+            .collect();
+        let v = get(
+            &mut c,
+            &format!("/sbtp/v1/query?limit=1&{}", ps.join("&")),
+            "",
+        )
+        .json();
+        let mut done = true;
+        for (i, l) in v["parents"].as_array().unwrap().iter().enumerate() {
+            let next = l["cursor"].as_str().unwrap().to_owned();
+            if let Some(k) = &cursors[i] {
+                assert!(
+                    !(l["block_ids"].as_array().unwrap().is_empty()
+                        && l["more"] == true
+                        && next == *k),
+                    "grouped listing {i}: an empty page with more and the same cursor"
+                );
+            }
+            done &= l["more"] == false;
+            cursors[i] = Some(next);
+        }
+        if done {
+            return;
+        }
+    }
+    panic!("the grouped walk did not end");
+}
