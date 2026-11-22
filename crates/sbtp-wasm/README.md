@@ -95,12 +95,18 @@ const signed = sbtp.attachSignature(block, signature);   // verified (C2, C3) be
 
 `signingMessage(block)` and `SealPending.message` return a `SigningMessage`, not bytes: `bytes` (a
 copy, 49 bytes for kind `"block"`, the spec §5.3 message for kind `"sealed"`), `kind` (`"block"` or
-`"sealed"`), `free()`. It has no constructor and no factory: only these two typed builders make one, so
-a signer that takes a `SigningMessage` and checks `message instanceof SigningMessage` never signs bytes
-its caller chose. The shipped `.d.ts` also brands it, so a `Uint8Array` or an object literal does not
-type-check where a `SigningMessage` is expected. A sealed message holds `msg`: free it after signing,
-and `fill(0)` the `bytes` copy. This is an API shape, not a sandbox: a script running in the page can
-still call `crypto.subtle.sign` on the key handle directly (see the threat model below).
+`"sealed"`), `free()`. It has no constructor and no factory: only these two typed builders make one.
+The shipped `.d.ts` also brands it, so a `Uint8Array` or an object literal does not type-check where a
+`SigningMessage` is expected.
+
+This protects against API misuse, not against code in the same JavaScript realm. A signer that takes a
+`SigningMessage` and checks `message instanceof SigningMessage` cannot be handed caller bytes by
+mistake, but code running in the page can forge one (`Object.create(SigningMessage.prototype)`, the
+glue's static `__wrap`, or a write to the module's `memory`), and can call `crypto.subtle.sign` on the
+key handle directly anyway (see the threat model below). A signer should therefore also check the
+shape of `bytes`: kind `"block"` is exactly 49 bytes starting with `SBTP-v1-block-sig`; kind `"sealed"`
+is at least 114 bytes starting with `SBTP-v1-sealed-sig`. A sealed message holds `msg`: free it after
+signing, and `fill(0)` the `bytes` copy.
 
 `parents` is the concatenation of 0 to 8 distinct 32-byte identifiers. `mineSlice` mines in place and
 returns the `block_id` once found, `undefined` when the slice is spent (call it again: the block holds the

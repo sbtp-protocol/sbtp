@@ -11,11 +11,17 @@ const require = createRequire(import.meta.url);
 const hex = (text) => Uint8Array.from(text.match(/../g) ?? [], (b) => parseInt(b, 16));
 const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const fill = (n, byte) => new Uint8Array(n).fill(byte);
+const occurrences = (needle) => {
+  const heap = Buffer.from(memory.buffer);
+  let n = 0;
+  for (let i = heap.indexOf(needle); i !== -1; i = heap.indexOf(needle, i + 1)) n++;
+  return n;
+};
 
 // The Node.js entry has instantiated the module (and run the self-test) on import.
 const resolved = require.resolve("@sbtp/wasm");
 assert.match(resolved, /[\\/]node_modules[\\/]@sbtp[\\/]wasm[\\/]node\.js$/);
-await init(); // accepted, returns at once
+const { memory } = await init(); // accepted, returns at once (with the module's exports)
 sbtp.selfTest();
 const manifest = JSON.parse(readFileSync(require.resolve("@sbtp/wasm/package.json"), "utf8"));
 assert.equal(manifest.scripts, undefined);
@@ -71,11 +77,26 @@ const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "he
 const identityKey = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
 const identityPublic = new Uint8Array(
   Buffer.from(createPublicKey(identityKey).export({ format: "jwk" }).x, "base64url"));
+// `instanceof` guards against API misuse only; the signer also checks the shape of the bytes
+// (security review 2026-11-22, L-3).
+const SHAPES = {
+  block: { prefix: Buffer.from("SBTP-v1-block-sig"), fits: (n) => n === 49 },
+  sealed: { prefix: Buffer.from("SBTP-v1-sealed-sig"), fits: (n) => n >= 114 },
+};
 function externalSign(message) {
   if (!(message instanceof sbtp.SigningMessage)) throw new TypeError("not a SigningMessage");
-  return new Uint8Array(ed25519Sign(null, message.bytes, identityKey));
+  const bytes = message.bytes;
+  const shape = SHAPES[message.kind];
+  if (!shape || !shape.fits(bytes.length) || !Buffer.from(bytes).subarray(0, shape.prefix.length).equals(shape.prefix)) {
+    throw new TypeError(`not a ${message.kind} signing message`);
+  }
+  return new Uint8Array(ed25519Sign(null, bytes, identityKey));
 }
 assert.throws(() => externalSign(new Uint8Array(49)), TypeError);
+// A forged object passes instanceof (same realm) but yields no bytes.
+const forged = Object.create(sbtp.SigningMessage.prototype);
+assert.ok(forged instanceof sbtp.SigningMessage);
+assert.throws(() => externalSign(forged));
 assert.deepEqual(Object.getOwnPropertyNames(sbtp.SigningMessage).filter(
   (n) => !["length", "name", "prototype", "__wrap"].includes(n)), []); // no factory
 
@@ -94,6 +115,10 @@ assert.deepEqual(ownInfo.publicKey, identityPublic);
 const pending = sbtp.sealPrepare(identityPublic, recipient.publicKey, recipientId, tag, NOTE);
 const sealedMessage = pending.message;
 assert.equal(sealedMessage.kind, "sealed");
+// Reading `bytes` copies straight to JS: no new copy of msg is left in WASM memory (review I-1).
+const before = occurrences(Buffer.from(NOTE));
+sealedMessage.bytes.fill(0);
+assert.ok(occurrences(Buffer.from(NOTE)) <= before, "SigningMessage.bytes left a copy of msg in WASM memory");
 const env2 = pending.finish(externalSign(sealedMessage));
 sealedMessage.free();
 const block2 = env2.unsignedBlock(BigInt(Date.now()));

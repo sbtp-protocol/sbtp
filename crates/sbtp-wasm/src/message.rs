@@ -3,9 +3,16 @@
 //!
 //! A `SigningMessage` comes out of `signingMessage(block)` (kind `"block"`: `SIG_PREFIX ‖
 //! block_id`, spec §3.2) or `SealPending.message` (kind `"sealed"`: the sealed signature message of
-//! `l2-grammar.md` §5.3). There is no constructor and no function that turns caller bytes into one,
-//! so a signer that accepts only a `SigningMessage` (checked with `instanceof` at run time, and by
-//! the brand of the shipped `.d.ts` at compile time) only ever signs messages built here.
+//! `l2-grammar.md` §5.3). There is no constructor and no function that turns caller bytes into one.
+//!
+//! This protects against API misuse, not against code running in the same JavaScript realm. A
+//! signer that accepts only a `SigningMessage` (checked with `instanceof` at run time, and by the
+//! brand of the shipped `.d.ts` at compile time) cannot be handed a `Uint8Array` by mistake. But code
+//! in the same realm can forge one: `Object.create(SigningMessage.prototype)` passes `instanceof`,
+//! the glue's static `__wrap` wraps any pointer, and the module's `memory` can be overwritten; it
+//! can also call the signer on the key handle directly. A signer SHOULD therefore also check the
+//! shape of `bytes`: kind `"block"` is exactly 49 bytes starting with `SBTP-v1-block-sig`; kind
+//! `"sealed"` is at least 114 bytes starting with `SBTP-v1-sealed-sig`.
 
 use core::fmt;
 
@@ -33,8 +40,9 @@ impl MessageKind {
 }
 
 /// A message built by a typed builder, for an external Ed25519 signer (ADR 0055 E1). A sealed
-/// message holds the plaintext `msg`: the copy held here is wiped on `free()`; the copies returned
-/// by `bytes` belong to the caller (`fill(0)` them after signing).
+/// message holds the plaintext `msg`: the copy held here is wiped on `free()`; `bytes` copies it
+/// straight into a new JS `Uint8Array` (no temporary buffer in WASM memory), which belongs to the
+/// caller (`fill(0)` it after signing).
 #[wasm_bindgen]
 pub struct SigningMessage {
     bytes: Zeroizing<Vec<u8>>,
@@ -77,10 +85,13 @@ impl SigningMessage {
 impl SigningMessage {
     /// A copy of the exact bytes to hand to the signer (Web Crypto
     /// `sign("Ed25519", key, message.bytes)`). Sign them, and nothing else, for this block or seal.
+    ///
+    /// Copied from the held bytes directly into JS memory: a `Vec` return would leave an unwiped
+    /// temporary copy in the WASM heap (security review 2026-11-22, I-1).
     #[wasm_bindgen(getter)]
     #[must_use]
-    pub fn bytes(&self) -> Vec<u8> {
-        self.bytes.to_vec()
+    pub fn bytes(&self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(&self.bytes[..])
     }
 
     /// `"block"` (spec §3.2) or `"sealed"` (spec §5.3).
@@ -113,7 +124,6 @@ mod tests {
         let block = SigningMessage::new(MessageKind::Block, &[7; 49]);
         assert_eq!(block.kind(), "block");
         assert_eq!(block.message_kind(), MessageKind::Block);
-        assert_eq!(block.bytes(), vec![7; 49]);
         assert_eq!(block.as_bytes(), &[7; 49]);
         assert_eq!(
             SigningMessage::new(MessageKind::Sealed, b"x").kind(),

@@ -67,12 +67,16 @@ through `signingMessage` / `attachSignature`, or `sealPrepare` / `finish` for se
 Those two builders return a `SigningMessage` (`bytes`, `kind`: `"block"` or `"sealed"`, `free()`),
 never bare bytes, and nothing else creates one: there is no constructor or factory. An external signer
 should accept only a `SigningMessage` (`instanceof` at run time; the `.d.ts` brands the type, so a
-`Uint8Array` does not type-check) and sign its `bytes`, so that it never signs bytes its caller chose
-(ADR 0055 E1).
+`Uint8Array` does not type-check) and sign its `bytes` (ADR 0055 E1). This protects against API
+misuse, not against code in the same JavaScript realm, which can forge a `SigningMessage` or call the
+signer directly. The signer should also check the shape of `bytes`: kind `"block"` is exactly 49 bytes
+starting with `SBTP-v1-block-sig`; kind `"sealed"` is at least 114 bytes starting with
+`SBTP-v1-sealed-sig`.
 
 ```js
 const message = sbtp.signingMessage(minedBlock);   // or pending.message, kind "sealed"
-const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, message.bytes));
+const bytes = message.bytes;                        // check kind, length and prefix as above
+const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", identityKey, bytes));
 message.free();
 const signed = sbtp.attachSignature(minedBlock, sig); // verified before it returns
 ```
