@@ -152,14 +152,42 @@ pub struct Relay<I> {
     before_quarantine: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
+/// Why [`Relay::new`] failed; the relay does not start.
+#[derive(Debug)]
+pub enum NewError {
+    /// The demand set of ADR 0046 rule 25 or the group table of ADR 0049 rule 5 could not be
+    /// allocated.
+    Alloc(TryReserveError),
+    /// With `ws_enabled`, the newest position could not be read (ADR 0054 rule 14). Security
+    /// review 2026-11-22, L-2: starting from position 0 instead would make every first
+    /// subscriber walk the whole store.
+    Head,
+}
+
+impl From<TryReserveError> for NewError {
+    fn from(e: TryReserveError) -> Self {
+        Self::Alloc(e)
+    }
+}
+
+impl std::fmt::Display for NewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Alloc(e) => write!(f, "allocating the demand set: {e}"),
+            Self::Head => f.write_str("reading the newest position for subscriptions failed"),
+        }
+    }
+}
+
+impl std::error::Error for NewError {}
+
 impl<I: IndexBackend + 'static> Relay<I> {
     /// The block routes' state over an open store and index.
     ///
     /// # Errors
     ///
-    /// The demand set of ADR 0046 rule 25 or the group table of ADR 0049 rule 5 could not be
-    /// allocated.
-    pub fn new(s: &Settings, store: Store, index: IndexHandle<I>) -> Result<Self, TryReserveError> {
+    /// [`NewError`]: an allocation failed, or the newest position could not be read.
+    pub fn new(s: &Settings, store: Store, index: IndexHandle<I>) -> Result<Self, NewError> {
         let queue = Duration::from_millis(s.queue_timeout_ms);
         let demand = Demand::new(s)?;
         let (cache_control, cdn_cache_control) = cache_headers(&demand);
@@ -182,7 +210,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 })
                 .ok()
                 .and_then(Result::ok)
-                .unwrap_or_default();
+                .ok_or(NewError::Head)?;
             let epoch = index.clone();
             Hub::new(s, head, move || epoch.epoch())
         } else {

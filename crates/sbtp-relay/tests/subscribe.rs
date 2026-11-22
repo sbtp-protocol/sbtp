@@ -775,6 +775,74 @@ fn a_slow_reader_under_steady_traffic_gets_1008() {
     }
 }
 
+/// Rules 14 and 34, security review 2026-11-22 L-2: the fan-out runs from start-up. More blocks
+/// than the fan-out queue holds, accepted before the first subscription connection, cause no
+/// `fanout` gap, and the first subscriber's `start` is the current head: the walk of rule 15
+/// from it lists nothing the subscription does not then deliver.
+#[test]
+fn the_first_subscriber_starts_at_the_head() {
+    let r = relay(&[
+        ("RATE_PUT_BURST", "1000000"),
+        ("INGEST_BYTES_PER_HOUR", "0"),
+    ]);
+    let mut c = r.connect();
+    let parent = BlockId([77; 32]);
+    let before = u32::try_from(sbtp_relay::subscribe::FANOUT_QUEUE).unwrap() + 44;
+    for n in 0..before {
+        if n % 100 == 99 {
+            c = r.connect();
+        }
+        let (b, _) = block(10, &n.to_be_bytes(), &[parent]);
+        assert_eq!(put_block(&mut c, &b).status, 201);
+    }
+    let mut ws = open(&r);
+    send(
+        &mut ws,
+        &format!(
+            r#"{{"op":"subscribe","sub":1,"parents":["{}"]}}"#,
+            hex(&parent)
+        ),
+    );
+    let m = next_json(&mut ws);
+    assert_eq!(m["op"], "subscribed", "{m}");
+    let start = m["start"].as_str().unwrap().to_owned();
+    let walked = get(
+        &mut c,
+        &format!(
+            "/sbtp/v1/query?parent={}&order=asc&cursor={start}&limit=1000",
+            hex(&parent)
+        ),
+        "",
+    )
+    .json();
+    let walked: Vec<BlockId> = walked["block_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| sbtp_relay::store::parse_hex_id(id.as_str().unwrap()).unwrap())
+        .collect();
+    assert!(walked.len() < 10, "{} blocks before start", walked.len());
+    let (last, last_id) = block(10, b"after start", &[parent]);
+    assert_eq!(put_block(&mut c, &last).status, 201);
+    let mut delivered = Vec::new();
+    while !delivered.contains(&last_id) {
+        match next(&mut ws) {
+            Message::Binary(b) => delivered.extend(delivery(&b).3.into_iter().map(|e| e.0)),
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                assert_eq!(v["op"], "tick", "no gap expected: {v}");
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    for id in &walked {
+        assert!(
+            delivered.contains(id),
+            "listed after start, not delivered: {id}"
+        );
+    }
+}
+
 /// Rule 42: a block of a denied key is never delivered.
 #[test]
 fn a_denied_block_is_never_delivered() {

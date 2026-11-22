@@ -142,6 +142,8 @@ impl TestServer {
         let walked = std::sync::Arc::clone(&relay);
         let marker = Box::new(move || sbtp_relay::deny::mark_all(&walked, 2));
         let denied = std::sync::Arc::clone(&relay);
+        // ADR 0054 rule 34: the fan-out starts with the runtime, as `sbtp_relay::run` does.
+        let fanout = relay.subscriptions().cloned();
         let app = sbtp_relay::api::layered(
             sbtp_relay::api::routes(settings, relay).merge(extra),
             settings,
@@ -157,6 +159,9 @@ impl TestServer {
                 .unwrap();
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                if let Some(hub) = fanout {
+                    hub.start();
+                }
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
                 // ADR 0052 rule 4: the reload task, as `sbtp_relay::run` starts it.
                 let (deny_stop, deny_stopped) = tokio::sync::watch::channel(false);

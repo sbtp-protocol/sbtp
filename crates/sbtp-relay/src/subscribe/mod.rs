@@ -408,7 +408,8 @@ impl Hub {
         }
     }
 
-    /// Starts the fan-out task once; called from inside the runtime.
+    /// Starts the fan-out task once; called from inside the runtime at start-up, before the
+    /// relay listens (security review 2026-11-22, L-2).
     pub fn start(self: &Arc<Self>) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
@@ -714,7 +715,6 @@ pub async fn upgrade(
     };
     let stopping = link.stopping.clone();
     let limiter = Arc::clone(&link.limiter);
-    hub.start();
     // Rule 29: every size of the codec set explicitly.
     ws.read_buffer_size(WS_READ_BUFFER)
         .write_buffer_size(0)
