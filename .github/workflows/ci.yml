@@ -199,6 +199,11 @@ jobs:
       - name: Contents check
         run: sh crates/sbtp-wasm/npm/check.sh "dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz"
 
+      # Installs the tarball into a scratch project (scripts disabled, offline) and runs a
+      # seal, open and validate round trip through the package's own exports.
+      - name: Smoke test of the installed package
+        run: sh crates/sbtp-wasm/npm/smoke.sh "dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz"
+
   deny:
     name: cargo deny (workspace and fuzz)
     runs-on: ubuntu-24.04
