@@ -8,11 +8,14 @@
 //   node tools.mjs pack-integrity < npm-pack.json         the integrity npm pack reported
 //   node tools.mjs dts-fix <sbtp_wasm.d.ts>               rewrites the DOM-only types of the init API
 //   node tools.mjs dts-check < sbtp_wasm.d.ts             checks the declarations, exit 1 on a finding
+//   node tools.mjs tar-list <package.tgz>                 checks the archive; prints "size name" lines
+//   node tools.mjs tar-cat <package.tgz> <name>           checks the archive; writes one file to stdout
 //
 // The functions are exported for tools.test.mjs; they throw on a finding.
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { crc32, inflateRawSync } from "node:zlib";
 
 // The files of the package (rule 35 of ADR 0053: build output, type declarations, licences, README).
 // npm adds package.json and README.md whatever `files` says.
@@ -208,9 +211,98 @@ export function dtsCheck(text) {
   if (findings.length > 0) throw new Error(findings.join("; "));
 }
 
+// --- Package archive ------------------------------------------------------------------------
+//
+// check.sh reads the tarball through readPackage only, so that it checks the bytes npm installs
+// (security review 2026-11-22, L-1): bsdtar stops at a lone zero block where node-tar, which npm
+// uses, reads on. The archive is therefore accepted only in the exact form npm pack writes: one
+// gzip member with no optional header field and nothing after it; ustar headers of regular files
+// with valid checksums, mode 0644, names on the expected list, each exactly once; then zero blocks
+// only, to the end.
+
+// Every file of the package, as npm pack names it: npm adds package.json and README.md.
+export const PACKAGE_FILES = ["package.json", "README.md", ...SHIPPED].map((f) => `package/${f}`).sort();
+
+// The bound on the decompressed archive: above check.sh's MAX_UNPACKED_BYTES plus the tar headers,
+// so that check.sh reports the size, and a gzip bomb stops here.
+export const MAX_TAR_BYTES = 2_000_000;
+
+function gunzipOneMember(gz, maxBytes) {
+  // RFC 1952: ID1 ID2 CM FLG MTIME(4) XFL OS. npm pack sets no flag (no name, comment or extra).
+  if (gz.length < 18 || gz[0] !== 0x1f || gz[1] !== 0x8b) throw new Error("not a gzip file");
+  if (gz[2] !== 8) throw new Error(`gzip compression method ${gz[2]}, expected 8 (deflate)`);
+  if (gz[3] !== 0) throw new Error(`gzip header flags 0x${gz[3].toString(16)}, expected none`);
+  let inflated;
+  try {
+    inflated = inflateRawSync(gz.subarray(10), { info: true, maxOutputLength: maxBytes });
+  } catch (e) {
+    throw new Error(`gzip data: ${e.message}`);
+  }
+  const { buffer: data, engine } = inflated;
+  const end = 10 + engine.bytesWritten;
+  if (end + 8 > gz.length) throw new Error("gzip trailer missing");
+  if (gz.readUInt32LE(end) !== crc32(data)) throw new Error("gzip CRC-32 mismatch");
+  if (gz.readUInt32LE(end + 4) !== data.length % 2 ** 32) throw new Error("gzip size mismatch");
+  if (end + 8 !== gz.length) {
+    throw new Error(`${gz.length - end - 8} bytes after the first gzip member (a second member or trailing data)`);
+  }
+  return data;
+}
+
+// A NUL- or space-terminated octal field. Base-256 sizes (high bit set) are refused.
+function octalField(h, offset, width, what) {
+  const text = h.subarray(offset, offset + width).toString("latin1").replace(/[\0 ]+$/, "");
+  if (!/^[0-7]+$/.test(text)) throw new Error(`bad ${what} field ${JSON.stringify(text)}`);
+  return parseInt(text, 8);
+}
+
+const cString = (h, offset, width) => {
+  const field = h.subarray(offset, offset + width);
+  const nul = field.indexOf(0);
+  return field.subarray(0, nul === -1 ? width : nul).toString("utf8");
+};
+
+// The files of a package tarball, as a Map from name to contents, in archive order.
+export function readPackage(gz, expected = PACKAGE_FILES, maxBytes = MAX_TAR_BYTES) {
+  const tarData = gunzipOneMember(gz, maxBytes);
+  if (tarData.length % 512 !== 0) throw new Error(`tar stream of ${tarData.length} bytes, not whole 512-byte blocks`);
+  const files = new Map();
+  let p = 0;
+  for (;;) {
+    if (p >= tarData.length) throw new Error("tar stream without an end-of-archive zero block");
+    const h = tarData.subarray(p, p + 512);
+    if (h.every((b) => b === 0)) break;
+    const at = `tar header at offset ${p}`;
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 0x20 : h[i];
+    if (octalField(h, 148, 8, "checksum") !== sum) throw new Error(`${at}: bad checksum`);
+    if (h.subarray(257, 265).toString("latin1") !== "ustar\u000000") throw new Error(`${at}: not a ustar header`);
+    const type = String.fromCharCode(h[156]);
+    const prefix = cString(h, 345, 155);
+    const name = prefix ? `${prefix}/${cString(h, 0, 100)}` : cString(h, 0, 100);
+    if (type !== "0") throw new Error(`${at}: ${JSON.stringify(name)} is not a regular file (type ${JSON.stringify(type)})`);
+    if (!expected.includes(name)) throw new Error(`${at}: unexpected file ${JSON.stringify(name)}`);
+    if (files.has(name)) throw new Error(`${at}: ${name} occurs twice`);
+    const mode = octalField(h, 100, 8, "mode");
+    if (mode !== 0o644) throw new Error(`${at}: ${name} has mode ${mode.toString(8)}, expected 644`);
+    const size = octalField(h, 124, 12, "size");
+    const start = p + 512;
+    if (start + size > tarData.length) throw new Error(`${at}: ${name} runs past the end of the archive`);
+    files.set(name, tarData.subarray(start, start + size));
+    p = start + Math.ceil(size / 512) * 512;
+  }
+  // Everything after the first zero block is zero: no entry hides behind it.
+  const rest = tarData.subarray(p);
+  const nonZero = rest.findIndex((b) => b !== 0);
+  if (nonZero !== -1) throw new Error(`non-zero byte at offset ${p + nonZero}, after the end-of-archive block`);
+  const missing = expected.filter((f) => !files.has(f));
+  if (missing.length > 0) throw new Error(`missing ${missing.join(", ")}`);
+  return files;
+}
+
 // --- Command line ---------------------------------------------------------------------------
 
-function main([command, arg]) {
+function main([command, arg, arg2]) {
   const stdin = () => readFileSync(0, "utf8");
   try {
     switch (command) {
@@ -226,6 +318,16 @@ function main([command, arg]) {
       case "pack-integrity": console.log(packIntegrity(stdin())); break;
       case "dts-fix": writeFileSync(arg, dtsFix(readFileSync(arg, "utf8"))); break;
       case "dts-check": dtsCheck(stdin()); break;
+      case "tar-list":
+        for (const [name, data] of readPackage(readFileSync(arg))) console.log(`${data.length} ${name}`);
+        break;
+      case "tar-cat": {
+        const name = arg2;
+        const data = readPackage(readFileSync(arg)).get(name);
+        if (!data) throw new Error(`no file ${name}`);
+        process.stdout.write(data);
+        break;
+      }
       default: throw new Error("unknown command");
     }
   } catch (e) {
