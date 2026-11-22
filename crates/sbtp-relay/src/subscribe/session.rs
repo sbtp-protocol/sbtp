@@ -92,6 +92,38 @@ fn read_failed(e: axum::Error) -> End {
     }
 }
 
+/// Security review 2026-11-22, M-1: the deadlines that end a connection whatever its queue holds,
+/// checked at the top of every turn of the loop and raced against every send, so that a client
+/// that reads slowly under steady traffic is still closed: `ws_max_age_ms` and `idle_timeout_ms`
+/// (rule 33), and `slow_at`, 2 × `tick_ms` after the queue overflowed (rule 20). Liveness (rule
+/// 32) is judged only while the queue is empty, when the session reads: a pong cannot be read
+/// while a send is in progress.
+fn ending(age_at: Instant, idle_at: Option<Instant>, slow_at: Option<Instant>) -> Instant {
+    [Some(age_at), idle_at, slow_at]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(age_at)
+}
+
+/// The close of [`ending`] due at `now`, if any.
+fn ended(
+    now: Instant,
+    age_at: Instant,
+    idle_at: Option<Instant>,
+    slow_at: Option<Instant>,
+) -> Option<End> {
+    if now >= age_at || idle_at.is_some_and(|t| t <= now) {
+        // Rule 33.
+        return Some(End::Close(1000));
+    }
+    if slow_at.is_some_and(|t| t <= now) {
+        // Rule 20: the subscriptions keep overflowing.
+        return Some(End::Close(1008));
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines)] // One loop for the whole life of the connection.
 async fn drive(
     hub: &Hub,
@@ -115,6 +147,17 @@ async fn drive(
             // Rule 23.
             return End::Close(1001);
         }
+        let (can_read, slow_at) = {
+            let q = lock(&conn.q);
+            (
+                q.room() >= proto::MAX_CONTROL,
+                q.overflow_since.map(|t| t + 2 * lim.ping),
+            )
+        };
+        if let Some(end) = ended(Instant::now(), age_at, idle_at, slow_at) {
+            return end;
+        }
+        let ending = ending(age_at, idle_at, slow_at);
         // The queue, one item at a time; its bytes stay counted until it is written.
         let item = lock(&conn.q).out.pop_front();
         if let Some(out) = item {
@@ -126,43 +169,32 @@ async fn drive(
                     (Message::Binary(b.into()), Some(n))
                 }
             };
-            // Rule 20: a client that does not read for 2 × `tick_ms` is dropped.
+            // Rule 20: a client that does not read for 2 × `tick_ms` is dropped. M-1: a deadline
+            // that ends the connection interrupts the send; the next turn closes.
             let r = tokio::select! {
                 biased;
                 _ = stopping.changed() => return End::Drop,
-                r = timeout(2 * lim.ping, socket.send(msg)) => r,
+                () = sleep_until(ending) => None,
+                r = timeout(2 * lim.ping, socket.send(msg)) => Some(r),
             };
-            {
-                let mut q = lock(&conn.q);
-                q.bytes = q.bytes.saturating_sub(len);
-                q.flush_gaps();
-            }
+            lock(&conn.q).release(len);
             match r {
-                Ok(Ok(())) => {
+                None => {}
+                Some(Ok(Ok(()))) => {
                     sent = true;
                     if let Some(n) = entries {
                         metrics::sent(1, n);
                     }
                 }
-                Ok(Err(_)) | Err(_) => return End::Drop,
+                Some(Ok(Err(_)) | Err(_)) => return End::Drop,
             }
             continue;
         }
-        let (can_read, overflow) = {
-            let q = lock(&conn.q);
-            (q.room() >= proto::MAX_CONTROL, q.overflow_since)
-        };
-        let slow_at = overflow.map(|t| t + 2 * lim.ping);
-        let now = Instant::now();
-        if slow_at.is_some_and(|t| t <= now) {
-            // Rule 20: the subscriptions keep overflowing.
-            return End::Close(1008);
-        }
-        let wake = [Some(ping_at), Some(age_at), idle_at, pong_due, slow_at]
+        let wake = [Some(ping_at), Some(ending), pong_due]
             .into_iter()
             .flatten()
             .min()
-            .unwrap_or(age_at);
+            .unwrap_or(ending);
         tokio::select! {
             biased;
             _ = stopping.changed() => return End::Close(1001),
@@ -191,10 +223,6 @@ async fn drive(
             }
             () = sleep_until(wake) => {
                 let now = Instant::now();
-                if now >= age_at || idle_at.is_some_and(|t| t <= now) {
-                    // Rule 33.
-                    return End::Close(1000);
-                }
                 if pong_due.is_some_and(|t| t <= now) {
                     // Rule 32.
                     return End::Close(1001);
@@ -216,6 +244,7 @@ async fn drive(
                     sent = false;
                     ping_at = now + lim.ping;
                 }
+                // The deadlines of [`ending`] are acted on at the next turn.
             }
         }
     }

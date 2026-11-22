@@ -28,6 +28,9 @@ use tungstenite::{Message, protocol::frame::coding::CloseCode};
 
 type Ws = WebSocket<TcpStream>;
 
+/// The tests that watch the process-wide gap and close counters run one at a time.
+static SLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A relay at difficulty 0 with subscriptions on, and `extra` settings.
 fn relay(extra: &[(&str, &str)]) -> TestServer {
     let mut pairs = vec![
@@ -575,9 +578,13 @@ fn an_upgraded_connection_leaves_the_per_client_bound() {
 
 /// Rules 18 and 19, 20 and 29: a consumer that stops reading gets one `gap` instead of the
 /// deliveries that do not fit, and the relay's queue never grows; the `gap` cursor, walked with
-/// `/query`, lists every block it was not given. Slow clients are not kept for ever (1008).
+/// `/query`, lists every block it was not given. Slow clients are not kept for ever: see
+/// `a_slow_reader_under_steady_traffic_gets_1008`.
 #[test]
 fn a_slow_consumer_gets_a_gap() {
+    let _one = SLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let r = relay(&[
         ("WS_PING_INTERVAL_MS", "5000"),
         ("WS_MAX_SUBSCRIPTIONS", "32"),
@@ -664,6 +671,107 @@ fn a_slow_consumer_gets_a_gap() {
     }
     for id in &ids {
         assert!(delivered.contains(id), "missing {id}");
+    }
+}
+
+/// Rule 20, security review 2026-11-22 M-1: a client that keeps reading, but more slowly than
+/// steady traffic fills its queue, is closed with 1008 about 2 × `tick_ms` after the first
+/// overflow, although its queue never empties and every single send completes.
+#[test]
+fn a_slow_reader_under_steady_traffic_gets_1008() {
+    let _one = SLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = relay(&[
+        ("WS_PING_INTERVAL_MS", "5000"),
+        ("WS_MAX_SUBSCRIPTIONS", "32"),
+        ("RATE_PUT_BURST", "1000000"),
+        ("INGEST_BYTES_PER_HOUR", "0"),
+        ("PUT_MAX_IN_FLIGHT", "8"),
+        ("PUT_MAX_IN_FLIGHT_PER_CLIENT", "8"),
+    ]);
+    let parents: Vec<BlockId> = (0..8u8).map(|n| BlockId([n + 101; 32])).collect();
+    let mut ws = open(&r);
+    let list = parents
+        .iter()
+        .map(|p| format!("\"{}\"", hex(p)))
+        .collect::<Vec<_>>()
+        .join(",");
+    for sub in 1..=32 {
+        send(
+            &mut ws,
+            &format!(r#"{{"op":"subscribe","sub":{sub},"parents":[{list}],"fields":"parents"}}"#),
+        );
+        assert_eq!(next_json(&mut ws)["op"], "subscribed");
+    }
+    let closed = ws_metrics::closed_total("1008");
+    // Steady traffic from four writers until told to stop, about 11 KB of frames per block, so
+    // that the socket buffers fill even when the index commits slowly.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4u32)
+        .map(|w| {
+            let (addr, stop, parents) = (r.addr, std::sync::Arc::clone(&stop), parents.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A refused or failed `PUT` (a slow disk under the whole test suite) is
+                    // not this test's concern: the writer goes on, on a new connection.
+                    let mut c = common::connect(addr);
+                    for _ in 0..50 {
+                        let (b, _) =
+                            block(9, &[w.to_be_bytes(), n.to_be_bytes()].concat(), &parents);
+                        n += 1;
+                        let head = format!(
+                            "PUT /sbtp/v1/block HTTP/1.1\r\nHost: relay.test\r\n\
+                             Content-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            b.len()
+                        );
+                        let sent = c
+                            .write_all(head.as_bytes())
+                            .and_then(|()| c.write_all(&b))
+                            .and_then(|()| common::read_response(&mut c));
+                        if !sent.is_ok_and(|r| r.status == 201) {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    // A slow reader: one message every 50 ms, about 7 KB/s, so that the queue would take about
+    // 9 s to drain even if the writer paused.
+    let t = Instant::now();
+    while ws_metrics::closed_total("1008") == closed {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "a slow reader was never closed"
+        );
+        match ws.read() {
+            Ok(Message::Close(f)) => {
+                panic!("closed with {f:?} before 1008 was counted");
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("connection lost before 1008 was counted: {e}"),
+        }
+    }
+    // 2 × `tick_ms` after the first overflow, not much later.
+    assert!(t.elapsed() >= Duration::from_secs(9), "{:?}", t.elapsed());
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    // Read what is left: the close frame, unless the relay gave up sending it to a client that
+    // was still reading slowly (it then drops the connection).
+    loop {
+        match ws.read() {
+            Ok(Message::Close(f)) => {
+                assert_eq!(f.map(|f| u16::from(f.code)), Some(1008));
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
     }
 }
 

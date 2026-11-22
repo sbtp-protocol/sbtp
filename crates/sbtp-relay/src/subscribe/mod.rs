@@ -199,7 +199,8 @@ struct Queue {
     subs: HashMap<u32, Sub>,
     /// The gap after the last position evaluated for this connection (rule 31).
     next: Position,
-    /// When a delivery was first dropped since the queue last had room (rule 20).
+    /// When a delivery was first dropped since the queue was last empty with no gap owed (rule
+    /// 20).
     overflow_since: Option<tokio::time::Instant>,
 }
 
@@ -235,7 +236,17 @@ impl Queue {
                 s.gap = false;
             }
         }
-        if self.subs.values().all(|s| !s.gap) {
+    }
+
+    /// The item of `len` bytes was written (or given up): its bytes leave the queue, owed gaps are
+    /// queued while they fit, and the slow-consumer clock of rule 20 stops once the queue is
+    /// empty with no gap owed. Security review 2026-11-22, M-1: a client that reads slowly under
+    /// steady traffic never empties its queue, though it flushes a gap now and then; its clock
+    /// keeps running and it is closed with 1008.
+    fn release(&mut self, len: usize) {
+        self.bytes = self.bytes.saturating_sub(len);
+        self.flush_gaps();
+        if self.out.is_empty() && !self.gap_pending() {
             self.overflow_since = None;
         }
     }
