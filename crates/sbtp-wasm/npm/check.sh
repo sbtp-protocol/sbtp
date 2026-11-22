@@ -65,7 +65,7 @@ unpacked=$(printf '%s\n' "$listing" | awk '{ n += $1 } END { print n + 0 }')
 # The declarations compile without the "dom" lib and keep the SigningMessage brand.
 cat_file package/sbtp_wasm.d.ts | node "$tools" dts-check
 case "$(basename "$tgz")" in
-  "sbtp-wasm-$version.tgz") ;;
+  "sbtp-wasm-$version.tgz" | "sbtp-wasm-$version-dirty.tgz") ;;
   *) die "tarball name $(basename "$tgz") does not carry the crate version $version" ;;
 esac
 

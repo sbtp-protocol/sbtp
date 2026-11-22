@@ -47,8 +47,10 @@ test("each privilege is held by one job", () => {
 
 test("the version input reaches the shell through env only", () => {
   const uses = code.match(/\$\{\{ *inputs\.[a-z_]+ *\}\}/g) ?? [];
-  assert.equal(uses.length, 1);
-  assert.match(code, /\n {10}VERSION: \$\{\{ inputs\.version \}\}\n/);
+  assert.equal(uses.length, (code.match(/\n {10}VERSION: \$\{\{ inputs\.version \}\}\n/g) ?? []).length);
+  assert.ok(uses.length >= 1);
+  // No expression in a one-line run either (review I-3).
+  for (const line of code.match(/\n {8}run: [^|\n][^\n]*/g) ?? []) assert.doesNotMatch(line, /\$\{\{/, line);
   // No expression inside a run script.
   for (const block of code.split(/\n {8}run: \|\n/).slice(1)) {
     const script = [];
@@ -63,4 +65,9 @@ test("the version input reaches the shell through env only", () => {
 test("an existing tag must point at the commit of the run", () => {
   assert.match(jobs.build, /git rev-parse -q --verify "refs\/tags\/\$tag\^\{commit\}"/);
   assert.match(jobs.build, /if \[ "\$tagged" != "\$GITHUB_SHA" \]; then/);
+});
+
+test("exactly one tarball, published to the npm registry by name (review I-3)", () => {
+  assert.match(jobs.build, /set -- dist-npm\/sbtp-wasm-\*\.tgz\n {10}if \[ "\$#" -ne 1 \]/);
+  assert.match(jobs.publish, /npm publish "dist-npm\/\$TARBALL" --registry https:\/\/registry\.npmjs\.org\/ /);
 });

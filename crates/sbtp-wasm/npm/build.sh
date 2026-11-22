@@ -9,8 +9,10 @@
 # print its SHA-256 and its integrity string.
 #
 # Reproducibility (Q-79): every tool is pinned below, the tree must be clean (the tarball is then the
-# build of one commit), local paths are remapped out of the module (`--remap-path-prefix`), and npm pack
-# writes fixed timestamps. Nothing is downloaded and nothing from the package is executed.
+# build of one commit; --allow-dirty names it sbtp-wasm-<version>-dirty.tgz), no compiler wrapper and
+# no Cargo configuration from outside the checkout applies, local paths are remapped out of the
+# module (`--remap-path-prefix`), and npm pack writes fixed timestamps. Nothing is downloaded and
+# nothing from the package is executed.
 set -eu
 
 # Pinned tools. rustc is pinned by rust-toolchain.toml and wasm-bindgen by Cargo.lock (the CLI must
@@ -26,7 +28,7 @@ die() { echo "build.sh: $*" >&2; exit 1; }
 
 allow_dirty=0
 if [ "${1:-}" = "--allow-dirty" ]; then allow_dirty=1; shift; fi
-case "${1:-}" in -h|--help) sed -n '2,13p' "$0"; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,15p' "$0"; exit 0 ;; esac
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -38,10 +40,32 @@ tools="$here/tools.mjs"
 
 # --- Source -----------------------------------------------------------------------------------
 commit=$(git -C "$root" rev-parse HEAD)
+dirty=""
 if [ -n "$(git -C "$root" status --porcelain)" ]; then
   [ "$allow_dirty" = 1 ] || die "the working tree is not clean (commit or stash first, or pass --allow-dirty for a local test build)"
   commit="$commit-dirty"
+  dirty="-dirty"
 fi
+
+# --- Build isolation (security review 2026-11-22, I-2) ---------------------------------------
+# No compiler wrapper (an empty value overrides build.rustc-wrapper of any config file) and no
+# other compiler than the rustup one checked below.
+export RUSTC_WRAPPER="" RUSTC_WORKSPACE_WRAPPER=""
+unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER RUSTC CARGO_BUILD_RUSTC
+# Cargo merges every .cargo/config(.toml) from the checkout up to the file system root, plus the
+# one in CARGO_HOME. Only the checkout's own may apply: anything above it is outside the commit.
+cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
+dir=$(dirname "$root")
+while :; do
+  for f in "$dir/.cargo/config" "$dir/.cargo/config.toml"; do
+    [ ! -e "$f" ] || die "$f would apply to this build; move it away (only the checkout's own Cargo configuration may apply)"
+  done
+  [ "$dir" = / ] && break
+  dir=$(dirname "$dir")
+done
+for f in "$cargo_home/config" "$cargo_home/config.toml"; do
+  [ ! -e "$f" ] || die "$f would apply to this build; move it away (only the checkout's own Cargo configuration may apply)"
+done
 
 # --- Tool versions ----------------------------------------------------------------------------
 want_rustc=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust-toolchain.toml")
@@ -64,7 +88,6 @@ version=$(cd "$root" && cargo metadata --format-version 1 --no-deps --locked | n
 # locations; remap them, and the checkout, to relative names. Different flags from a normal build,
 # so a target directory of its own. Fields of CARGO_ENCODED_RUSTFLAGS are separated by 0x1f, which
 # keeps a path with spaces intact.
-cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
 CARGO_ENCODED_RUSTFLAGS=$(printf '%s\037%s' \
   "--remap-path-prefix=$cargo_home/registry/src=registry" "--remap-path-prefix=$root=sbtp")
 export CARGO_ENCODED_RUSTFLAGS
@@ -92,8 +115,11 @@ cp "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$stage/"
 chmod 0644 "$stage"/*
 node "$tools" manifest "$version" < "$stage/package.json"
 
-tarball="$out/sbtp-wasm-$version.tgz"
-rm -f "$tarball"
+# npm pack names the file sbtp-wasm-<version>.tgz; a build of a dirty tree is renamed
+# sbtp-wasm-<version>-dirty.tgz afterwards, so it is never mistaken for the build of a commit.
+packed_name="sbtp-wasm-$version.tgz"
+tarball="$out/sbtp-wasm-$version$dirty.tgz"
+rm -f "$out/$packed_name" "$tarball"
 # Scripts disabled (there are none), no user or global npm configuration read, nothing fetched.
 : > "$root/target/npm/empty-user-npmrc"
 : > "$root/target/npm/empty-global-npmrc"
@@ -102,7 +128,8 @@ rm -f "$tarball"
   npm_config_update_notifier=false npm_config_fund=false \
   npm pack --ignore-scripts --json --pack-destination "$out") > "$root/target/npm/pack.json"
 packed=$(node "$tools" pack-integrity < "$root/target/npm/pack.json")
-[ "${packed%% *}" = "sbtp-wasm-$version.tgz" ] || die "npm pack wrote ${packed%% *}"
+[ "${packed%% *}" = "$packed_name" ] || die "npm pack wrote ${packed%% *}"
+[ -z "$dirty" ] || mv "$out/$packed_name" "$tarball"
 
 # --- Check and report -------------------------------------------------------------------------
 sh "$here/check.sh" "$tarball"
