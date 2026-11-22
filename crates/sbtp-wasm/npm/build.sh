@@ -82,6 +82,9 @@ rm -rf "$stage"
 wasm-bindgen --target web --out-dir "$stage" "$module"
 # Declarations of the raw exports; sbtp_wasm.d.ts already carries them (InitOutput).
 rm -f "$stage/sbtp_wasm_bg.wasm.d.ts"
+# The init API is typed with DOM lib names; replace them by local aliases so that the declarations
+# compile for a consumer without the "dom" lib (tools.mjs dts-fix, checked again by check.sh).
+node "$tools" dts-fix "$stage/sbtp_wasm.d.ts"
 wasm-opt -Os --strip-debug --strip-producers --strip-target-features \
   "$stage/sbtp_wasm_bg.wasm" -o "$stage/sbtp_wasm_bg.wasm"
 cp "$here/package.json" "$here/README.md" "$here/node.js" "$stage/"

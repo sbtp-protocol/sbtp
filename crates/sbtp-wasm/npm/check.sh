@@ -5,8 +5,8 @@
 #
 # Fails if the tarball holds anything other than the expected files (regular files only), if the
 # manifest declares a script, a dependency or other than the expected name, version, licence and
-# file list, if any file holds a local or absolute path or a source map reference, or if the module
-# is not under the 200,000-byte gzip budget of ADR 0048. Reads the tarball only; extracts nothing to
+# file list, if the type declarations name a DOM-only type or lost the SigningMessage brand, if any
+# file holds a local or absolute path or a source map reference, or if the module is not under the 200,000-byte gzip budget of ADR 0048. Reads the tarball only; extracts nothing to
 # disk and executes nothing from it.
 set -eu
 
@@ -45,6 +45,8 @@ fi
 
 version=$(cd "$root" && cargo metadata --format-version 1 --no-deps --locked | node "$tools" crate-version)
 tar -xOzf "$tgz" package/package.json | node "$tools" manifest "$version"
+# The declarations compile without the "dom" lib and keep the SigningMessage brand.
+tar -xOzf "$tgz" package/sbtp_wasm.d.ts | node "$tools" dts-check
 case "$(basename "$tgz")" in
   "sbtp-wasm-$version.tgz") ;;
   *) die "tarball name $(basename "$tgz") does not carry the crate version $version" ;;
