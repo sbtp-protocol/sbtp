@@ -217,3 +217,91 @@
   structural look-alike as intended. That check also found that `sbtp_wasm.d.ts` needs the DOM lib
   (`RequestInfo`, `BufferSource`, the `WebAssembly` namespace in the `init` types) to compile.
 - `cargo deny check` (advisory fetch failed), `cargo clippy` and `gitleaks dir` (not run: disk full).
+
+## Re-review (2026-11-22)
+
+- Scope: `git diff f7152f0..b118bc3` (7 commits), against the findings above, ADR 0053 and ADR 0055 E1.
+- Verdict: **mergeable**. Every finding in scope is closed. The fixes add no finding above low.
+
+### Status of the findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| M-1 | Closed | `release-npm.yml` has only a `workflow_dispatch` trigger. Every job checks `github.ref == 'refs/heads/main'`. `publish` runs in the `npm-release` environment, which owner setup step 3 restricts to `main`. The tag is checked in `build` and created in `tag` on `GITHUB_SHA`. `release-workflow.test.mjs` fixes all of this. |
+| L-1 | Closed | `check.sh` no longer uses `tar(1)`; it reads the archive through `tools.mjs readPackage` only. That walker accepts one gzip member with `FLG = 0`, a valid CRC-32 and ISIZE, and nothing after it. It then accepts only ustar type `0` headers with a valid checksum and mode 0644, whose names are on the exact list, each once. Every byte after the first zero block must be zero. The original lone-zero-block case is tested and refused. |
+| L-2 | Closed | `package.json`, `node.js`, `README.md` and both licences are compared with `cmp` against the repository copies. The tarball is bounded at 300,000 bytes and the unpacked files at 1,000,000. `tamper.test.mjs` replays every tampering from L-2, including whitespace-only manifest changes: 17 of 17 are refused. |
+| L-3 | Closed | The rustdoc of `message.rs`, the crate README and the npm README now say "against API misuse, not against code in the same JavaScript realm", and give the shape checks. `smoke.mjs` signs only after checking kind, length and prefix, and asserts that an `Object.create` forgery is refused. |
+| I-1 | Closed | `bytes()` returns `js_sys::Uint8Array::from(&self.bytes[..])`: a view on the held bytes is copied into a new JS array, with no temporary `Vec`. `smoke.mjs` checks that reading `bytes` adds no copy of `msg` to linear memory, and that test passed. |
+| I-2 | Mostly closed | `build.sh` clears `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC` and the `CARGO_BUILD_*` forms. It refuses any `.cargo/config*` above the checkout or in `CARGO_HOME`, and names a dirty build `-dirty.tgz` (`check.sh` accepts both names; `release-npm.yml` requires the clean one). Still open, info only: ignored files are not detected (`git status --porcelain` omits them); `target/npm/cargo` is reused; other `CARGO_*` environment variables (for example `CARGO_PROFILE_RELEASE_*`) still apply. The rebuild-and-compare check of Q-79 covers all three. |
+| I-3 | Closed | The tarball name reaches `smoke.sh` through `env:`, and the build fails unless there is exactly one `sbtp-wasm-$VERSION.tgz`. `npm publish` names `--registry https://registry.npmjs.org/`. A test asserts that no `${{ }}` expression appears inside a `run:` script. |
+
+The other findings were outside this re-review. I-4 and I-5 are unchanged. I-6 is partly reduced: `cmp` fails safe on an empty extraction. The per-file path scan still passes on a failed `tar-cat`, but `tar-list` has already validated the same file, so that case cannot occur in practice.
+
+### New code checked
+
+**Release workflow, `tag` job (`contents: write`).**
+
+- It runs no checkout and no third-party action. It makes one `gh api` POST of `refs/tags/$TAG` on `GITHUB_SHA`.
+- `TAG` comes from the `build` output, which is `wasm-v` followed by a version that matched `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` and equals `package.json`. The input reaches the shell only through `env:`.
+- `tag` needs `publish`. If `publish` is skipped or rejected, no tag is created.
+
+**A dispatch from another ref.**
+
+- A dispatch on a branch other than `main` runs that branch's copy of the workflow, so its `if:` guards can be removed. `publish` is still stopped by the environment's deployment branch policy, and the npm trusted publisher requires the environment name. A dispatch on a tag ref is stopped the same way (no tag pattern in the policy).
+- That branch copy can declare a `contents: write` job, but anyone who can push a branch can already do so in any workflow. The `tag` job adds no capability.
+- What protects publication is therefore owner setup step 3, not the `if:` guards. The workflow header says so.
+
+**New finding N-1 (low, before enabling the release): the tag ruleset of step 4 blocks update and deletion, not creation.**
+
+- Scenario: someone with write access, or a stolen token with `contents: write`, creates `wasm-v<next>` on another commit before the release.
+- Effect: the release `build` job fails ("tag exists on X, not on GITHUB_SHA"). This is a detectable denial of service. Nothing wrong is published, because provenance names the real commit and `refs/heads/main`.
+- Consumers who follow the npm README compare the provenance commit with the tag, so a pre-created tag makes them see a mismatch and refuse the version. That is the intended outcome.
+- Fix (optional): in step 4, also restrict creation of `wasm-v*`, with GitHub Actions as the only bypass actor. Or accept the risk, since the failure is loud.
+
+**Tar and gzip walker (`tools.mjs readPackage`).**
+
+- Crash and resource use:
+  - Every failure is a thrown `Error`. `main` catches it and exits 1, so `check.sh` fails closed.
+  - Decompressed output is capped at 2,000,000 bytes (`maxOutputLength`), so a gzip bomb stops (tested).
+  - The stream must be whole 512-byte blocks, every read is bounds-checked (`start + size` and `end + 8`), and each iteration advances by at least 512 bytes. There is no infinite loop or out-of-range read.
+- Parsing bypasses:
+  - Base-256 sizes and non-octal or space-padded fields are refused.
+  - PAX (`x`, `g`), GNU (`L`, `K`), link, directory and old-style `\0` type headers are refused.
+  - The GNU `ustar  \0` magic is refused.
+- Parity with node-tar:
+  - node-tar reads the ustar prefix over 155 or 130 bytes, depending on byte 475. Both stop at the first NUL, so for any name this walker accepts, the two give the same path.
+  - Names must match `package/<file>` exactly, so no normalisation difference (`./`, `//`, a different first component that `strip: 1` would hide) gets through.
+- No bypass found. The walker is stricter than node-tar everywhere, so a future `npm pack` that writes PAX headers (long names) would fail the check. That is the safe direction.
+
+**`.d.ts` alias trick and the `SigningMessage` brand.**
+
+Read on the shipped `sbtp_wasm.d.ts` of the rebuilt tarball (no `tsc`).
+
+- The aliases are seven non-exported `type` declarations. Each is a conditional on `typeof globalThis`, or a structural ES-lib type. They are used only in `InitInput`, `SyncInitInput`, `InitOutput.memory` and `InitOutput.__wbindgen_externrefs`, and none of them refers to `SigningMessage`.
+- The brand is unchanged:
+  - `declare const signingMessageBrand: unique symbol`;
+  - an `interface SigningMessage` with `readonly [signingMessageBrand]: true`, merged with `export class SigningMessage { private constructor(); ... }`;
+  - `export {}`, which keeps the symbol and the aliases out of the module's exports.
+- The aliases cannot weaken the brand. They widen or narrow only the `init` input types: `never` when a global is absent, and the global's own instance type (or `any`-derived) when present.
+- The real gain is that a consumer without the DOM lib no longer needs `skipLibCheck`, which would hide every other error of the file.
+- `dtsFix` requires each wasm-bindgen line to occur exactly once, so a wasm-bindgen upgrade fails the build instead of silently shipping DOM names again.
+
+**N-2 (info).** `dtsCheck` counts the brand parts in the raw text, comments included. A brand that survived only inside a comment would pass. The input is the pinned wasm-bindgen output, not attacker input, so this only guards against regressions. The fix is optional: count on the comment-stripped `code`.
+
+**N-3 (info, disk hygiene).** `build.sh` writes `$root/target/npm/` (about 160 MB here) and ignores `CARGO_TARGET_DIR`, so each worktree that builds the package gets its own `target/`. The fix is optional: base `stage` and `cargo_target` on `${CARGO_TARGET_DIR:-$root/target}/npm`, as `web/build.sh` now does.
+
+**`web/build.sh`.** It uses the same `--remap-path-prefix` pair as `build.sh`, its own target directory under `CARGO_TARGET_DIR`, and a final scan that fails if `$HOME`, the checkout or `CARGO_HOME` appears in `web/pkg`. There is no security concern.
+
+### Tests run
+
+- `node --test crates/sbtp-wasm/npm/*.test.mjs`: 20 passed, 17 skipped (no tarball given), 0 failed.
+- `build.sh` on `b118bc3`: the contents check passed. The tarball is 146,765 bytes (340,340 unpacked) and the module is 122,348 bytes gzip -9. SHA-256 `b909a024f73a74459ea83c3536694af997f6c92c2abf3fd62527a3e7e652cd7a`.
+- `tamper.test.mjs` with that tarball: 17 passed, 0 failed.
+- `smoke.sh` with that tarball: passed. This includes the forged-object refusal and the I-1 heap-copy check.
+
+### Not checked
+
+- The `.d.ts` under `tsc`, with and without the DOM lib, and with `@types/node` (no compiler available). The reading above is a code review only.
+- The release workflow on GitHub: whether the environment policy rejects a non-`main` dispatch as described, whether `gh api` with the job token can create a tag under the planned ruleset, and the pinned SHAs (no network access).
+- That node-tar's current header parser matches the behaviour described above (read from memory of its source, not from the vendored version).
+- `cargo deny`, `cargo clippy` and `cargo test --workspace`: the Rust changes are limited to `message.rs`, and the build and the smoke test exercise it.
