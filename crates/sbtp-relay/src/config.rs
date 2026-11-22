@@ -1072,6 +1072,15 @@ impl Settings {
                     "mirror_region" => Some(self.mirror_region.clone()),
                     "mirror_prefix" => Some(self.mirror_prefix.clone()),
                     "mirror_url_style" => Some(self.mirror_url_style.name().to_owned()),
+                    // Deny review I-7: a `*_ref` is logged only when the archive copy is
+                    // configured, which checks that it names a variable that is set; otherwise
+                    // a value pasted by mistake would reach the log.
+                    "mirror_access_key_ref" | "mirror_secret_key_ref"
+                    | "mirror_session_token_ref"
+                        if self.mirror_endpoint.is_none() =>
+                    {
+                        Some("unused".to_owned())
+                    }
                     "mirror_access_key_ref" => Some(self.mirror_access_key_ref.clone()),
                     "mirror_secret_key_ref" => Some(self.mirror_secret_key_ref.clone()),
                     "mirror_session_token_ref" => {
@@ -1660,6 +1669,21 @@ impl Settings {
         self.sources
             .iter()
             .map(|(name, source)| (*name, self.value_text(name).unwrap_or_default(), *source))
+    }
+
+    /// Mirror review L-2: the names of the environment variables the archive copy reads its
+    /// credentials from, when it is configured; none otherwise.
+    #[must_use]
+    pub fn credential_vars(&self) -> Vec<&str> {
+        if self.mirror_endpoint.is_none() {
+            return Vec::new();
+        }
+        let mut v = vec![
+            self.mirror_access_key_ref.as_str(),
+            self.mirror_secret_key_ref.as_str(),
+        ];
+        v.extend(self.mirror_session_token_ref.as_deref());
+        v
     }
 
     /// ADR 0021 rule 22: the most bytes the logger can write in the 24 hours after start-up,

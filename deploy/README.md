@@ -280,7 +280,12 @@ manager's secret mechanism (a Docker or Kubernetes secret exposed as environment
 systemd `LoadCredential`/`EnvironmentFile` readable by the relay user only), never in the
 configuration file. They are read once at start-up: rotation is a restart. They never appear in
 logs, `setting` lines, metrics or errors; the `mirror_endpoint` setting line logs `set`, not the
-URL.
+URL, and the `*_ref` lines log `unused` while `mirror_endpoint` is unset. The relay keeps a copy
+of the three named variables only while it prepares the copy, and wipes it after use. The
+**process environment** still holds them for the life of the process, and the relay cannot clear
+it: anyone who can read `/proc/<pid>/environ` (the relay's user and root) or a core dump can read
+them. Run the relay under its own user, keep core dumps off for it (`LimitCORE=0`, or
+`--ulimit core=0`), and do not give other services that user.
 
 What the relay sends: one `PUT` per block to `{mirror_prefix}sbtp/v1/block/{block_id}`, signed
 with AWS Signature Version 4 (signed payload), with `If-None-Match: *` (the first write wins; an
@@ -345,13 +350,17 @@ it is logged at start-up (`memory_bound`).
 same network); the rule is that of `replication_allow_private`.
 
 **Logs and metrics.** Counters (served with `/metrics` once it exists, as those of replication;
-the `stats` line does not carry them yet) `mirror_uploaded_total`, `mirror_existing_total`,
+until then on the `stats` line, without the `_total` suffix and with `mirror_failed` summed over
+the classes) `mirror_uploaded_total`, `mirror_existing_total`,
 `mirror_failed_total{status}` (`3xx`, `4xx`, `5xx`, `network`), `mirror_missed_total` (evicted
 before its turn), `mirror_damaged_total`, `mirror_poisoned_total`, `mirror_denied_total` (on the
-operator deny list, not uploaded); gauges `mirror_lag_blocks`
-(counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed` (status class and delay
-only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on `mirror_lag_ms` above
-`demand_epoch_ms` and on any `mirror_poisoned_total`. **Egress**: allow TCP 443 to the endpoint
+operator deny list, not uploaded), `mirror_unverified_total` (after a `412`, the public URL did
+not answer `200`: the store says it holds an object that nobody can read there); gauges
+`mirror_lag_blocks` (counted up to 1,000,000) and `mirror_lag_ms`. Events `mirror_failed`
+(status class and delay only) and `mirror_poisoned` (the `block_id`), rate-capped. Alert on
+`mirror_lag_ms` above `demand_epoch_ms`, on any `mirror_poisoned_total`, and on
+`mirror_unverified_total` growing with `mirror_existing_total` (a store that answers success
+without storing). **Egress**: allow TCP 443 to the endpoint
 (and to `mirror_public_url`), and DNS.
 
 ## Operator deny list
@@ -375,6 +384,8 @@ deny_file = "/etc/sbtp-relay/deny.txt"
   `ExecReload=/bin/kill -HUP $MAINPID`, or `docker kill --signal HUP`), or wait up to
   `deny_reload_ms`. Write the new list to a temporary file and `mv` it into place, so that the
   relay never reads half a file. A loaded list applies to every request that starts after it.
+  `SIGHUP` never stops the relay: one without `deny_file`, or one still starting, ignores it
+  (the former logs `config_warning code=sighup_ignored`, at most once a minute).
 - **An invalid or missing file never empties the list.** At start-up the relay refuses to start
   (`fatal`, the line number and a fixed reason). On reload it keeps the previous list whole and
   logs `deny_list_invalid line=… reason=…`; fix the file and reload again. Alert on any
@@ -390,18 +401,22 @@ deny_file = "/etc/sbtp-relay/deny.txt"
   (for example by a `GET`) before loading a `purge` entry.
 - **Copies the relay cannot reach.**
   - A CDN keeps `200` responses up to a year: purge `/sbtp/v1/block/<block_id>` from it after each
-    new block entry. For a key entry, purge each held block of that key. A command that lists
-    them is not part of this version yet, and once a key entry is loaded the relay hides its
-    blocks from `/query` and answers `451`, so the list must be collected **before** the key takes
-    effect:
-    1. Load the key with `hide` first if you intend `purge` (a `purge` entry deletes the local
-       bytes, so nothing would be left to inspect). Or collect the list before loading the entry
-       at all.
-    2. Collect the list: with no key entry loaded yet, walk `/query` and keep the blocks whose
-       header carries the key (bytes 19 to 50 of each block); with a `hide` entry already loaded,
-       read the block files in the data directory directly, since `/query` no longer lists them.
-    3. Purge each `/sbtp/v1/block/<block_id>` of that list from the CDN.
-    4. Only then switch the entry to `purge`, if wanted, and reload.
+    new block entry. For a key entry, purge each held block of that key. The relay lists them:
+
+    ```sh
+    sbtp-relay key-blocks <public-key-hex> [--config <path>] > key-blocks.txt
+    ```
+
+    It reads the block headers in the data directory (same settings as the relay, so the same
+    `--config` and `SBTP_RELAY_*` variables), read-only, and works while the relay runs, before or
+    after the key entry is loaded. It prints one `block_id` per line on standard output and
+    writes nothing else, to the log or elsewhere; keep the list file as private as the deny file.
+    Run it as the relay's user (in the image:
+    `docker exec <container> /usr/local/bin/sbtp-relay key-blocks …`).
+    A `purge` entry deletes the local bytes, after which nothing is left to list, so:
+    1. Load the key with `hide` (or not at all yet) and run `key-blocks`.
+    2. Purge each `/sbtp/v1/block/<block_id>` of that list from the CDN.
+    3. Only then switch the entry to `purge`, if wanted, and reload.
   - The archive copy never uploads a denied block, but never deletes from the bucket either.
     Removing an object already uploaded is an operator task, with credentials the relay does not
     hold (the relay's own allow `PutObject` only): delete

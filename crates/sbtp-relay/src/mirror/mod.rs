@@ -100,8 +100,11 @@ pub mod metrics {
     const LAG_BLOCKS: usize = 5;
     const LAG_MS: usize = 6;
     const DENIED: usize = 7;
-    const FAILED: usize = 8;
+    const UNVERIFIED: usize = 8;
+    const FAILED: usize = 9;
     static C: [AtomicU64; FAILED + 4] = [const { AtomicU64::new(0) }; FAILED + 4];
+    /// Whether the archive copy runs, for the `stats` line.
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn add(i: usize) {
         if let Some(c) = C.get(i) {
@@ -134,6 +137,12 @@ pub mod metrics {
     }
     pub(super) fn denied() {
         add(DENIED);
+    }
+    pub(super) fn unverified() {
+        add(UNVERIFIED);
+    }
+    pub(super) fn set_on() {
+        ON.store(true, Relaxed);
     }
     pub(super) fn failed(c: Class) {
         add(FAILED + c as usize);
@@ -175,6 +184,12 @@ pub mod metrics {
     pub fn denied_total() -> u64 {
         get(DENIED)
     }
+    /// `mirror_unverified_total` (mirror review L-4): the check after a `412` did not get a
+    /// `200` from the public URL, so nothing says the object is there.
+    #[must_use]
+    pub fn unverified_total() -> u64 {
+        get(UNVERIFIED)
+    }
     /// `mirror_failed_total{status}`.
     #[must_use]
     pub fn failed_total(c: Class) -> u64 {
@@ -184,6 +199,36 @@ pub mod metrics {
     #[must_use]
     pub fn lag() -> (u64, u64) {
         (get(LAG_BLOCKS), get(LAG_MS))
+    }
+
+    /// Mirror review L-4: the fields of the `stats` line while the archive copy runs, until
+    /// `/metrics` serves them; none otherwise.
+    #[must_use]
+    pub fn stats() -> Vec<(&'static str, u64)> {
+        if !ON.load(Relaxed) {
+            return Vec::new();
+        }
+        let failed = [
+            Class::Redirect,
+            Class::Client,
+            Class::Server,
+            Class::Network,
+        ]
+        .into_iter()
+        .map(failed_total)
+        .fold(0, u64::saturating_add);
+        vec![
+            ("mirror_uploaded", uploaded_total()),
+            ("mirror_existing", existing_total()),
+            ("mirror_failed", failed),
+            ("mirror_missed", missed_total()),
+            ("mirror_damaged", damaged_total()),
+            ("mirror_poisoned", poisoned_total()),
+            ("mirror_denied", denied_total()),
+            ("mirror_unverified", unverified_total()),
+            ("mirror_lag_blocks", get(LAG_BLOCKS)),
+            ("mirror_lag_ms", get(LAG_MS)),
+        ]
     }
 }
 
@@ -354,6 +399,7 @@ impl Mirror {
         relay: Arc<Relay<RedbIndex>>,
         stop: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
+        metrics::set_on();
         let shared = Arc::new(Shared {
             relay,
             m: self,
@@ -678,9 +724,15 @@ impl Shared {
             .get(&mut conn, public, &path, BLOCK_CEILING)
             .await
         else {
+            metrics::unverified();
             return;
         };
-        if reply.status == StatusCode::OK && store::full_validation(&reply.body, id).is_err() {
+        if reply.status != StatusCode::OK {
+            // Mirror review L-4: a store that claims to hold an object it does not serve.
+            metrics::unverified();
+            return;
+        }
+        if store::full_validation(&reply.body, id).is_err() {
             static LOG: Throttle = Throttle::new();
             metrics::poisoned();
             let hex = store::hex(id);
@@ -887,7 +939,12 @@ impl Shared {
             .header(header::CONTENT_LENGTH, body.len())
             .header(header::USER_AGENT, HeaderValue::from_static("sbtp-relay"));
         for (n, v) in &signed {
-            b = b.header(*n, *v);
+            let Ok(mut v) = HeaderValue::from_str(v) else {
+                return None;
+            };
+            // Mirror review L-2: the session token, like `Authorization`, is sensitive.
+            v.set_sensitive(*n == "x-amz-security-token");
+            b = b.header(*n, v);
         }
         let mut auth = HeaderValue::from_str(&auth).ok()?;
         auth.set_sensitive(true);

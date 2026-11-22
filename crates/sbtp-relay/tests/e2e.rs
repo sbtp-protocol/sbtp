@@ -413,6 +413,128 @@ fn sighup_reloads_the_deny_list() {
     assert!(!log.contains(MARKER));
 }
 
+/// Deny review I-1: on a relay without `deny_file`, `SIGHUP` (`systemctl reload`) is ignored:
+/// the relay keeps serving, stops cleanly afterwards, and logs one throttled `config_warning`
+/// for several signals.
+#[test]
+fn sighup_without_a_deny_file_is_ignored() {
+    let relay = RelayProcess::start(&tmp_dir("e2e-hup"));
+    let pid = relay.child.as_ref().unwrap().id().to_string();
+    for _ in 0..3 {
+        let sent = Command::new("kill").args(["-HUP", &pid]).status().unwrap();
+        assert!(sent.success());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut c = relay.connect();
+    let (bytes, _) = mined(43, MARKER.as_bytes(), &[], DIFFICULTY);
+    assert_eq!(put_block(&mut c, &bytes).status, 201, "still serving");
+    drop(c);
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{status}\n{log}");
+    assert_eq!(log.matches("code=sighup_ignored").count(), 1, "{log}");
+}
+
+/// ADR 0052 rule 10: `sbtp-relay key-blocks <key>` lists the held blocks of a key on standard
+/// output while the relay runs, also once the key is denied with `hide` and marked; nothing on
+/// standard error, and the relay's log never sees the key. Bad arguments exit with code 2 and a
+/// message that does not repeat them.
+#[test]
+fn key_blocks_lists_the_held_blocks_of_a_key() {
+    let dir = tmp_dir("e2e-key-blocks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("deny.txt");
+    std::fs::write(&file, "").unwrap();
+    let data = dir.join("data");
+    let relay = RelayProcess::start_with(&data, &[("DENY_FILE", file.to_str().unwrap())]);
+    let mut c = relay.connect();
+    let (a1, a1_id) = mined(51, b"first of a", &[], DIFFICULTY);
+    let (a2, a2_id) = mined(51, b"second of a", &[a1_id], DIFFICULTY);
+    let (b, _) = mined(52, b"of b", &[], DIFFICULTY);
+    for x in [&a1, &a2, &b] {
+        assert_eq!(put_block(&mut c, x).status, 201);
+    }
+    let key = hex(&BlockId(*sbtp_core::parse(&a1).unwrap().pubkey()));
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sbtp-relay"))
+            .env_clear()
+            .env("SBTP_RELAY_DATA_DIR", &data)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let listed = |out: &std::process::Output| {
+        let mut v: Vec<String> = String::from_utf8(out.stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        v.sort();
+        v
+    };
+    let mut want = vec![hex(&a1_id), hex(&a2_id)];
+    want.sort();
+    let out = run(&["key-blocks", &key]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!((listed(&out), out.stderr.len()), (want.clone(), 0));
+    // Once the key is denied and its blocks marked, `/query` hides them; the command does not.
+    std::fs::write(&file, format!("key {key}\n")).unwrap();
+    let pid = relay.child.as_ref().unwrap().id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let t = Instant::now();
+    while !page(&mut c, "").0.iter().all(|id| !want.contains(id)) {
+        assert!(t.elapsed() < Duration::from_secs(10), "not marked");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = run(&["key-blocks", &key]);
+    assert_eq!(listed(&out), want);
+    for bad in [
+        &["key-blocks"][..],
+        &["key-blocks", "Z1"],
+        &["key-blocks", &key, "x"],
+    ] {
+        let out = run(bad);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+        assert_eq!(out.stdout.len(), 0, "{bad:?}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("Z1"));
+    }
+    drop(c);
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{log}");
+    assert!(!log.contains(&key), "a key in the log");
+}
+
+/// Deny review I-7: with the archive copy off (`mirror_endpoint` unset), a value pasted into a
+/// `*_ref` setting is not logged: the three `setting` lines say `unused`.
+#[test]
+fn ref_settings_are_not_logged_while_the_copy_is_off() {
+    const PASTED: &str = "PASTEDVALUEQ3R8T1M6";
+    let relay = RelayProcess::start_with(
+        &tmp_dir("e2e-ref-off"),
+        &[
+            ("MIRROR_ACCESS_KEY_REF", PASTED),
+            ("MIRROR_SECRET_KEY_REF", PASTED),
+            ("MIRROR_SESSION_TOKEN_REF", PASTED),
+        ],
+    );
+    let (status, log) = relay.stop();
+    assert!(status.success(), "{log}");
+    assert!(!log.contains(PASTED), "{log}");
+    for name in [
+        "mirror_access_key_ref",
+        "mirror_secret_key_ref",
+        "mirror_session_token_ref",
+    ] {
+        assert!(log.contains(&format!("name={name} value=unused")), "{log}");
+    }
+}
+
 /// Security review 2026-11-21 (archive copy), L-1: a value pasted into a `*_ref` setting
 /// instead of a variable name, which passes the name check, stops the start-up before any
 /// `setting` line: it appears in no line of the log.

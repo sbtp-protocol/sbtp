@@ -29,6 +29,7 @@ pub mod log;
 pub mod metrics;
 #[cfg(feature = "object-store")]
 pub mod mirror;
+pub mod operator;
 pub mod peers;
 pub mod pool;
 pub mod query;
@@ -114,11 +115,14 @@ where
     // Security review L-3: `log_format` alone first, so that this line and an early `fatal`
     // line have the configured form; the other logger settings are applied once loaded.
     let args: Vec<OsString> = args.into_iter().collect();
-    let env: Vec<(OsString, OsString)> = env.into_iter().collect();
+    // Mirror review L-2: every value of the start-up environment is wiped when dropped.
+    let env = WipedEnv(env.into_iter().collect());
     log::global().configure(&LogConfig {
-        format: config::early_log_format(&args, &env),
+        format: config::early_log_format(&args, &env.0),
         ..LogConfig::default()
     });
+    // Deny review I-1: from here on, `SIGHUP` never stops the relay, whatever its settings.
+    guard_hangup()?;
     // ADR 0019 rule 26. The version goes to the log only, never to the network (rule 25).
     log::emit(
         Event::Start,
@@ -128,12 +132,19 @@ where
         ],
     );
     self_test().map_err(StartError::SelfTest)?;
-    // Kept only for the credentials of ADR 0050 rule 22, then dropped.
-    #[cfg(feature = "object-store")]
-    let env_kept = env.clone();
-    #[cfg(not(feature = "object-store"))]
-    let env_kept: Vec<(OsString, OsString)> = Vec::new();
-    let settings = Settings::load(args, env).map_err(StartError::Config)?;
+    // The settings read only `SBTP_RELAY_*` variables; nothing else is copied for them.
+    let relay_vars = env
+        .0
+        .iter()
+        .filter(|(k, _)| {
+            k.to_str()
+                .is_some_and(|k| k.starts_with(config::ENV_PREFIX))
+        })
+        .cloned();
+    let settings = Settings::load(args, relay_vars).map_err(StartError::Config)?;
+    // Mirror review L-2: only the variables the archive copy's settings name are kept, for the
+    // credentials of ADR 0050 rule 22; the rest is wiped now, these after use.
+    let env_kept = env.keep(&settings.credential_vars());
     if settings.log_client_tag == log::ClientTag::Keyed {
         log::client_tag_key().map_err(|e| StartError::Io("drawing the client tag key", e))?;
     }
@@ -142,7 +153,7 @@ where
     // review 2026-11-21 (archive copy), L-1: before the `setting` lines, so that a `*_ref`
     // setting holding a value instead of a variable name stops the start-up before it is
     // logged.
-    let mirror = prepare_mirror(&settings, &env_kept)?;
+    let mirror = prepare_mirror(&settings, &env_kept.0)?;
     drop(env_kept);
     log_settings(&settings)?;
     announce_mirror(mirror.as_ref(), &settings);
@@ -256,6 +267,33 @@ where
         log::emit(Event::Shutdown, &[("phase", Value::Str("index_closed"))]);
     }
     served.and(durable).and(closed)
+}
+
+/// The start-up environment, whose values are wiped when it is dropped (mirror review L-2): the
+/// heap copies of the archive copy's credentials do not outlive their use. The process
+/// environment block itself cannot be cleared (`deploy/README.md`, "Archive copy").
+struct WipedEnv(Vec<(OsString, OsString)>);
+
+impl WipedEnv {
+    /// Keeps the variables named in `names`, by move, and wipes every other value now.
+    fn keep(self, names: &[&str]) -> Self {
+        let mut all = self;
+        let (kept, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut all.0)
+            .into_iter()
+            .partition(|(k, _)| k.to_str().is_some_and(|k| names.contains(&k)));
+        drop(Self(rest));
+        Self(kept)
+    }
+}
+
+impl Drop for WipedEnv {
+    fn drop(&mut self) {
+        for (_, v) in &mut self.0 {
+            drop(zeroize::Zeroizing::new(
+                std::mem::take(v).into_encoded_bytes(),
+            ));
+        }
+    }
 }
 
 /// The start state of demand eviction (ADR 0046 rule 13, clarifications D1 and D2), read and
@@ -494,10 +532,11 @@ where
         // ADR 0050: the archive copy, likewise.
         let mut mirrorer = spawn_mirror(mirror, &relay, &stopped);
         // ADR 0052 rule 4: the reload task and the marking pass, likewise; `SIGHUP` asks for a
-        // reload. Without `deny_file`, `SIGHUP` keeps its default action.
+        // reload. Without `deny_file`, `SIGHUP` is logged (throttled) and ignored (deny review
+        // I-1).
         let batch = usize::try_from(settings.sweep_batch).unwrap_or(index::MAX_QUERY_LIMIT);
+        spawn_hangup(&relay)?;
         let mut denier = if relay.deny().enabled() {
-            spawn_hangup(&relay)?;
             Some(tokio::spawn(deny::run(
                 Arc::clone(&relay),
                 batch,
@@ -559,17 +598,61 @@ where
     })
 }
 
+/// Deny review I-1: installs the process-wide `SIGHUP` handler at the start of start-up, before
+/// the settings are read and the store is reconciled, so that a `SIGHUP` (`systemctl reload`)
+/// never takes its default action, which terminates the process. tokio installs its handler the
+/// first time a signal kind is listened for and keeps it for the life of the process, replacing
+/// the default action (`tokio::signal::unix::signal`, "Caveats"); until [`spawn_hangup`] listens
+/// again, a `SIGHUP` is swallowed. The short-lived runtime only provides the signal driver for
+/// that registration.
+#[cfg(unix)]
+fn guard_hangup() -> Result<(), StartError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let failed = |e| StartError::Io("installing signal handlers", e);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(failed)?;
+    let _in = rt.enter();
+    drop(signal(SignalKind::hangup()).map_err(failed)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // The signature of the unix build.
+fn guard_hangup() -> Result<(), StartError> {
+    Ok(())
+}
+
 /// ADR 0052 rule 4: forwards each `SIGHUP` to the deny list as a reload request, for the life
-/// of the process.
+/// of the process. Without `deny_file` the signal is ignored, with one `config_warning` line per
+/// minute at most (deny review I-1).
 #[cfg(unix)]
 fn spawn_hangup(relay: &Arc<Relay<RedbIndex>>) -> Result<(), StartError> {
     use tokio::signal::unix::{SignalKind, signal};
+    static IGNORED_LOG: log::Throttle = log::Throttle::new();
     let mut hangup = signal(SignalKind::hangup())
         .map_err(|e| StartError::Io("installing signal handlers", e))?;
     let deny = Arc::clone(relay.deny_arc());
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
-            deny.request_reload();
+            if deny.enabled() {
+                deny.request_reload();
+            } else {
+                log::throttled(
+                    &IGNORED_LOG,
+                    Event::ConfigWarning,
+                    &[
+                        ("code", Value::Str("sighup_ignored")),
+                        ("setting", Value::Str("deny_file")),
+                        (
+                            "msg",
+                            Value::Str("SIGHUP ignored: no deny_file is set, nothing to reload"),
+                        ),
+                    ],
+                    None,
+                );
+            }
         }
     });
     Ok(())
@@ -611,4 +694,26 @@ pub fn signals() -> std::io::Result<Signals> {
         terminate: signal(SignalKind::terminate())?,
         interrupt: signal(SignalKind::interrupt())?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// Mirror review L-2: only the named variables are kept, by move.
+    #[test]
+    fn only_the_named_variables_are_kept() {
+        let env = WipedEnv(
+            [("A", "1"), ("CRED", "secret"), ("B", "2"), ("TOKEN", "t")]
+                .into_iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect(),
+        );
+        let kept = env.keep(&["CRED", "TOKEN"]);
+        let names: Vec<_> = kept.0.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert_eq!(names, ["CRED", "TOKEN"]);
+        assert_eq!(kept.0[0].1, "secret");
+        assert_eq!(WipedEnv(Vec::new()).keep(&["CRED"]).0.len(), 0);
+    }
 }

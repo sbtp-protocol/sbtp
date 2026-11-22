@@ -713,40 +713,62 @@ impl Store {
     ///
     /// Operating-system errors while listing.
     pub fn scan(&self, mut f: impl FnMut(BlockId, u64, u64)) -> io::Result<()> {
-        for shard in fs::read_dir(&self.blocks)? {
-            let shard = shard?;
-            // `DirEntry::file_type` does not follow a symbolic link.
-            if !shard.file_type()?.is_dir() {
+        scan_tree(&self.blocks, |id, _, meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            f(id, meta.len(), mtime);
+        })
+    }
+}
+
+/// The walk of [`Store::scan`] over the `blocks` directory of a data directory, read-only and
+/// without a [`Store`] (the operator command, [`crate::operator`]): `f(id, path, metadata)` for
+/// every regular file named as a block file at its own shard (ADR 0025 rules 1 and 13).
+///
+/// # Errors
+///
+/// Operating-system errors while listing.
+pub fn scan_tree(
+    blocks: &Path,
+    mut f: impl FnMut(BlockId, &Path, &fs::Metadata),
+) -> io::Result<()> {
+    for shard in fs::read_dir(blocks)? {
+        let shard = shard?;
+        // `DirEntry::file_type` does not follow a symbolic link.
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(shard.path())? {
+            let file = file?;
+            let name = file.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".bin"))
+                .and_then(parse_hex_id)
+            else {
+                continue;
+            };
+            let [.., last] = *id.as_bytes();
+            let path = file.path();
+            if blocks
+                .join(format!("{last:02x}"))
+                .join(format!("{}.bin", hex(&id)))
+                != path
+            {
                 continue;
             }
-            for file in fs::read_dir(shard.path())? {
-                let file = file?;
-                let name = file.file_name();
-                let Some(id) = name
-                    .to_str()
-                    .and_then(|n| n.strip_suffix(".bin"))
-                    .and_then(parse_hex_id)
-                else {
-                    continue;
-                };
-                if self.path(&id) != file.path() {
-                    continue;
-                }
-                // `DirEntry::metadata` does not follow a symbolic link.
-                let meta = file.metadata()?;
-                if !meta.is_file() {
-                    continue;
-                }
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                f(id, meta.len(), mtime);
+            // `DirEntry::metadata` does not follow a symbolic link.
+            let meta = file.metadata()?;
+            if !meta.is_file() {
+                continue;
             }
+            f(id, &path, &meta);
         }
-        Ok(())
     }
+    Ok(())
 }
 
 fn not_a_dir() -> io::Error {

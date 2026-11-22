@@ -458,6 +458,16 @@ pub trait IndexBackend: Send + Sync + Sized {
         Ok(0)
     }
 
+    /// ADR 0052 rule 9, deny review L-2: the key of the mark of each of `ids`, `None` for an
+    /// unmarked block, in the order of `ids`. None by default.
+    ///
+    /// # Errors
+    ///
+    /// Backend errors.
+    fn denied_keys(&self, ids: &[BlockId]) -> Result<Vec<Option<[u8; 32]>>, Self::Error> {
+        Ok(vec![None; ids.len()])
+    }
+
     /// ADR 0046, at start-up before the index is shared: sets the demand epoch `epoch_ms` used to
     /// quantise `last_demand` on insert, and gives demand entries to every block that has none
     /// (an index written before ADR 0046), with `last_demand` its `received_at` quantised to its
@@ -940,6 +950,19 @@ impl IndexBackend for RedbIndex {
         }
         txn.commit()?;
         Ok(marked)
+    }
+
+    /// Deny review L-2, in one read transaction.
+    ///
+    /// # Errors
+    ///
+    /// redb errors.
+    fn denied_keys(&self, ids: &[BlockId]) -> Result<Vec<Option<[u8; 32]>>, IndexError> {
+        let txn = self.db.begin_read()?;
+        let denied = txn.open_table(DENIED)?;
+        ids.iter()
+            .map(|id| Ok(denied.get(id.as_bytes())?.map(|g| *g.value())))
+            .collect()
     }
 
     /// Sets `E`, then, unless `meta` says it is done, gives demand entries to every block that has

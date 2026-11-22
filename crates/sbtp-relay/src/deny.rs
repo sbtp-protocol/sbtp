@@ -1,9 +1,10 @@
 //! The operator deny list (ADR 0052; core spec §4, "Denied blocks"; `architecture.md` §2).
 //!
 //! The list names blocks by `block_id` and keys by the header's public key. It is local
-//! configuration: read from `deny_file` at start-up, on `SIGHUP` and when the file's
-//! modification time or size changes (checked every `deny_reload_ms`), never derived from
-//! anything the relay receives (rule 2). An invalid file at start-up stops the start-up; an
+//! configuration: read from `deny_file` at start-up, on `SIGHUP` and when the file changes
+//! (device, inode, modification or change time, size; checked every `deny_reload_ms`), never
+//! derived from anything the relay receives (rule 2). A file that changes while it is read is
+//! discarded and read again (deny review L-1). An invalid file at start-up stops the start-up; an
 //! invalid or missing file on reload keeps the previous list whole (rule 4).
 //!
 //! **Parser input bounds** (rule 3, for the security review). The file is read as a stream
@@ -32,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -150,9 +151,33 @@ impl List {
     ///
     /// The first invalid line, or a read error ([`Reason::Unreadable`]).
     pub fn parse(r: impl Read, max_entries: usize) -> Result<Self, Invalid> {
+        Self::parse_sized(r, max_entries, (0, 0))
+    }
+
+    /// [`List::parse`] into maps allocated first for `sized` (`block` and `key` entries), so
+    /// that a reload does not grow them entry by entry (deny review L-3: no growth transient,
+    /// the peak stays within `2 × N × 80`). `sized` is a hint, from [`count_entries`]: a file
+    /// that changed between the two reads is still parsed correctly.
+    ///
+    /// # Errors
+    ///
+    /// As [`List::parse`]; [`Reason::OutOfMemory`] when the first allocation fails.
+    pub fn parse_sized(
+        r: impl Read,
+        max_entries: usize,
+        sized: (usize, usize),
+    ) -> Result<Self, Invalid> {
         let mut r = BufReader::with_capacity(READ_BUFFER, r);
         let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
         let mut list = Self::default();
+        let oom = Invalid {
+            line: 0,
+            reason: Reason::OutOfMemory,
+        };
+        let blocks = sized.0.min(max_entries);
+        let keys = sized.1.min(max_entries.saturating_sub(blocks));
+        list.blocks.try_reserve(blocks).map_err(|_| oom)?;
+        list.keys.try_reserve(keys).map_err(|_| oom)?;
         let mut n: u64 = 0;
         loop {
             line.clear();
@@ -277,10 +302,39 @@ impl List {
             || added_purge(&self.keys, old.map(|o| &o.keys))
     }
 
-    /// Every listed key with `hide` or `purge`, for the operator command.
+    /// Every listed key, with `hide` or `purge`.
     pub fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.keys.keys()
     }
+}
+
+/// The first read of a reload (deny review L-3): the number of lines that start like a `block`
+/// and like a `key` entry, duplicates included, each at most `max_entries`. Reads as the parser
+/// does, through one bounded line buffer; it stops at the first line too long or a read error,
+/// which the parse then reports.
+#[must_use]
+pub fn count_entries(r: impl Read, max_entries: usize) -> (usize, usize) {
+    let mut r = BufReader::with_capacity(READ_BUFFER, r);
+    let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
+    let (mut blocks, mut keys) = (0usize, 0usize);
+    loop {
+        line.clear();
+        let Ok(read) = (&mut r)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+        else {
+            break;
+        };
+        if read == 0 || line.strip_suffix(b"\n").unwrap_or(&line).len() > MAX_LINE_BYTES {
+            break;
+        }
+        if line.starts_with(b"block ") {
+            blocks = blocks.saturating_add(1).min(max_entries);
+        } else if line.starts_with(b"key ") {
+            keys = keys.saturating_add(1).min(max_entries);
+        }
+    }
+    (blocks, keys)
 }
 
 /// `<kind> <hex>[ <action>]`, single spaces, nothing else (rule 3).
@@ -311,8 +365,26 @@ pub fn pubkey_of(bytes: &[u8]) -> Option<[u8; 32]> {
         .and_then(|k| <[u8; 32]>::try_from(k).ok())
 }
 
-/// The modification time and size of the file, or `None` when it cannot be read.
-type Stamp = Option<(Option<SystemTime>, u64)>;
+/// What tells one state of the file from another: the device and inode (an `mv` into place),
+/// the modification and change times (a time-preserving copy changes `ctime`) and the size
+/// (deny review L-1). `None` when the file cannot be read, or when the last read must be done
+/// again.
+type Stamp = Option<FileStamp>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mtime: Option<SystemTime>,
+    /// `ctime` in seconds and nanoseconds; `(0, 0)` where it does not exist.
+    ctime: (i64, i64),
+    len: u64,
+}
+
+/// How many times the start-up load reads a file that changes while it is read, before giving
+/// up, and the pause between two reads.
+const SETTLE_TRIES: u32 = 5;
+const SETTLE_PAUSE: Duration = Duration::from_millis(50);
 
 /// The deny list of a relay: off, or the list loaded from `deny_file`.
 #[derive(Debug, Default)]
@@ -337,6 +409,9 @@ pub enum Reload {
     Loaded,
     /// The file is invalid or missing: the previous list stays in force.
     Invalid(Invalid),
+    /// The file changed while it was read (deny review L-1): the result is discarded, the
+    /// previous list stays in force, and the next poll reads the file again.
+    Changed,
     /// The deny list is off.
     Off,
 }
@@ -364,13 +439,22 @@ impl Deny {
             reload_every: Duration::from_millis(s.deny_reload_ms),
             ..Self::default()
         };
-        match deny.reload() {
-            Reload::Loaded | Reload::Off => Ok(deny),
-            Reload::Invalid(e) => Err(ConfigError::Invalid {
-                setting: "deny_file",
-                reason: format!("invalid at line {}: {}", e.line, e.reason.name()),
-            }),
+        for _ in 0..SETTLE_TRIES {
+            match deny.reload() {
+                Reload::Loaded | Reload::Off => return Ok(deny),
+                Reload::Invalid(e) => {
+                    return Err(ConfigError::Invalid {
+                        setting: "deny_file",
+                        reason: format!("invalid at line {}: {}", e.line, e.reason.name()),
+                    });
+                }
+                Reload::Changed => std::thread::sleep(SETTLE_PAUSE),
+            }
         }
+        Err(ConfigError::Invalid {
+            setting: "deny_file",
+            reason: "the file kept changing while it was read".into(),
+        })
     }
 
     /// Whether a deny list is applied (`deny_file` is set; `/info` `deny_list`, rule 11).
@@ -407,7 +491,7 @@ impl Deny {
         self.pass_wanted.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether the file's modification time or size differs from the last read attempt.
+    /// Whether the file's stamp ([`FileStamp`]) differs from the last read attempt.
     #[must_use]
     pub fn changed(&self) -> bool {
         let Some(path) = &self.path else {
@@ -428,7 +512,10 @@ impl Deny {
         let (read, stamp) = read_file(path, self.max_entries);
         *self.stamp.lock().unwrap_or_else(PoisonError::into_inner) = stamp;
         let new = match read {
-            Ok(list) => Arc::new(list),
+            Ok(Some(list)) => Arc::new(list),
+            // Deny review L-1: half a rewrite is never applied; `stamp` is unset, so that the
+            // next poll reads the file again.
+            Ok(None) => return Reload::Changed,
             Err(e) => {
                 log::throttled(
                     &INVALID_LOG,
@@ -465,12 +552,38 @@ impl Deny {
 }
 
 fn stamp_of(m: Option<&std::fs::Metadata>) -> Stamp {
-    m.map(|m| (m.modified().ok(), m.len()))
+    m.map(|m| {
+        #[cfg(unix)]
+        let (dev, ino, ctime) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (m.dev(), m.ino(), (m.ctime(), m.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let (dev, ino, ctime) = (0, 0, (0, 0));
+        FileStamp {
+            dev,
+            ino,
+            mtime: m.modified().ok(),
+            ctime,
+            len: m.len(),
+        }
+    })
 }
 
 /// Opens `path` without blocking on a FIFO or a device, refuses anything but a regular file,
-/// and parses it. Returns the stamp of the opened file.
-fn read_file(path: &Path, max_entries: usize) -> (Result<List, Invalid>, Stamp) {
+/// and parses it. Returns the stamp of the opened file. `Ok(None)` when the open file changed
+/// while it was parsed (deny review L-1): an in-place rewrite caught half-way, whose stamp is
+/// then `None`.
+fn read_file(path: &Path, max_entries: usize) -> (Result<Option<List>, Invalid>, Stamp) {
+    read_file_then(path, max_entries, || {})
+}
+
+/// [`read_file`], with `between` called between the parse and the second `fstat` (tests).
+fn read_file_then(
+    path: &Path,
+    max_entries: usize,
+    between: impl FnOnce(),
+) -> (Result<Option<List>, Invalid>, Stamp) {
     let whole = |reason| Invalid { line: 0, reason };
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -491,24 +604,58 @@ fn read_file(path: &Path, max_entries: usize) -> (Result<List, Invalid>, Stamp) 
     if !meta.is_some_and(|m| m.is_file()) {
         return (Err(whole(Reason::Unreadable)), stamp);
     }
-    (List::parse(file, max_entries), stamp)
+    // Deny review L-3: count first, then parse into maps of that size, from the start again.
+    let sized = count_entries(&file, max_entries);
+    if (&file).seek(io::SeekFrom::Start(0)).is_err() {
+        return (Err(whole(Reason::Unreadable)), stamp);
+    }
+    let parsed = match List::parse_sized(&file, max_entries, sized) {
+        Ok(list) => list,
+        Err(e) => return (Err(e), stamp),
+    };
+    between();
+    // A rewrite in place that started or ended during the parse changes the size, the
+    // modification or the change time of the open file.
+    if stamp_of(file.metadata().ok().as_ref()) != stamp {
+        return (Ok(None), None);
+    }
+    (Ok(Some(parsed)), stamp)
 }
 
 /// Where the marking pass is.
 struct Pass {
     from: Position,
     pending: u64,
+    /// `purge` deletions that failed in this pass (deny review L-2).
+    failed: u64,
 }
 
-/// One run of the marking pass from `from`, at most `batch` held blocks, with `list`. Returns
-/// the next position and the number of blocks walked, `None` as position when the walk is done;
-/// `Err` when an index queue refused or a job failed (the run is tried again).
+/// What one run of the marking pass did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ran {
+    /// The next position, `None` when the walk is done.
+    pub next: Option<Position>,
+    /// The blocks walked.
+    pub walked: u64,
+    /// The `purge` deletions that failed; their blocks keep their entries and their mark, and
+    /// a later pass tries again.
+    pub failed: u64,
+}
+
+/// One run of the marking pass from `from`, at most `batch` held blocks, with `list`. `Err`
+/// when an index queue refused or a job failed (the run is tried again).
+///
+/// Deny review L-2: every key match, `purge` included, is marked before any file is deleted,
+/// and a block whose file is gone is judged by the key of its mark. A run tried again after a
+/// failed index removal, or a pass started again after a stop, therefore still finds the key,
+/// deletes nothing more and removes the entries. A block whose deletion fails keeps its mark,
+/// so it stays out of `/query`.
 pub(crate) fn mark_once<I: IndexBackend + 'static>(
     relay: &Relay<I>,
     list: &List,
     from: Position,
     batch: usize,
-) -> Result<(Option<Position>, u64), ()> {
+) -> Result<Ran, ()> {
     let Ok(Ok(page)) = relay
         .index()
         .read_blocking(move |i| i.query(None, from, batch))
@@ -516,64 +663,98 @@ pub(crate) fn mark_once<I: IndexBackend + 'static>(
         return Err(());
     };
     let walked = page.entries.len() as u64;
+    // The marks already written, read only when the list names a key.
+    let marked: Vec<Option<[u8; 32]>> = if list.has_keys() {
+        let ids: Vec<BlockId> = page.entries.iter().map(|(_, id)| *id).collect();
+        match relay.index().read_blocking(move |i| i.denied_keys(&ids)) {
+            Ok(Ok(keys)) => keys,
+            _ => return Err(()),
+        }
+    } else {
+        Vec::new()
+    };
     let mut marks = Vec::new();
-    let mut purged = Vec::new();
-    for (at, id) in page.entries {
-        let _lock = relay.lock_id(&id);
-        // The stored file's key; a file that cannot be read is judged by its `block_id` only.
+    let mut to_purge = Vec::new();
+    for (n, (at, id)) in page.entries.iter().enumerate() {
+        let _lock = relay.lock_id(id);
+        // The stored file's key; else the key of its mark; else judged by `block_id` only.
         let key = relay
             .store()
-            .read(&id)
+            .read(id)
             .ok()
             .flatten()
-            .and_then(|b| pubkey_of(&b));
-        let (by_key, purge) = list.judge(&id, key.as_ref());
+            .and_then(|b| pubkey_of(&b))
+            .or_else(|| marked.get(n).copied().flatten());
+        let (by_key, purge) = list.judge(id, key.as_ref());
+        if let (true, Some(k)) = (by_key, key) {
+            marks.push((*id, k));
+        }
         if purge {
-            // Rule 14: as an eviction deletes, regardless of ADR 0046 rule 7. A failed deletion
-            // keeps the entries; the next pass tries again.
-            if relay.evict_locked(&id).is_ok() {
-                purged.push(at);
-            }
-        } else if let (true, Some(k)) = (by_key, key) {
-            marks.push((id, k));
+            to_purge.push((*at, *id));
         }
     }
-    relay.store().publish_gauges();
     if !marks.is_empty() {
         match relay.index().write_blocking(move |i| i.mark_denied(&marks)) {
             Ok(Ok(_)) => {}
             _ => return Err(()),
         }
     }
+    // Rule 14: as an eviction deletes, regardless of ADR 0046 rule 7. A file already gone is
+    // a deletion done (`Ok(None)`).
+    let mut purged = Vec::new();
+    let mut failed = 0u64;
+    for (at, id) in to_purge {
+        let _lock = relay.lock_id(&id);
+        if relay.evict_locked(&id).is_ok() {
+            purged.push(at);
+        } else {
+            failed += 1;
+        }
+    }
+    relay.store().publish_gauges();
     if !purged.is_empty() {
         match relay.index().write_blocking(move |i| i.remove(&purged)) {
             Ok(Ok(_)) => {}
             _ => return Err(()),
         }
     }
-    Ok((page.more.then_some(page.next), walked))
+    Ok(Ran {
+        next: page.more.then_some(page.next),
+        walked,
+        failed,
+    })
 }
 
-/// The whole marking pass with the list in force, run after run, on the calling thread (tests,
-/// the operator command).
+/// The whole marking pass with the list in force, run after run, on the calling thread (tests).
+/// `false` when a run failed or a `purge` deletion failed.
 pub fn mark_all<I: IndexBackend + 'static>(relay: &Relay<I>, batch: usize) -> bool {
     let Some(list) = relay.deny().list() else {
         return true;
     };
     let mut from = Position::default();
+    let mut failed = 0;
     loop {
         match mark_once(relay, &list, from, batch) {
-            Ok((Some(next), _)) => from = next,
-            Ok((None, _)) => return true,
+            Ok(ran) => {
+                failed += ran.failed;
+                match ran.next {
+                    Some(next) => from = next,
+                    None => return failed == 0,
+                }
+            }
             Err(()) => return false,
         }
     }
 }
 
+/// The wait before a pass whose `purge` deletions failed is started again (deny review L-2).
+const PURGE_RETRY: Duration = Duration::from_secs(300);
+
 /// The reload task (rule 4) and the marking pass (rules 9 and 14), until `stop` changes: a
 /// reload on [`Deny::request_reload`] and when the file changed (every `deny_reload_ms`), a run
-/// of the pass every [`PASS_PAUSE`] while one is due. Returns early only if a job panicked,
-/// which the caller treats as the end of a supervised task (ADR 0018 rule 37).
+/// of the pass every [`PASS_PAUSE`] while one is due, and a new pass [`PURGE_RETRY`] after one
+/// whose `purge` deletions failed. Returns early only if a job panicked, which the caller treats
+/// as the end of a supervised task (ADR 0018 rule 37).
 pub async fn run<I: IndexBackend + 'static>(
     relay: Arc<Relay<I>>,
     batch: usize,
@@ -584,8 +765,14 @@ pub async fn run<I: IndexBackend + 'static>(
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pass: Option<Pass> = None;
+    let mut again: Option<tokio::time::Instant> = None;
     loop {
+        if again.is_some_and(|t| t <= tokio::time::Instant::now()) {
+            again = None;
+            deny.pass_wanted.store(true, Ordering::Release);
+        }
         if deny.take_pass() {
+            again = None;
             let r = Arc::clone(&relay);
             let len = tokio::task::spawn_blocking(move || {
                 r.index()
@@ -598,13 +785,14 @@ pub async fn run<I: IndexBackend + 'static>(
             pass = Some(Pass {
                 from: Position::default(),
                 pending: len.unwrap_or(0),
+                failed: 0,
             });
         }
         metrics::set_deny_marking_pending(pass.as_ref().map_or(0, |p| p.pending));
-        let pause = if pass.is_some() {
-            PASS_PAUSE
-        } else {
-            Duration::MAX
+        let pause = match (&pass, again) {
+            (Some(_), _) => PASS_PAUSE,
+            (None, Some(t)) => t.saturating_duration_since(tokio::time::Instant::now()),
+            (None, None) => Duration::MAX,
         };
         let forced = tokio::select! {
             biased;
@@ -636,11 +824,18 @@ pub async fn run<I: IndexBackend + 'static>(
             return;
         };
         match ran {
-            Ok((Some(next), n)) => {
-                p.from = next;
-                p.pending = p.pending.saturating_sub(n);
+            Ok(ran) => {
+                p.failed = p.failed.saturating_add(ran.failed);
+                if let Some(next) = ran.next {
+                    p.from = next;
+                    p.pending = p.pending.saturating_sub(ran.walked);
+                } else {
+                    if p.failed > 0 {
+                        again = Some(tokio::time::Instant::now() + PURGE_RETRY);
+                    }
+                    pass = None;
+                }
             }
-            Ok((None, _)) => pass = None,
             Err(()) => tokio::time::sleep(PASS_RETRY).await,
         }
     }
@@ -791,6 +986,98 @@ mod tests {
         );
         assert!(l(format!("key {B} purge\n")).needs_pass(Some(&keys)));
         assert!(l(format!("key {A}\n")).needs_pass(Some(&keys)));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "sbtp-deny-{name}-{}-{}",
+            std::process::id(),
+            log::unix_ms()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("deny.txt")
+    }
+
+    /// Deny review L-1: a file rewritten in place while it is parsed is discarded, with no
+    /// stamp, so that the next poll reads it again.
+    #[test]
+    fn a_file_changed_during_the_parse_is_discarded() {
+        let path = scratch("rewrite");
+        std::fs::write(&path, format!("block {A}\n")).unwrap();
+        let (read, stamp) = read_file_then(&path, 16, || {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(format!("block {B}\n").as_bytes()).unwrap();
+        });
+        assert_eq!((read, stamp), (Ok(None), None));
+        let (read, stamp) = read_file(&path, 16);
+        assert_eq!(read.unwrap().unwrap().counts(), (2, 0, 0));
+        assert!(stamp.is_some());
+    }
+
+    /// Deny review L-1: a replacement with the same size and modification time, moved into
+    /// place, is seen by the poll (the inode and `ctime` differ).
+    #[test]
+    fn a_same_size_same_time_replacement_is_seen() {
+        let path = scratch("swap");
+        std::fs::write(&path, format!("block {A}\n")).unwrap();
+        let deny = Deny {
+            path: Some(path.clone()),
+            max_entries: 16,
+            ..Deny::default()
+        };
+        assert_eq!(deny.reload(), Reload::Loaded);
+        assert!(!deny.changed());
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let next = path.with_extension("new");
+        std::fs::write(&next, format!("block {B}\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert!(deny.changed());
+        assert_eq!(deny.reload(), Reload::Loaded);
+        assert!(deny.check(&id(B), None).is_some());
+    }
+
+    /// Deny review L-3: the counting read sizes both maps, so the parse never grows them; a
+    /// hint smaller or larger than the file is still parsed correctly.
+    #[test]
+    fn maps_are_sized_by_the_counting_read() {
+        let many: String = (0..=99u8)
+            .map(|n| format!("block {}\nkey {}\n", hex32(n), hex32(n)))
+            .collect();
+        let text = format!("# comment\n{many}");
+        assert_eq!(count_entries(text.as_bytes(), 1_000), (100, 100));
+        assert_eq!(count_entries(text.as_bytes(), 150), (100, 100));
+        assert_eq!(count_entries(text.as_bytes(), 50), (50, 50));
+        let sized = count_entries(text.as_bytes(), 1_000);
+        let l = List::parse_sized(text.as_bytes(), 1_000, sized).unwrap();
+        let (b, k) = (l.blocks.capacity(), l.keys.capacity());
+        assert!(b >= 100 && k >= 100);
+        let grown = List::parse(text.as_bytes(), 1_000).unwrap();
+        assert_eq!(l, grown);
+        // Capacities did not move past the first allocation.
+        let again = List::parse_sized(text.as_bytes(), 1_000, sized).unwrap();
+        assert_eq!((again.blocks.capacity(), again.keys.capacity()), (b, k));
+        for hint in [(0, 0), (1, 1), (500, 500)] {
+            assert_eq!(
+                List::parse_sized(text.as_bytes(), 1_000, hint).unwrap(),
+                grown
+            );
+        }
+        assert_eq!(
+            List::parse_sized(text.as_bytes(), 150, sized)
+                .unwrap_err()
+                .reason,
+            Reason::TooManyEntries
+        );
     }
 
     /// The public key of a block is read from its header.

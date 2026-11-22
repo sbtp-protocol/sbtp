@@ -983,7 +983,8 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
             .map(|r| refused_total(*r))
             .fold(0, u64::saturating_add)
     };
-    vec![
+    #[allow(unused_mut)] // Extended in the `object-store` build.
+    let mut v = vec![
         ("requests_2xx", class(0)),
         ("requests_4xx", class(1)),
         ("requests_5xx", class(2)),
@@ -1026,5 +1027,9 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         ("panics", PANICS.load(Relaxed)),
         ("connections_open", CONNECTIONS_OPEN.load(Relaxed)),
         ("connections_refused", CONNECTIONS_REFUSED.load(Relaxed)),
-    ]
+    ];
+    // Mirror review L-4: the archive copy's counters, while it runs.
+    #[cfg(feature = "object-store")]
+    v.extend(crate::mirror::metrics::stats());
+    v
 }
