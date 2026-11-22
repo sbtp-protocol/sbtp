@@ -57,6 +57,11 @@ Initial public version. Pre-release software: no version is supported for produc
   (single-shot, X25519/HKDF-SHA256/ChaCha20Poly1305), padding to the fixed buckets, strict inner
   signature, directory and application tags; `no_std` + `alloc`, `wasm32`. Security review:
   `docs/security/2026-11-21-sbtp-seal.md` (mergeable; L-2 fixed, other low and info findings tracked).
+- `@sbtp/wasm` npm package (ADR 0053), not published yet: reproducible build with pinned tools, strict
+  contents check in CI (exact file list, byte comparison of copied files, strict tar walk, size bounds),
+  `SigningMessage` returned by the signing-message builders (ADR 0055 E1), declarations that compile
+  without the DOM lib, a disabled release workflow that publishes only from `main` with provenance.
+  Security review and re-review: `docs/security/2026-11-22-wasm-npm-package.md` (mergeable).
 - `sbtp-wasm`: layer 2 validation (`validateL2Payload`) and the sealed envelope (`seal`, two-phase
   `sealPrepare` / `finish` for an identity key outside WASM such as a non-extractable Web Crypto key,
   `openSealed` with one opaque `OpenFailed`, `EncKeyPair`, tags); one module behind the `l2` and `seal`
