@@ -32,6 +32,7 @@ use crate::pool::{IndexHandle, PoolError};
 use crate::query::expiry_floor;
 use crate::server::RequestClient;
 use crate::store::{self, Cause, Quarantine, Store, StoreError, Stored, full_validation};
+use crate::subscribe::{Entry as SubEntry, Hub};
 
 /// A bounded operation class of ADR 0018 rule 18: permits, then a queue of at most `max_queue`
 /// waiters, each for at most `queue_timeout_ms`. Never an unbounded wait (rule 3).
@@ -138,6 +139,8 @@ pub struct Relay<I> {
     ingest: Ingest,
     /// ADR 0052: the operator deny list, off unless [`Relay::with_deny`] sets one.
     deny: Arc<Deny>,
+    /// ADR 0054: the subscriptions, `None` with `ws_enabled = false`.
+    subscriptions: Option<Arc<Hub>>,
     /// Tests: run once by [`Relay::index_new`] just before its index insert, under the lock.
     #[cfg(test)]
     before_insert: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -160,6 +163,31 @@ impl<I: IndexBackend + 'static> Relay<I> {
         let queue = Duration::from_millis(s.queue_timeout_ms);
         let demand = Demand::new(s)?;
         let (cache_control, cdn_cache_control) = cache_headers(&demand);
+        // ADR 0054 rule 14: the fan-out starts at the gap after the newest position, read once.
+        let subscriptions = if s.ws_enabled {
+            let head = index
+                .read_blocking(|i| {
+                    i.read_query(&crate::index::QueryPlan {
+                        listings: vec![crate::index::Listing {
+                            parent: None,
+                            cursor: None,
+                        }],
+                        order: crate::index::Order::Desc,
+                        lower: Position::default(),
+                        limit: 1,
+                        fields: false,
+                        deny: None,
+                    })
+                    .map(|a| a.head)
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let epoch = index.clone();
+            Hub::new(s, head, move || epoch.epoch())
+        } else {
+            None
+        };
         Ok(Self {
             store,
             index,
@@ -196,6 +224,7 @@ impl<I: IndexBackend + 'static> Relay<I> {
             sweep_retry_after_s: s.sweep_interval_ms.div_ceil(1_000),
             ingest: Ingest::from_settings(s)?,
             deny: Arc::new(Deny::off()),
+            subscriptions,
             #[cfg(test)]
             before_insert: Mutex::new(None),
             #[cfg(test)]
@@ -285,6 +314,12 @@ impl<I: IndexBackend + 'static> Relay<I> {
     pub fn with_deny(mut self, deny: Arc<Deny>) -> Self {
         self.deny = deny;
         self
+    }
+
+    /// The subscriptions (ADR 0054), `None` when off.
+    #[must_use]
+    pub fn subscriptions(&self) -> Option<&Arc<Hub>> {
+        self.subscriptions.as_ref()
     }
 
     /// The operator deny list (ADR 0052).
@@ -614,7 +649,8 @@ impl<I: IndexBackend + 'static> Relay<I> {
                 f();
             }
         }
-        let inserted = self.insert(id, len, block.parents(), FileState::Created);
+        let key = *block.pubkey();
+        let inserted = self.insert_new(id, len, block.parents(), key);
         self.bump_accepted(id);
         self.store.publish_gauges();
         // ADR 0018 rule 13: the writer queue is bounded by the `PUT` permits; a refusal leaves an
@@ -805,6 +841,44 @@ impl<I: IndexBackend + 'static> Relay<I> {
         let inserted = self
             .index
             .write_blocking(move |i| i.insert(&id, len, &parents, clock(), state))
+            .map_err(|_: PoolError| Refused::IndexQueue);
+        if let Ok(r) = &inserted {
+            self.index.record_write(r); // ADR 0018 rule 37
+        }
+        inserted
+    }
+
+    /// [`Relay::insert`] of a block new for the relay, which then takes a new position: right
+    /// after the commit, on the writer thread, the block is offered to the subscriptions, unless
+    /// the deny list refuses it now (ADR 0054 rules 12, 13, 34 and 42). The offer never waits.
+    fn insert_new(
+        &self,
+        id: &BlockId,
+        len: u32,
+        parents: &[BlockId],
+        key: [u8; 32],
+    ) -> Result<Result<Option<crate::index::Position>, I::Error>, Refused> {
+        let Some(hub) = self.subscriptions.clone() else {
+            return self.insert(id, len, parents, FileState::Created);
+        };
+        let (id, parents, clock, deny) =
+            (*id, parents.to_vec(), self.clock, Arc::clone(&self.deny));
+        let inserted = self
+            .index
+            .write_blocking(move |i| {
+                let r = i.insert(&id, len, &parents, clock(), FileState::Created);
+                if let Ok(Some(at)) = &r
+                    && deny.check(&id, Some(&key)).is_none()
+                {
+                    hub.offer(SubEntry {
+                        at: *at,
+                        id,
+                        parents,
+                        len,
+                    });
+                }
+                r
+            })
             .map_err(|_: PoolError| Refused::IndexQueue);
         if let Ok(r) = &inserted {
             self.index.record_write(r); // ADR 0018 rule 37

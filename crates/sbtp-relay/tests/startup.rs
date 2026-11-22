@@ -825,7 +825,7 @@ fn profile_precedence_and_per_setting_override() {
     assert!(lines.contains(&"max_connections = 500 (env)".to_owned()));
     assert!(lines.contains(&"profile = standard (env)".to_owned()));
     assert!(lines.contains(&"listen = 127.0.0.1:8080 (default)".to_owned()));
-    assert_eq!(lines.len(), 89, "one line per setting");
+    assert_eq!(lines.len(), 96, "one line per setting");
 
     // An override that breaks a constraint with a profile value stops the start-up and names
     // both settings; nothing is adjusted.
@@ -1372,6 +1372,14 @@ const FUNCTIONS: &[(&str, Pairs, Pairs, u64)] = &[
         &[("DENY_FILE", "")],
         2 * 2_048 * 80,
     ),
+    // ADR 0054 rule 35: the subscription registry, the fan-out queue and the group counts, only
+    // with `ws_enabled`; the connection buffers fit in the connection term (rule 29).
+    (
+        "subscriptions",
+        &[("WS_ENABLED", "true")],
+        &[("WS_ENABLED", "false")],
+        16 * 4 * 5_184 + 256 * 320 + 16 * 128,
+    ),
 ];
 
 /// ADR 0048 budget: `small` with every function of [`FUNCTIONS`] on stays under 20,000,000 bytes,
@@ -1391,14 +1399,14 @@ fn small_profile_with_every_function_is_under_20_mb() {
         .collect();
     let all = load(&[], &on).unwrap().memory_bound_bytes();
     assert!(all < 20_000_000, "{all}");
-    // ADR 0052 rule 21: the figure of the ADR, 19,009,458 bytes, with every function compiled
-    // in. It also counts two terms of functions this relay does not have yet: server TLS (ADR
+    // ADR 0054 rule 35 (after ADR 0052 rule 21): the figure of the ADR, 19,425,202 bytes, with
+    // every function compiled in. It also counts two terms of functions this relay does not have yet: server TLS (ADR
     // 0028 rule 36) and the read-through of ADR 0050 rules 15 to 19 (its share of rule 27 when
     // replication is on).
     if cfg!(feature = "object-store") {
         const SERVER_TLS: u64 = 2_228_224;
         const READ_THROUGH: u64 = 168_197;
-        assert_eq!(all + SERVER_TLS + READ_THROUGH, 19_009_458);
+        assert_eq!(all + SERVER_TLS + READ_THROUGH, 19_425_202);
     }
     for (name, _, off, share) in functions {
         let mut without = on.clone();

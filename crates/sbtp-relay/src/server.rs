@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderValue, Method, Request, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use http_body::Body as _;
 use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
@@ -71,6 +71,7 @@ use crate::config::Settings;
 use crate::limiter::Limiter;
 use crate::log::{self, Event, Level, Throttle, Value};
 use crate::metrics::{self, AcceptClass};
+use crate::subscribe::Link;
 
 /// Time allowed, after `request_timeout_ms`, to write the `503` of rule 25 or finish a response.
 pub const RESPONSE_GRACE: Duration = Duration::from_secs(1);
@@ -155,7 +156,9 @@ impl RequestClass {
     pub fn of(method: &Method, path: &str) -> Self {
         match (method, path) {
             (&Method::PUT, "/sbtp/v1/block") => Self::Put,
-            (&Method::GET | &Method::HEAD, "/sbtp/v1/query") => Self::Query,
+            // ADR 0054 rule 25, step 3: the upgrade takes one `query` token.
+            (&Method::GET | &Method::HEAD, "/sbtp/v1/query")
+            | (&Method::GET, "/sbtp/v1/subscribe") => Self::Query,
             _ => Self::Block,
         }
     }
@@ -343,6 +346,7 @@ impl Drain {
 /// # Errors
 ///
 /// None at present; accept errors are retried.
+#[allow(clippy::too_many_lines)] // The accept loop and the drain, in one place.
 pub async fn serve<S: StopSignal>(
     listener: TcpListener,
     app: Router,
@@ -428,9 +432,15 @@ pub async fn serve<S: StopSignal>(
             };
             let open = metrics::OpenConnection::new();
             tokio::spawn(async move {
-                conn.run(stream).await;
-                drop(open);
+                let session = conn.run(stream).await;
+                // ADR 0054 rule 27: from its `101` a subscription connection leaves the
+                // per-client connection count, and keeps its `max_connections` permit until its
+                // session ends.
                 drop(slot);
+                if let Some(ended) = session {
+                    let _ = ended.await;
+                }
+                drop(open);
                 drop(permit);
             });
         }
@@ -581,8 +591,11 @@ fn admit(
 }
 
 impl Connection {
-    async fn run(mut self, stream: TcpStream) {
+    /// Serves the connection; returns the end of its subscription session when it was upgraded
+    /// (ADR 0054 rule 27).
+    async fn run(mut self, stream: TcpStream) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let state = Arc::new(ConnState::new(self.limits));
+        let link = Link::new(self.stopping.clone(), Arc::clone(&state.limits.limiter));
         let io = TokioIo::new(Watched {
             inner: stream,
             state: Arc::clone(&state),
@@ -594,10 +607,12 @@ impl Connection {
             let admission = self.admission;
             let clients = Arc::clone(&state.limits.clients);
             let limiter = Arc::clone(&state.limits.limiter);
+            let link = Arc::clone(&link);
             hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
                 state.request_started(req.body().size_hint().exact());
                 let state = Arc::clone(&state);
                 let mut req = req.map(Body::new);
+                req.extensions_mut().insert(Arc::clone(&link));
                 // Step 3 of ADR 0018 rule 28, before the request reaches the router and before
                 // the body is read (spec §4, `429` for requests in flight). The slot belongs to
                 // this request: it moves into its response body and is released once that
@@ -611,7 +626,9 @@ impl Connection {
                     };
                     // ADR 0019 rules 32 and 33 (spec §4: a response MAY carry
                     // `Connection: close`).
-                    if state.last_request() {
+                    // Never on a `101`, whose `Connection` is `upgrade` (ADR 0054).
+                    if state.last_request() && response.status() != StatusCode::SWITCHING_PROTOCOLS
+                    {
                         response
                             .headers_mut()
                             .insert(header::CONNECTION, HeaderValue::from_static("close"));
@@ -623,7 +640,8 @@ impl Connection {
                 }
             })
         };
-        let conn = self.builder.serve_connection(io, svc);
+        // ADR 0054 rule 3: the HTTP/1.1 upgrade of `GET /sbtp/v1/subscribe`.
+        let conn = self.builder.serve_connection(io, svc).with_upgrades();
         tokio::pin!(conn);
         let mut stopping = *self.stopping.borrow();
         if stopping {
@@ -634,10 +652,11 @@ impl Connection {
             tokio::select! {
                 // Errors (malformed request, reset, oversized headers already answered by hyper)
                 // end the connection; nothing about the peer is logged.
-                _ = conn.as_mut() => return,
+                _ = conn.as_mut() => return link.take_session(),
                 () = tokio::time::sleep_until(deadline) => {
                     if state.deadline() <= Instant::now() {
-                        return; // Dropping `conn` closes the socket (rules 23, 25, 26).
+                        // Dropping `conn` closes the socket (rules 23, 25, 26).
+                        return link.take_session();
                     }
                 }
                 () = state.changed.notified() => {}

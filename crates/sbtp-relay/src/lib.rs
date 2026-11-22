@@ -37,6 +37,7 @@ pub mod query;
 pub mod replication;
 pub mod server;
 pub mod store;
+pub mod subscribe;
 pub mod sweep;
 
 use std::ffi::OsString;

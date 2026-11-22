@@ -1047,6 +1047,41 @@ mod demand_tests {
         let _ = std::fs::remove_file(&list);
     }
 
+    /// ADR 0054 rule 42: a block the deny list refuses when it is committed is never offered to
+    /// the subscriptions, even when the list was loaded after the `PUT`'s own check.
+    #[tokio::test]
+    async fn a_block_denied_at_the_fan_out_is_never_offered() {
+        fn now() -> u64 {
+            T0
+        }
+        let list = std::env::temp_dir().join(format!("sbtp-deny-fanout-{}", std::process::id()));
+        std::fs::write(&list, "").unwrap();
+        let f = fixture(
+            "deny-fanout",
+            now,
+            &[
+                ("DENY_FILE", list.to_str().unwrap()),
+                ("WS_ENABLED", "true"),
+            ],
+        );
+        let hub = Arc::clone(f.relay.subscriptions().unwrap());
+        let (a, ida) = block(1, 16, &[]);
+        assert_eq!(put(&f, &a).await.status(), StatusCode::CREATED);
+        assert_eq!(hub.drain_offered(), [ida]);
+        let (b, idb) = block(2, 16, &[]);
+        let relay = Arc::downgrade(&f.relay);
+        let file = list.clone();
+        // After the `PUT`'s deny check (rule 7 of ADR 0052), before its insert.
+        f.relay.set_before_insert(move || {
+            std::fs::write(&file, format!("block {idb}\n")).unwrap();
+            let r = relay.upgrade().unwrap();
+            assert_eq!(r.deny().reload(), crate::deny::Reload::Loaded);
+        });
+        assert_eq!(put(&f, &b).await.status(), StatusCode::CREATED);
+        assert_eq!(hub.drain_offered(), Vec::<BlockId>::new(), "never offered");
+        let _ = std::fs::remove_file(&list);
+    }
+
     /// A block of `len` payload bytes, distinct per `n`, with `parents`.
     fn block(n: u32, len: usize, parents: &[BlockId]) -> (Vec<u8>, BlockId) {
         let k = sbtp_core::SigningKey::from_bytes(&[5; 32]);
