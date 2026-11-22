@@ -3,14 +3,24 @@
 #
 #   crates/sbtp-wasm/npm/check.sh <sbtp-wasm-VERSION.tgz>
 #
-# Fails if the tarball holds anything other than the expected files (regular files only), if the
-# manifest declares a script, a dependency or other than the expected name, version, licence and
-# file list, if the type declarations name a DOM-only type or lost the SigningMessage brand, if any
-# file holds a local or absolute path or a source map reference, or if the module is not under the 200,000-byte gzip budget of ADR 0048. Reads the tarball only; extracts nothing to
-# disk and executes nothing from it.
+# Fails if:
+#   - the tarball holds anything other than the expected files (regular files only);
+#   - the manifest declares a script, a dependency or other than the expected name, version,
+#     licence and file list;
+#   - a file copied from the repository (manifest, Node.js entry, README, licences) is not
+#     byte-identical to its repository copy;
+#   - the package exceeds its size bounds, or the module is not under the 200,000-byte gzip budget
+#     of ADR 0048;
+#   - the type declarations name a DOM-only type or lost the SigningMessage brand;
+#   - any file holds a local or absolute path or a source map reference.
+# Reads the tarball only; extracts nothing to disk and executes nothing from it.
 set -eu
 
 MAX_WASM_GZIP_BYTES=200000
+# Bounds of the whole package: the tarball file and the sum of its unpacked files. About twice the
+# current sizes (0.1.0: 140 kB packed, 340 kB unpacked), so that only a gross change trips them.
+MAX_TARBALL_BYTES=300000
+MAX_UNPACKED_BYTES=1000000
 
 die() { echo "check.sh: $*" >&2; exit 1; }
 [ $# -eq 1 ] || die "usage: check.sh <tarball>"
@@ -45,6 +55,24 @@ fi
 
 version=$(cd "$root" && cargo metadata --format-version 1 --no-deps --locked | node "$tools" crate-version)
 tar -xOzf "$tgz" package/package.json | node "$tools" manifest "$version"
+# The files copied verbatim into the package are byte-identical to the repository copies, so no key
+# of the manifest and no line of the Node.js entry can differ from what was reviewed (security review
+# 2026-11-22, L-2). Only the build output (glue, declarations, module) is not compared here; the
+# reproducible build checks it (rebuild and compare the tarball's SHA-256).
+for pair in "package.json:$here/package.json" "node.js:$here/node.js" "README.md:$here/README.md" \
+  "LICENSE-MIT:$root/LICENSE-MIT" "LICENSE-APACHE:$root/LICENSE-APACHE"; do
+  name=${pair%%:*}
+  copy=${pair#*:}
+  tar -xOzf "$tgz" "package/$name" | cmp -s - "$copy" \
+    || die "package/$name differs from the repository copy ${copy#"$root"/}"
+done
+
+packed=$(wc -c < "$tgz" | tr -d ' ')
+[ "$packed" -le "$MAX_TARBALL_BYTES" ] || die "the tarball is $packed bytes, the bound is $MAX_TARBALL_BYTES"
+unpacked=$(tar -xOzf "$tgz" | wc -c | tr -d ' ')
+[ "$unpacked" -gt 0 ] || die "could not read the files of the tarball"
+[ "$unpacked" -le "$MAX_UNPACKED_BYTES" ] || die "the files of the tarball sum to $unpacked bytes, the bound is $MAX_UNPACKED_BYTES"
+
 # The declarations compile without the "dom" lib and keep the SigningMessage brand.
 tar -xOzf "$tgz" package/sbtp_wasm.d.ts | node "$tools" dts-check
 case "$(basename "$tgz")" in
@@ -72,4 +100,5 @@ gz=$(tar -xOzf "$tgz" package/sbtp_wasm_bg.wasm | gzip -9c | wc -c | tr -d ' ')
 
 echo "contents check passed: $(basename "$tgz")"
 tar -tvzf "$tgz" | sed 's/^/  /'
+echo "  package: $packed bytes, $unpacked bytes unpacked (bounds: $MAX_TARBALL_BYTES, $MAX_UNPACKED_BYTES)"
 echo "  sbtp_wasm_bg.wasm: $raw bytes, $gz bytes gzip -9 (budget: below $MAX_WASM_GZIP_BYTES)"

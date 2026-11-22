@@ -202,6 +202,13 @@ jobs:
       - name: Contents check
         run: sh crates/sbtp-wasm/npm/check.sh "dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz"
 
+      # Tampered copies of the tarball (manifest keys, Node.js entry, README, licences, sizes) must
+      # each fail the contents check.
+      - name: Contents check refuses tampered tarballs
+        run: |
+          SBTP_NPM_TARBALL="dist-npm/sbtp-wasm-$(node -p 'require("./crates/sbtp-wasm/npm/package.json").version').tgz" \
+            node --test crates/sbtp-wasm/npm/tamper.test.mjs
+
       # Installs the tarball into a scratch project (scripts disabled, offline) and runs a
       # seal, open and validate round trip through the package's own exports.
       - name: Smoke test of the installed package
