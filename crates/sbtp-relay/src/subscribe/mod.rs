@@ -13,7 +13,7 @@
 //!   subscription until a `gap` fits; the `gap` carries the cursor of the last frame queued for
 //!   that subscription, or its `start`.
 //! - **Session** (rules 6 to 8, 14, 17, 20, 23, 26, 31 to 33): one task per connection reads the
-//!   client's messages, only while its queue has room for a control message, sends the queue,
+//!   client's messages, only while the reply reserve of its queue is free, sends the queue,
 //!   pings and ticks, and closes on idle, age, liveness, a slow consumer and shutdown.
 //! - **Privacy** (rules 36 and 37): the state lives in memory only, and nothing of a client
 //!   message (a parent, a cursor, a `sub`) reaches a log or a metric label.
@@ -191,6 +191,11 @@ enum Out {
 /// counted (about 800), and its memory stays within [`WS_SEND_BYTES`], so the per-connection term
 /// of rule 29 is unchanged.
 const ITEM_OVERHEAD: usize = 2 * std::mem::size_of::<Out>() + ALLOC_SLACK;
+/// Security review 2026-11-22, L-1: the bytes of the queue bound kept for the reply to one client
+/// message (`subscribed`, `unsubscribed` or `error`, each within [`proto::MAX_CONTROL`]).
+/// Deliveries, gaps and ticks use only the rest; the session reads a client message only while
+/// the whole reserve is free, so that its reply always fits.
+const REPLY_RESERVE: usize = proto::MAX_CONTROL + ITEM_OVERHEAD;
 /// The allocator's header and size rounding of one heap allocation: at most 24 bytes for the
 /// glibc allocator of the relay's image (an 8-byte header, rounded up to 16).
 const ALLOC_SLACK: usize = 32;
@@ -229,14 +234,25 @@ struct Queue {
 }
 
 impl Queue {
-    fn room(&self) -> usize {
-        WS_SEND_BYTES.saturating_sub(self.bytes)
+    /// Whether the session may read a client message: the reply reserve is free (L-1).
+    fn can_read(&self) -> bool {
+        self.bytes.saturating_add(REPLY_RESERVE) <= WS_SEND_BYTES
     }
 
-    fn push(&mut self, mut out: Out) -> bool {
+    /// Queues a delivery, a gap or a tick, outside the reply reserve.
+    fn push(&mut self, out: Out) -> bool {
+        self.push_within(out, WS_SEND_BYTES - REPLY_RESERVE)
+    }
+
+    /// Queues the reply to a client message, which may use the reserve.
+    fn push_reply(&mut self, out: Out) -> bool {
+        self.push_within(out, WS_SEND_BYTES)
+    }
+
+    fn push_within(&mut self, mut out: Out, bound: usize) -> bool {
         out.shrink();
         let cost = out.cost();
-        if cost > self.room() {
+        if self.bytes.saturating_add(cost) > bound {
             return false;
         }
         self.bytes += cost;
@@ -590,11 +606,16 @@ impl Hub {
         reg.conns.remove(&id);
     }
 
-    /// Rule 14: registers `sub` and queues `subscribed`, in one step, so that `subscribed`
-    /// precedes every frame of it. The caller checked that a control message fits.
-    fn subscribe(&self, id: u64, c: &Conn, sub: u32, filter: Filter, fields: bool) {
+    /// Rule 14: queues `subscribed` and registers `sub`, in one step, so that `subscribed`
+    /// precedes every frame of it. L-1: nothing is registered when `subscribed` cannot be queued
+    /// (never while the caller read the message with the reply reserve free); `false` then.
+    fn subscribe(&self, id: u64, c: &Conn, sub: u32, filter: Filter, fields: bool) -> bool {
         let mut reg = lock(&self.reg);
         let start = self.cursor(reg.next);
+        let mut q = lock(&c.q);
+        if !q.push_reply(Out::Text(proto::subscribed(sub, &start))) {
+            return false;
+        }
         let t = Target { conn: id, sub };
         match &filter {
             Filter::All => reg.all.push(t),
@@ -606,8 +627,6 @@ impl Hub {
             }
         }
         metrics::subscription_opened(&filter);
-        let mut q = lock(&c.q);
-        q.push(Out::Text(proto::subscribed(sub, &start)));
         q.subs.insert(
             sub,
             Sub {
@@ -617,6 +636,7 @@ impl Hub {
                 gap: false,
             },
         );
+        true
     }
 
     /// Rule 17: removes `sub` and queues `unsubscribed`; `false` when it is not open.
@@ -628,7 +648,8 @@ impl Hub {
         };
         reg.remove(Target { conn: id, sub }, &s.filter);
         metrics::subscription_closed(&s.filter);
-        q.push(Out::Text(proto::unsubscribed(sub)));
+        // The caller read the message with the reply reserve free: it fits.
+        q.push_reply(Out::Text(proto::unsubscribed(sub)));
         true
     }
 }
@@ -928,6 +949,57 @@ mod tests {
             q.out.len()
         );
         assert!(q.bytes <= WS_SEND_BYTES);
+    }
+
+    /// Security review 2026-11-22, L-1: deliveries never take the reply reserve, so the reply to
+    /// a message read with the reserve free always fits, and `subscribed` precedes every frame
+    /// of its subscription; the largest frame of one fan-out batch still fits outside the
+    /// reserve.
+    #[test]
+    fn replies_have_a_reserve() {
+        let h = hub();
+        let (id, c) = h.add_conn();
+        assert!(h.subscribe(id, &c, 1, Filter::All, true));
+        drain(&c);
+        let parents: Vec<u8> = (1..=8).collect();
+        for round in 0..20u64 {
+            let batch: Vec<Entry> = (0..FANOUT_BATCH as u64)
+                .map(|n| entry(10 + round * 100 + n, 1, &parents))
+                .collect();
+            h.evaluate(&batch);
+        }
+        {
+            let q = lock(&c.q);
+            assert!(q.subs[&1].gap, "the queue overflowed");
+            assert!(q.can_read(), "deliveries left the reserve free");
+        }
+        let before = lock(&c.q).out.len();
+        assert!(h.subscribe(id, &c, 2, Filter::All, false));
+        assert!(h.unsubscribe(id, &c, 2));
+        let q = lock(&c.q);
+        let replies: Vec<&String> = q
+            .out
+            .iter()
+            .skip(before)
+            .filter_map(|o| match o {
+                Out::Text(t) => Some(t),
+                Out::Binary(_) => None,
+            })
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].contains(r#""op":"subscribed""#), "{replies:?}");
+        assert_eq!(*replies[1], proto::unsubscribed(2));
+        assert!(q.bytes <= WS_SEND_BYTES);
+        drop(q);
+        // The largest frame of one batch: 64 entries, mask and fields with 8 parents.
+        let ids = [BlockId([0; 32]); 8];
+        let item = Item {
+            id: &ids[0],
+            mask: Some(u32::MAX),
+            fields: Some((&ids, u32::MAX)),
+        };
+        let frame = proto::delivery(1, &"c".repeat(40), &[item; FANOUT_BATCH]).unwrap();
+        assert!(frame.len() + ITEM_OVERHEAD <= WS_SEND_BYTES - REPLY_RESERVE);
     }
 
     /// ADR 0054 rule 34: a full writer queue gives every open subscription a gap, and later

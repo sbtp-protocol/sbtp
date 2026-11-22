@@ -149,10 +149,7 @@ async fn drive(
         }
         let (can_read, slow_at) = {
             let q = lock(&conn.q);
-            (
-                q.room() >= proto::MAX_CONTROL,
-                q.overflow_since.map(|t| t + 2 * lim.ping),
-            )
+            (q.can_read(), q.overflow_since.map(|t| t + 2 * lim.ping))
         };
         if let Some(end) = ended(Instant::now(), age_at, idle_at, slow_at) {
             return end;
@@ -267,9 +264,9 @@ fn message(
     limiter: &Limiter,
     idle_at: &mut Option<Instant>,
 ) -> Option<End> {
-    // The caller read this message only with room for a control message in the queue.
+    // The caller read this message only with the reply reserve free (L-1): the reply fits.
     let reply = |m: String| {
-        lock(&conn.q).push(Out::Text(m));
+        lock(&conn.q).push_reply(Out::Text(m));
         conn.wake.notify_one();
     };
     let invalid = |sub, m| reply(proto::error(sub, "InvalidParameter", None, m));
@@ -305,8 +302,7 @@ fn message(
                 invalid(Some(sub), "sub is already open on this connection");
             } else if full {
                 invalid(Some(sub), "max_subscriptions reached on this connection");
-            } else {
-                hub.subscribe(id, conn, sub, filter, fields);
+            } else if hub.subscribe(id, conn, sub, filter, fields) {
                 *idle_at = None;
                 conn.wake.notify_one();
             }
