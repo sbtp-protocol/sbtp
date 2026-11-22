@@ -24,7 +24,8 @@ pnpm add --save-exact @sbtp/wasm
 ```
 
 Before taking a new version, check its provenance (`npm audit signatures`): it MUST name the repository
-`sbtp-protocol/sbtp`, the workflow `.github/workflows/release-npm.yml` and a commit on `main`.
+`sbtp-protocol/sbtp`, the workflow `.github/workflows/release-npm.yml` run on `refs/heads/main`, and
+the commit that the tag `wasm-v<version>` points at.
 
 ## Use
 
