@@ -67,6 +67,11 @@ Initial public version. Pre-release software: no version is supported for produc
   `openSealed` with one opaque `OpenFailed`, `EncKeyPair`, tags); one module behind the `l2` and `seal`
   features (122 KB gzip). `sbtp-seal`: two-phase API, in-place item encoding (review L-1). Security
   review: `docs/security/2026-11-21-wasm-seal.md` (mergeable; low findings tracked).
+- `sbtp-relay`: subscriptions over WebSocket (ADR 0054), off by default (`ws_enabled`): upgrade on
+  `GET /sbtp/v1/subscribe`, admission per client and per network group, fan-out after the index commit that
+  never blocks the writer, bounded per-connection queues (drop then `gap`, memory-accounted), ping, idle
+  and maximum-age timers, never a denied block. Security review, fixes and re-review:
+  `docs/security/2026-11-22-relay-websocket.md` (mergeable; L-9 fixed).
 - `sbtp-relay`: `SIGHUP` never stops the relay (ignored without `deny_file`); deny-list reload detects a file
   changed during the read, `purge` survives interruption, pre-sized maps; the archive copy keeps only its
   three credential variables and wipes them; `sbtp-relay key-blocks <key>` lists a denied key's held
