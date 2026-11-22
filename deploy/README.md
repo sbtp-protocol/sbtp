@@ -491,6 +491,23 @@ Whatever the proxy, it MUST (ADR 0019 rules 18, 34 and 42; ADR 0030):
 - answer no `3xx` on `/sbtp/v1/` (no trailing-slash or path redirect; the plain-HTTP-to-HTTPS
   redirect on port 80 is allowed).
 
+With subscriptions on (`ws_enabled = true`, ADR 0054 rule 45), it MUST also, on
+`/sbtp/v1/subscribe` only:
+
+- forward the WebSocket upgrade: pass `Upgrade: websocket` and `Connection: upgrade` to the
+  relay, and the `101` back. It MAY accept WebSocket over HTTP/2 or HTTP/3 from clients and use
+  the HTTP/1.1 upgrade towards the relay;
+- not clear or rewrite the `Connection` field there, as a rule that pools upstream keep-alive
+  connections usually does for every other route;
+- keep an upgraded connection open while frames flow at least every `ws_ping_interval_ms`
+  (30 s): its idle timeout for upgraded connections must be longer, for example 120 s; the
+  same holds for a CDN in front, which must not cache that route;
+- set `X-Forwarded-For` (or `client_ip_header`) on the upgrade request as on any other: the
+  client key of a subscription connection is fixed at its upgrade.
+
+A proxy or network that strips the upgrade costs clients only latency: they poll `/query`
+instead.
+
 ### Client identification
 
 The per-client limits (token buckets, `max_connections_per_client`, in-flight `PUT`s) key each
@@ -716,6 +733,39 @@ documentation and source read through Context7 on 2026-11-20):
   - Replication requests (`Sbtp-Replication: 1`, ADR 0048 rule 18) are answered
     `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and are not counted as demand:
     a copy made by another relay is not a read.
+
+## Subscriptions (WebSocket)
+
+Off by default. With `ws_enabled = true` the relay serves `GET /sbtp/v1/subscribe` (subprotocol
+`sbtp.subscribe.v1`, ADR 0054) and publishes `subscribe` in `/info`; clients are told of new
+blocks instead of polling `/query`. The reverse proxy must forward the upgrade (above).
+
+| Setting | `small` / `standard` / `large` | Meaning |
+|---|---|---|
+| `ws_enabled` | `false` | Serve the route. |
+| `ws_max_connections` | 16 / 128 / 2,048 | Subscription connections in all, at most half of `max_connections`. Over it: `503`. |
+| `ws_max_connections_per_client` | 4 / 8 / 16 | Per client key (an IPv4 address or an IPv6 /64). Over it: `429`, `Retry-After: 30`. |
+| `ws_max_subscriptions` | 4 / 8 / 8 | Subscriptions per connection (`/info` `max_subscriptions`). |
+| `ws_group_share_pct` | 25 | Share of `ws_max_connections` one IPv4 /24 or IPv6 /48 may hold. Over it: `429`. |
+| `ws_ping_interval_ms` | 30,000 | Ping and `tick` interval (`/info` `tick_ms`); a connection that answers nothing within it after a ping is closed. |
+| `ws_max_age_ms` | 3,600,000 | Connections are closed (code 1000) at this age, so that slots turn over. |
+
+A subscription connection counts in `max_connections` for its whole life, but no longer in
+`max_connections_per_client` once upgraded. The upgrade takes one `query` token; each subscription
+`⌈N/8⌉` tokens for `N` parents, 4 for the relay-wide one. A connection with no subscription for
+`idle_timeout_ms` is closed. Each connection queues at most 64 KiB for sending: a client that does
+not keep up gets a `gap` (it then catches up with `/query`), and one that stays behind for twice
+`ws_ping_interval_ms` is closed (1008). At shutdown every connection is closed with 1001, so all
+clients reconnect at once (with back-off).
+
+Memory: on `small` the bound grows by 415,744 bytes (the subscription registry, the fan-out queue
+of 256 entries and the group counts); `small` with every function on is 19,425,202 bytes. The
+subscriptions live in memory only and are never logged: no parent, cursor or `sub` value reaches
+a log line. The `stats` line carries `ws_connections_open`, `ws_subscriptions_parents`,
+`ws_subscriptions_all`, `ws_frames_sent`, `ws_entries_sent`, `ws_gaps_queue`, `ws_gaps_fanout`
+and `ws_closed`; refused upgrades count in `http_refused_total` with the reasons `ws_client`,
+`ws_group` and `ws_full`. Alert on `ws_gaps_fanout` increasing: the fan-out cannot keep up with
+ingest.
 
 ## Logs and client addresses
 
