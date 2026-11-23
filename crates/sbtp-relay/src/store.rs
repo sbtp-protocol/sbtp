@@ -190,8 +190,10 @@ impl Store {
             if ids.get(id)?.is_some() {
                 return Ok(Put::Existing);
             }
-            // spec §7: the quota refuses new blocks only, after the duplicate check.
-            if std::fs::metadata(&self.path)?.len() >= quota {
+            // spec §7: the quota refuses new blocks only, after the duplicate check. It counts the disk
+            // space really allocated: redb grows its file sparsely, in steps of up to 4 GiB, so the
+            // apparent length would refuse writes with half the quota unused.
+            if std::fs::metadata(&self.path)?.blocks().saturating_mul(512) >= quota {
                 return Ok(Put::Full);
             }
             // spec §5: from 1, above every position given before. A failed commit gives nothing.

@@ -157,24 +157,19 @@ The relay never evicts a block. Once the store reaches the quota, new blocks get
 everything already stored is still served. The operator then either grows the volume (and raises
 the quota) or adds the keys that fill it to the deny list.
 
-The quota is compared with the **length of `relay.redb`**, checked before each new block, and the
-database grows that file in large steps (redb 4.6.0, `page_manager.rs`): it doubles the file while
-it is smaller than one 4 GiB region, then adds one whole 4 GiB region at a time (a step is at most
-4 GiB plus a few MiB of region headers). The file is extended with `ftruncate`, so it is sparse
-(no disk space is used until pages are written), but a copy that does not preserve holes
-(`docker cp`, a plain `cp`, `tar` without `-S`) materialises the full length. A file just under
-the quota can still grow by one full step before the next check. So:
+The quota is compared with the **disk space allocated to `relay.redb`** (`st_blocks`), checked
+before each new block. redb 4.6.0 grows that file sparsely (`ftruncate`, in steps of up to 4 GiB),
+so its apparent length can be far above the data it holds; only written pages use disk. Real data
+stops at about the quota plus one block, so:
 
-> volume usable space >= quota + min(quota, 4 GiB) + headroom (1 GiB or more, for the deny list,
-> `relay.position`, file system overhead and a backup copy made in place)
+> volume usable space >= quota + headroom (1 GiB or more, for the deny list, `relay.position` and
+> file system overhead)
 
-Real data stops at the last file length below the quota, so the usable capacity is smaller than
-the quota (between about half of it and all of it); the quota is a ceiling, not a target.
+Example, a 7 GB volume (about 6.5 GiB usable on ext4): `SBTP_MAX_STORE_BYTES=5368709120` (5 GiB).
 
-Example, a 7 GB volume (about 6.5 GiB usable on ext4): set `SBTP_MAX_STORE_BYTES=2147483648`
-(2 GiB). The file cannot exceed about 4 GiB, which leaves about 2.5 GiB of headroom. A quota of
-4 GiB would allow an 8 GiB file and does not fit. The default (8 GiB) needs a volume of about
-16 GiB or more.
+A copy that does not preserve holes (`docker cp`, a plain `cp`, `tar` without `-S`) writes out the
+full apparent length, which can be several GiB larger: back up with `cp -a --sparse=always`, `tar
+-S`, or a volume snapshot, to a place with room for the apparent length if in doubt.
 
 ### Backup in a container
 
