@@ -147,11 +147,12 @@ MUST serve only bytes that pass §4 for that `block_id`. A `404` means this rela
 Lists stored blocks in position order, oldest first. Parameters, all optional:
 
 - `parent`: one `block_id`; only blocks that have it among their Parents. Without it, every block.
-- `since`: a position, decimal, at most 20 digits (default `0`); only blocks with a greater position.
+- `since`: a position, decimal, at most 20 digits (default `0`); only blocks with a greater position. A
+  value above 2^64 − 1 is `InvalidParameter`.
 - `limit`: integer, at least 1, default 100; a value above `max_query_limit` is lowered to it.
 
-An unknown, repeated or malformed parameter gets `400` `InvalidParameter`. A position greater than the
-relay's last position gets `400` `InvalidPosition`, never an empty page: the client resumes from `0` and
+An unknown, repeated or malformed parameter gets `400` `InvalidParameter`. A position greater than every
+position the relay has given (denied blocks included) gets `400` `InvalidPosition`, never an empty page: the client resumes from `0` and
 deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: no-store`:
 
 ```json
@@ -159,11 +160,15 @@ deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: 
 ```
 
 - `block_ids`: 0 to `limit` identifiers, in position order, none listed twice.
-- `since`: decimal string, the position of the last listed block, or the requested position when the
-  page is empty. The next request sends it as `since` to get the blocks after the page.
-- `more`: `true` when matching blocks remained after the page.
+- `since`: decimal string, the greatest position the relay examined for this page, listed or not (it may
+  be a gap or a denied block), or the requested position when it examined none. The next request sends
+  it as `since` to get the blocks after the page.
+- `more`: `true` when matching blocks remained after the page. When `more` is `true`, `since` is greater
+  than the requested position, so a client always progresses, even on an empty page.
+- The body is at most 131,072 bytes.
 - An unknown `parent` gets `200` with an empty list. A denied block is not listed. Every identifier is a
-  hint: the client fetches and validates the block (§4).
+  hint: the client fetches and validates the block (§4), and drops it if it does not carry the requested
+  `parent`. A response whose `since` is lower than the requested one is a relay error.
 
 ### `GET /sbtp/v1/info`
 
@@ -171,11 +176,12 @@ deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: 
 
 ```json
 { "relay_id": "9f2c…e41a", "min_pow_difficulty": 16, "max_future_ms": 300000, "block_versions": [1],
-  "max_query_limit": 1000, "max_subscriptions_per_ip": 4, "last_position": 1042 }
+  "max_query_limit": 1000, "max_subscriptions_per_ip": 4, "last_position": "1042" }
 ```
 
 - `relay_id`: 32 lowercase hexadecimal characters, 16 random bytes drawn when the relay's store is
-  created and kept as long as that store lives. A client that sees a `relay_id` other than the one its
+  created and kept as long as that store lives. A store restored from a backup or a copy MUST draw a new
+  `relay_id`. A client that sees a `relay_id` other than the one its
   positions came from MUST drop those positions, resume from `0` and deduplicate by `block_id`.
 - `min_pow_difficulty`: `d` of C1 on `PUT`, 0 to 256. An author SHOULD read it before mining.
 - `max_future_ms`: the P1 margin, in milliseconds.
@@ -183,11 +189,12 @@ deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: 
 - `max_query_limit`: largest `/query` page, 1 to 1,000.
 - `max_subscriptions_per_ip`: concurrent `/subscribe` connections allowed per client address; absent
   when the relay does not serve `/subscribe`.
-- `last_position`: the greatest visible position, `0` when the relay holds no block.
+- `last_position`: decimal string, the greatest position of a block the relay still serves (a denied
+  block does not count), `"0"` when it serves none. Every position in this specification is a decimal
+  string in JSON, never a JSON number.
 
 A client MUST accept the absence of any member other than `relay_id`, `min_pow_difficulty` and
-`max_future_ms`, and
-MUST ignore members it does not know. A relay MAY change its values at any time.
+`max_future_ms`, and MUST ignore members it does not know. A relay MAY change its values at any time.
 
 ## 6. `GET /sbtp/v1/subscribe` (WebSocket)
 
@@ -196,7 +203,7 @@ under `https`). `since` is required and has the `/query` meaning; `parent` is op
 connection carries exactly one subscription. Without `parent` it covers every block of the relay.
 
 - Refusals, as plain HTTP before the upgrade: `400` `InvalidParameter` (malformed upgrade or parameter),
-  `400` `InvalidPosition` (`since` beyond the last position), `429` `RateLimited` with `Retry-After` (over
+  `400` `InvalidPosition` (`since` beyond every position given, as for `/query`), `429` `RateLimited` with `Retry-After` (over
   `max_subscriptions_per_ip`), `503` `Unavailable` (over the relay's total).
 - Relay to client: one binary frame per block, `position` (u64, big-endian, 8 bytes) followed by the
   block bytes, 126 to 65,917 bytes in all. The relay sends, in position order, every matching block with a
@@ -204,7 +211,9 @@ connection carries exactly one subscription. Without `parent` it covers every bl
   once `GET /block` serves it. A denied block is never sent.
 - Client to relay: no data frames. A client data frame closes the connection with `1003`.
 - The client validates each block itself (§4, without R1) and keeps the last position it
-  received.
+  received. It MUST drop a block that does not carry the requested `parent` among its Parents.
+- A frame whose position is not greater than both `since` and the previous frame's position is a relay
+  error: the client closes the connection and falls back to `/query` with back-off.
 - **Catch-up, then live.** While it sends blocks already stored, the relay reads them from its store
   only as fast as the client takes them (TCP flow control): a slow client is never closed for slowness
   during catch-up, so one connection can sync a whole relay. Once caught up, the relay bounds what it
@@ -216,7 +225,8 @@ connection carries exactly one subscription. Without `parent` it covers every bl
 - Close codes: `1000` idle timeout or maximum age; `1001` relay stopping; `1003` client sent data;
   `1011` relay error; `4000` client too slow.
 - After any close, the client reconnects with `since` set to its last position, backing off
-  exponentially, or walks `/query` from it. Completeness comes from `since`, not from the stream.
+  exponentially, or walks `/query` from it. A browser cannot see why an upgrade was refused: after a
+  failed upgrade, a client reads `/info` (`relay_id`, `last_position`) before it retries. Completeness comes from `since`, not from the stream.
 
 ## 7. Relay limits
 
@@ -224,13 +234,17 @@ A client MUST expect, on any relay:
 
 - block size: at most 65,909 bytes, checked before the body is read (`413`); a body read timeout (`408`);
 - proof of work: at least `min_pow_difficulty` (`400` `InsufficientPow`);
-- rate limits per client address (an IPv6 /64 is one address) and a cap on concurrent connections: `429`
+- rate limits per client address (an IPv6 /64 is one address) and a cap on concurrent connections; an
+  operator MAY give higher limits, for requests and connections, to client addresses it lists (for
+  example a gateway that publishes for many users): `429`
   `RateLimited` with `Retry-After` in seconds. A client MUST NOT repeat the request before `Retry-After`
   has elapsed; without it, it backs off exponentially with jitter, starting at 1 second;
 - a global disk quota: `507` `StorageFull` for new blocks, with no eviction; blocks already stored still
   get `200`;
 - an operator deny list by `block_id` or public key: `451`. A client MUST NOT resend a denied block to
-  that relay automatically, and MUST NOT read a `451` as proof that the block is invalid elsewhere.
+  that relay automatically, and MUST NOT read a `451` as proof that the block is invalid elsewhere. A
+  denial is never announced: an index that must honour an operator's removals re-checks a block with
+  `GET /block`, where `451` signals the removal.
 
 Every request is safe to repeat. A `502`, `503` or `504` is transient: the client keeps its position and
 its unpublished blocks and retries later.

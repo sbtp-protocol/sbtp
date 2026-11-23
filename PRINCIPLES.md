@@ -89,3 +89,8 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
 - 2026-11-23: a `/subscribe` frame is `position ‖ block`, one filter per connection; the backlog
   catch-up is paced by TCP flow control and replaces batch reads; only a slow live consumer is closed
   with 4000.
+- 2026-11-23 (review fixes): positions are decimal strings in JSON; `last_position` counts only
+  served blocks, while `InvalidPosition` compares with every position ever given; a restored store
+  draws a new `relay_id`; a `/query` page always advances `since`; clients drop blocks outside their
+  filter and treat out-of-order positions as a relay error; operators MAY raise limits for listed
+  addresses; a denial is never announced, so indexes re-check with `GET /block`.
