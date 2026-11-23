@@ -66,7 +66,7 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
 |---|---|
 | Spec | 1 page |
 | `sbtp-core` | ≤ 1,000 lines |
-| Relay | 600 to 900 lines |
+| Relay | 600 to 1,000 lines |
 | CLI | ≤ 300 lines |
 | JavaScript client (separate repository) | 600 to 900 lines, pure TypeScript, no WASM required |
 
@@ -99,3 +99,7 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
   immutable, a position is local to one store).
 - 2026-11-23: a restored or copied store keeps the relative order of its blocks; ordering by position
   means trusting that relay, which the spec states.
+- 2026-11-23: relay budget raised from 900 to 1,000 lines: v1 relay measured at 948 code lines with
+  every spec guard in place, and further cuts would drop required behaviour.
+- 2026-11-23: v1 carries over the v0.2 exception to the two-week rule for `redb =4.6.0` (same checksum,
+  `legacy/v0.2:docs/security/2026-11-18-redb-4.6-exception.md`).
