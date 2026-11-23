@@ -81,3 +81,6 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
 - 2026-11-23: relay logging uses `tracing`, not a home-made logger.
 - 2026-11-23: a client implementation need not use WASM; any implementation must pass the frozen
   vectors.
+- 2026-11-23: a position is a persisted u64 from 1; `since` and `cursor` name the same position; one
+  beyond the last gets `400 InvalidCursor`; a `/subscribe` frame is `position ‖ block`, one filter per
+  connection, a slow consumer is closed with 4000.
