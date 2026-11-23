@@ -1,0 +1,26 @@
+[package]
+name = "sbtp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "cargo-fuzz target for sbtp-core. How to run it: fuzz/README.md"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace (usual cargo-fuzz layout). Versions are pinned by fuzz/Cargo.lock, committed
+# and held to the same two-week rule as the root lock file.
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sbtp-core = { path = "../crates/sbtp-core", version = "0.1.0" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_block"
+path = "fuzz_targets/decode_block.rs"
+test = false
+doc = false
+bench = false
