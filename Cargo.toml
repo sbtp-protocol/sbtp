@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sbtp-core", "crates/sbtp-relay"]
+members = ["crates/sbtp-core", "crates/sbtp-relay", "examples/cli"]
 resolver = "3"
 
 [workspace.package]
@@ -37,6 +37,19 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 redb = "=4.6.0"
 # The 16 random bytes of `relay_id` (SPEC §5 `/info`). Already in the graph.
 getrandom = "0.4.3"
+
+# CLI (examples/cli). The versions v0.2's CLI used, all in its Cargo.lock.
+# Blocking HTTP/1.1 client. No default features: no TLS (rustls, ring, webpki-roots), no gzip, no
+# JSON. Exact pin: the version v0.2 locked (3.5.2 was younger than two weeks then).
+ureq = { version = "=3.5.1", default-features = false }
+# `/info` and `/query` bodies, read as `serde_json::Value` (no derive).
+serde_json = "1.0.154"
+# Wipes the key file text and the decoded seed. Already in the graph through ed25519-dalek.
+zeroize = "1.9.1"
+# `O_NOFOLLOW` and `O_NONBLOCK` when opening the key file: constants only, no `unsafe`.
+libc = "0.2.191"
+# The CLI's end-to-end test starts the relay in-process (dev-dependency only).
+sbtp-relay = { path = "crates/sbtp-relay", version = "0.1.0" }
 
 # Tests and benches
 tempfile = "3.27.0"

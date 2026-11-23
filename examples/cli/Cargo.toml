@@ -1,0 +1,31 @@
+[package]
+name = "sbtp-cli"
+description = "SBTP v1 command-line client: keygen, publish, get, query."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "sbtp"
+path = "src/main.rs"
+
+[dependencies]
+sbtp-core = { workspace = true, features = ["std"] }
+ureq.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+sbtp-relay.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
