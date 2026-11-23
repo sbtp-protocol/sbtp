@@ -94,3 +94,6 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
   draws a new `relay_id`; a `/query` page always advances `since`; clients drop blocks outside their
   filter and treat out-of-order positions as a relay error; operators MAY raise limits for listed
   addresses; a denial is never announced, so indexes re-check with `GET /block`.
+- 2026-11-23: `/query` lists each block's position next to its id, so a client walking `/query` orders
+  blocks as a `/subscribe` client does; `GET /block` carries no position (its response is cached as
+  immutable, a position is local to one store).

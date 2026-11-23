@@ -156,10 +156,12 @@ position the relay has given (denied blocks included) gets `400` `InvalidPositio
 deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: no-store`:
 
 ```json
-{ "block_ids": ["5965bbc7…4f046d47"], "since": "1042", "more": false }
+{ "block_ids": ["5965bbc7…4f046d47"], "positions": ["1040"], "since": "1042", "more": false }
 ```
 
 - `block_ids`: 0 to `limit` identifiers, in position order, none listed twice.
+- `positions`: decimal strings, the position of each listed block, same length and order as `block_ids`
+  (so strictly increasing). A response whose arrays differ in length is a relay error.
 - `since`: decimal string, the greatest position the relay examined for this page, listed or not (it may
   be a gap or a denied block), or the requested position when it examined none. The next request sends
   it as `since` to get the blocks after the page.
