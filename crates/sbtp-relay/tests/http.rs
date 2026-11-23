@@ -220,6 +220,9 @@ async fn rate_limit_listed_addresses_and_proxy_header() {
         ("2001:db8::1", 200),
         ("2001:db8::2", 429),
         ("2001:db8:0:1::2", 200),
+        // `ip:port` and `[v6]:port` are the same clients.
+        ("10.0.0.2:5000", 429),
+        ("[2001:db8:0:1::3]:443", 429),
     ] {
         let header = format!("X-Forwarded-For: 203.0.113.9, {ip}");
         let r = relay.raw("GET", "/sbtp/v1/info", &[&header], b"").await;

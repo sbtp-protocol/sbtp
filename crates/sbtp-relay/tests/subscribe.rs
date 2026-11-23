@@ -106,6 +106,46 @@ async fn catch_up_then_live_with_parent_filter() {
 }
 
 #[tokio::test]
+async fn denied_key_is_skipped_in_catch_up_and_live() {
+    let dir = TempDir::new().unwrap();
+    let relay = Relay::start(config(&dir)).await;
+    let other = |payload: &[u8]| {
+        common::block_with(
+            &common::key(2),
+            &[],
+            payload,
+            common::now_ms(),
+            common::TEST_POW,
+        )
+    };
+    let (a, a_bytes) = block(&[], b"a");
+    let (b, b_bytes) = other(b"b");
+    let (c, c_bytes) = block(&[], b"c");
+    for bytes in [&a_bytes, &b_bytes, &c_bytes] {
+        assert_eq!(relay.put(bytes).await.status, 201);
+    }
+    let key2 = BlockId(common::key(2).verifying_key().to_bytes());
+    relay.write_deny(&format!("key {key2}\n"));
+    for _ in 0..200 {
+        if relay.get(&format!("/sbtp/v1/block/{b}")).await.status == 451 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut ws = connect(&relay, "since=0").await;
+    assert_eq!(next(&mut ws).await, Ok((1, a)));
+    assert_eq!(next(&mut ws).await, Ok((3, c)));
+    // Live: the denied key's new block is refused and never sent; the next one arrives.
+    let (_, d_bytes) = other(b"d");
+    assert_eq!(relay.put(&d_bytes).await.status, 451);
+    let (e, e_bytes) = block(&[], b"e");
+    assert_eq!(relay.put(&e_bytes).await.status, 201);
+    assert_eq!(next(&mut ws).await, Ok((4, e)));
+    drop(ws);
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn refusals_before_the_upgrade() {
     let dir = TempDir::new().unwrap();
     let mut c = config(&dir);
