@@ -91,3 +91,69 @@ touch "$SBTP_DATA_DIR/restored"
 
 The relay then draws a new `relay_id` and deletes the file. Doing so when it was not needed only
 makes clients resync from position 0.
+
+## Container
+
+`deploy/Dockerfile` builds a static binary into a distroless image with no shell, running as
+`65532:65532`. CI (`.github/workflows/relay-image.yml`, manual or on a `relay-v*` tag) publishes
+it as `ghcr.io/sbtp-protocol/sbtp-relay` for `linux/amd64`, tagged `sha-<commit>` and, for a tag,
+`<version>`. The job summary prints the pushed digest. **Deploy by digest, never by tag**, and
+check the SLSA build provenance before the first use of a digest:
+
+```sh
+gh attestation verify oci://ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest> -R sbtp-protocol/sbtp
+```
+
+It succeeds only if the image was built by this repository's workflow from the commit it names.
+
+Settings inside the container (the table above otherwise applies):
+
+| Variable | Container default |
+|---|---|
+| `SBTP_LISTEN` | `0.0.0.0:8080` (the container's own network; `EXPOSE 8080`) |
+| `SBTP_DATA_DIR` | `/data` (a volume) |
+| `SBTP_CLIENT_IP_HEADER`, `SBTP_MIN_POW_DIFFICULTY`, `SBTP_MAX_STORE_BYTES`, `SBTP_LISTED_ADDRESSES` | as above |
+
+Unknown variables are ignored: the v0.2 names (`SBTP_RELAY_*`) do nothing. Behind a proxy, set
+`SBTP_CLIENT_IP_HEADER`; the relay then logs its startup warning (header on a non-loopback
+listener), which is expected while only the proxy can reach port 8080. Never publish that port on
+a public interface.
+
+Run it with a read-only root filesystem: `/data` is the only path the relay writes, and logs go to
+standard error. A memory limit of 256 MB is recommended; the relay needs far less, the limit only
+keeps a fault from taking the host down.
+
+```sh
+docker run -d --name sbtp-relay --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --memory 256m -v sbtp-data:/data -e SBTP_CLIENT_IP_HEADER=x-real-ip \
+  ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest>
+```
+
+A named volume starts owned by `65532:65532`. A bind-mounted host directory must be writable by
+that uid.
+
+There is no healthcheck in the image (no shell, no HTTP client): the process exits on a fatal
+error, and a probe from outside can call `GET /sbtp/v1/info`.
+
+### Disk quota: no eviction
+
+The relay never evicts a block. Set `SBTP_MAX_STORE_BYTES` (in bytes) below the volume size, with
+room for the deny list, `relay.position` and file system overhead: for example 5 GiB
+(`5368709120`) on a 6 GB volume. Once the store reaches the quota, new blocks get `507` and
+everything already stored is still served. The operator then either grows the volume (and raises
+the quota) or adds the keys that fill it to the deny list.
+
+### Backup in a container
+
+Either stop the container, copy the volume's contents, and start it again:
+
+```sh
+docker stop sbtp-relay
+docker cp sbtp-relay:/data ./sbtp-data-backup   # works on a stopped container, needs no shell
+docker start sbtp-relay
+```
+
+or take a snapshot of the volume (file system, LVM or cloud disk). Restoring either kind is a
+rollback the relay cannot detect by itself: **before starting the relay on restored data, create
+`restored` in the volume** (see "Backup and restore" above), for example with
+`touch <volume path>/restored` on the host.
