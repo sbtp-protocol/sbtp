@@ -28,6 +28,7 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
+    "ISC", # ring and rustls-webpki, through the CLI's TLS
     "MIT",
     "Unicode-3.0",
 ]
@@ -37,6 +38,11 @@ allow = [
 [[licenses.exceptions]]
 crate = "libfuzzer-sys"
 allow = ["NCSA"]
+
+# webpki-roots (CLI TLS) ships the Mozilla root list as data under the permissive CDLA-Permissive-2.0.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
 
 # SPEC §3: batch verification and the lax `S` check are forbidden. This complements the
 # `c3_v3_s_plus_l` test vector; it does not replace it.

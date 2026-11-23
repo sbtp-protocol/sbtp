@@ -25,8 +25,8 @@ sbtp publish URL KEY_FILE [--parent BLOCK_ID]... < PAYLOAD
 sbtp get URL BLOCK_ID [--raw]
     Fetch the block, validate it (SPEC section 4, id included); print a summary
     or, with --raw, the block bytes.
-URL is http://HOST[:PORT] (no TLS in this build). List blocks with any HTTP
-tool: GET URL/sbtp/v1/query?since=0 (JSON). Exit status 1 on any failure.
+URL is https://HOST[:PORT] (or http:// for a local relay). List blocks with any
+HTTP tool: GET URL/sbtp/v1/query?since=0 (JSON). Exit status 1 on any failure.
 ";
 
 /// Appends lowercase hexadecimal; never reallocates when `out` has the room.
