@@ -81,6 +81,11 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
 - 2026-11-23: relay logging uses `tracing`, not a home-made logger.
 - 2026-11-23: a client implementation need not use WASM; any implementation must pass the frozen
   vectors.
-- 2026-11-23: a position is a persisted u64 from 1; `since` and `cursor` name the same position; one
-  beyond the last gets `400 InvalidCursor`; a `/subscribe` frame is `position ‖ block`, one filter per
-  connection, a slow consumer is closed with 4000.
+- 2026-11-23: a position is a persisted u64 from 1, never reused or renumbered (gaps allowed), visible
+  in increasing order, named only `since`; one beyond the last gets `400 InvalidPosition`.
+- 2026-11-23: `/info` carries a random `relay_id` per store; a client that sees it change resumes from 0.
+- 2026-11-23: a relay never evicts a stored block; only the deny list (`451`) stops serving it, so a
+  `404` means "never stored here".
+- 2026-11-23: a `/subscribe` frame is `position ‖ block`, one filter per connection; the backlog
+  catch-up is paced by TCP flow control and replaces batch reads; only a slow live consumer is closed
+  with 4000.

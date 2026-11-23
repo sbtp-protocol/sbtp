@@ -101,9 +101,13 @@ NOT answer with a redirect; a client MUST NOT follow one.
 
 **Positions.** A relay gives each block it stores for the first time a position: a u64, at least 1,
 strictly greater than every position it gave before, never reused, kept across restarts. Positions MAY
-have gaps. A relay MUST make positions visible in increasing order: once a reader sees position `q`, no
-block with a lower position appears later. Positions are local to one relay. Position `0` means "before
-the first block".
+have gaps, and a position is never renumbered: a block denied after it was stored leaves a gap. A relay
+MUST make positions visible in increasing order: once a reader sees position `q`, no block with a lower
+position appears later. Positions are local to one store of one relay, named by `relay_id` (§5,
+`/info`). Position `0` means "before the first block".
+
+**Retention.** A relay never evicts a block it has stored: it keeps serving it unless the operator
+denies it (`451`).
 
 **Errors.** Every `4xx` and `5xx` from the relay has `Content-Type: application/json`, `Cache-Control:
 no-store` and the body `{ "error": "<name>", "message": "<text>" }`; `message` is optional, at most 200
@@ -135,28 +139,28 @@ A client MUST treat `200` and `201` as the same success. `PUT` is idempotent.
 
 `200` with the stored bytes as `application/octet-stream` and `Cache-Control: public, max-age=31536000,
 immutable`; `404` `NotFound`; `400` `InvalidParameter` for a malformed identifier; `451` `Denied`. A relay
-MUST serve only bytes that pass §4 for that `block_id`. A `404` does not prove the block does not exist.
+MUST serve only bytes that pass §4 for that `block_id`. A `404` means this relay never stored the block
+(retention, §5); it says nothing about other relays.
 
 ### `GET /sbtp/v1/query`
 
 Lists stored blocks in position order, oldest first. Parameters, all optional:
 
 - `parent`: one `block_id`; only blocks that have it among their Parents. Without it, every block.
-- `since` or `cursor`: a position, decimal, at most 20 digits (default `0`); only blocks with a greater
-  position. The two names mean the same thing; a request MUST NOT carry both.
+- `since`: a position, decimal, at most 20 digits (default `0`); only blocks with a greater position.
 - `limit`: integer, at least 1, default 100; a value above `max_query_limit` is lowered to it.
 
 An unknown, repeated or malformed parameter gets `400` `InvalidParameter`. A position greater than the
-relay's last position gets `400` `InvalidCursor`, never an empty page: the client resumes from `0` and
+relay's last position gets `400` `InvalidPosition`, never an empty page: the client resumes from `0` and
 deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: no-store`:
 
 ```json
-{ "block_ids": ["5965bbc7…4f046d47"], "cursor": "1042", "more": false }
+{ "block_ids": ["5965bbc7…4f046d47"], "since": "1042", "more": false }
 ```
 
 - `block_ids`: 0 to `limit` identifiers, in position order, none listed twice.
-- `cursor`: decimal string, the position of the last listed block, or the requested position when the
-  page is empty. The next request sends it back to get the blocks after the page.
+- `since`: decimal string, the position of the last listed block, or the requested position when the
+  page is empty. The next request sends it as `since` to get the blocks after the page.
 - `more`: `true` when matching blocks remained after the page.
 - An unknown `parent` gets `200` with an empty list. A denied block is not listed. Every identifier is a
   hint: the client fetches and validates the block (§4).
@@ -166,10 +170,13 @@ deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: 
 `200`, `application/json`, at most 16,384 bytes:
 
 ```json
-{ "min_pow_difficulty": 16, "max_future_ms": 300000, "block_versions": [1],
+{ "relay_id": "9f2c…e41a", "min_pow_difficulty": 16, "max_future_ms": 300000, "block_versions": [1],
   "max_query_limit": 1000, "max_subscriptions_per_ip": 4, "last_position": 1042 }
 ```
 
+- `relay_id`: 32 lowercase hexadecimal characters, 16 random bytes drawn when the relay's store is
+  created and kept as long as that store lives. A client that sees a `relay_id` other than the one its
+  positions came from MUST drop those positions, resume from `0` and deduplicate by `block_id`.
 - `min_pow_difficulty`: `d` of C1 on `PUT`, 0 to 256. An author SHOULD read it before mining.
 - `max_future_ms`: the P1 margin, in milliseconds.
 - `block_versions`: accepted Version values; read as `[1]` when absent.
@@ -178,7 +185,8 @@ deduplicates by `block_id`. Response `200`, `application/json`, `Cache-Control: 
   when the relay does not serve `/subscribe`.
 - `last_position`: the greatest visible position, `0` when the relay holds no block.
 
-A client MUST accept the absence of any member other than `min_pow_difficulty` and `max_future_ms`, and
+A client MUST accept the absence of any member other than `relay_id`, `min_pow_difficulty` and
+`max_future_ms`, and
 MUST ignore members it does not know. A relay MAY change its values at any time.
 
 ## 6. `GET /sbtp/v1/subscribe` (WebSocket)
@@ -188,7 +196,7 @@ under `https`). `since` is required and has the `/query` meaning; `parent` is op
 connection carries exactly one subscription. Without `parent` it covers every block of the relay.
 
 - Refusals, as plain HTTP before the upgrade: `400` `InvalidParameter` (malformed upgrade or parameter),
-  `400` `InvalidCursor` (`since` beyond the last position), `429` `RateLimited` with `Retry-After` (over
+  `400` `InvalidPosition` (`since` beyond the last position), `429` `RateLimited` with `Retry-After` (over
   `max_subscriptions_per_ip`), `503` `Unavailable` (over the relay's total).
 - Relay to client: one binary frame per block, `position` (u64, big-endian, 8 bytes) followed by the
   block bytes, 126 to 65,917 bytes in all. The relay sends, in position order, every matching block with a
@@ -197,13 +205,18 @@ connection carries exactly one subscription. Without `parent` it covers every bl
 - Client to relay: no data frames. A client data frame closes the connection with `1003`.
 - The client validates each block itself (§4, without R1) and keeps the last position it
   received.
-- The relay sends WebSocket pings and closes a connection that does not answer. It bounds what it queues
-  per connection; a client that reads too slowly is closed with `4000`. There is no gap or tick message.
+- **Catch-up, then live.** While it sends blocks already stored, the relay reads them from its store
+  only as fast as the client takes them (TCP flow control): a slow client is never closed for slowness
+  during catch-up, so one connection can sync a whole relay. Once caught up, the relay bounds what it
+  queues per connection, and a client that reads new blocks too slowly is closed with `4000`. The
+  maximum connection age still applies; the client then reconnects from its last position.
+- The relay sends WebSocket pings and closes a connection that does not answer. There is no gap or tick
+  message. A browser client cannot see pings; one that needs to tell a quiet stream from a dead one MAY
+  compare its last position with `last_position` from `/info` from time to time.
 - Close codes: `1000` idle timeout or maximum age; `1001` relay stopping; `1003` client sent data;
   `1011` relay error; `4000` client too slow.
-- After any close, the client walks `/query` from its last position until `more` is `false`, then MAY
-  reconnect with that position, backing off exponentially. Completeness comes from `since`, not from the
-  stream.
+- After any close, the client reconnects with `since` set to its last position, backing off
+  exponentially, or walks `/query` from it. Completeness comes from `since`, not from the stream.
 
 ## 7. Relay limits
 
