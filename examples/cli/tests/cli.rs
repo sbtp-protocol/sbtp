@@ -40,7 +40,11 @@ fn sbtp(args: &[&str], stdin: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    // The tool may exit before reading stdin (a refused key file): a broken pipe is not a failure.
+    let written = child.stdin.take().unwrap().write_all(stdin);
+    if let Err(e) = written {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     child.wait_with_output().unwrap()
 }
 
