@@ -39,8 +39,9 @@ redb = "=4.6.0"
 getrandom = "0.4.3"
 
 # CLI (examples/cli). The versions v0.2's CLI used, all in its Cargo.lock.
-# Blocking HTTP/1.1 client. No default features: no TLS (rustls, ring, webpki-roots), no gzip, no
-# JSON. Exact pin: the version v0.2 locked (3.5.2 was younger than two weeks then).
+# Blocking HTTP/1.1 client for the CLI. Only the `rustls` feature (ring provider, webpki-roots): no
+# gzip, no JSON. Exact pin: the version v0.2 locked (3.5.2 was younger than two weeks then). The TLS
+# crates are held in Cargo.lock at versions at least two weeks old (CLI review M-1).
 ureq = { version = "=3.5.1", default-features = false, features = ["rustls"] }
 # `/info` and `/query` bodies, read as `serde_json::Value` (no derive).
 serde_json = "1.0.154"
