@@ -1,0 +1,26 @@
+[package]
+name = "sbtp-relay"
+description = "SBTP v1 dumb relay: validates the layer 0 envelope, stores blocks in receipt order, serves them over HTTP and WebSocket."
+version.workspace = true
+edition.workspace = true
+# redb 4.6 needs Rust 1.90; sbtp-core keeps the workspace value.
+rust-version = "1.90"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sbtp-core = { workspace = true, features = ["std"] }
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+redb.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+[lints]
+workspace = true

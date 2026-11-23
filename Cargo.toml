@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sbtp-core"]
+members = ["crates/sbtp-core", "crates/sbtp-relay"]
 resolver = "3"
 
 [workspace.package]
@@ -21,7 +21,27 @@ blake3 = { version = "1.8.7", default-features = false }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 zerocopy = { version = "0.8.63", features = ["derive"] }
 
+# Relay (crates/sbtp-relay). Every version below is the one v0.2's Cargo.lock held, except
+# `tracing-subscriber` (new in v1, see its comment).
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+# No default features: no form, JSON or query extractors, no HTTP/2. `ws` adds the WebSocket upgrade
+# (tokio-tungstenite, sha1, base64).
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# Log lines to stderr (PRINCIPLES "Relay scope"). New in v1: tokio-rs project, 0.3.23 published
+# 2026-03-13. `fmt` only: no ANSI colours, no env-filter (and its regex), no tracing-log.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+# The store. Exact pin, default features only, never `Builder::set_concurrency_mode()`: the
+# owner-approved, reviewed exception of 2026-11-18 (legacy/v0.2
+# docs/security/2026-11-18-redb-4.6-exception.md, lock checksum 096b1dd5…535ef). Needs Rust 1.90.
+redb = "=4.6.0"
+# The 16 random bytes of `relay_id` (SPEC §5 `/info`). Already in the graph.
+getrandom = "0.4.3"
+
 # Tests and benches
+tempfile = "3.27.0"
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 proptest = "1.12.0"
 criterion = "0.8.2"
 
