@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderName;
@@ -47,6 +47,8 @@ pub struct Config {
     pub rate_per_sec: f64,
     /// See `rate_per_sec`.
     pub rate_burst: f64,
+    /// Global requests in flight, `503` above: each may hold one block in memory.
+    pub max_requests: usize,
     /// Global `/subscribe` connections (`503`); each may hold a 256 KiB catch-up page.
     pub max_subscriptions: usize,
     /// spec §6 bounded live queue, in blocks, shared by all subscribers.
@@ -67,10 +69,15 @@ const MAX_QUERY_LIMIT: u32 = 1000;
 const MAX_SUBSCRIPTIONS_PER_IP: u32 = 4;
 /// spec §7 per-client concurrency: requests in flight (what stays visible behind a proxy).
 const REQUESTS_PER_CLIENT: u32 = 8;
-/// Global requests in flight, `503` above: each may hold one block in memory.
-const MAX_REQUESTS: usize = 256;
 /// Multiplier of the per-client limits for listed addresses (spec §7), e.g. a gateway.
 const LISTED_FACTOR: u32 = 16;
+/// `PUT` bytes per second and burst per client, apart from the request rate: 50 maximum-size
+/// `PUT`s per second filled the 8 GiB quota in 43 minutes; at 32 KiB/s it takes 3 days.
+const PUT_BYTES_PER_SEC: f64 = 32_768.0;
+const PUT_BYTES_BURST: f64 = 4_194_304.0;
+/// The same budget per IPv6 /48 ([`ClientKey::wide`]), this many times one client's: ISPs
+/// that assign /56s put up to 256 customers in one /48.
+const WIDE: f64 = 8.0;
 
 impl Config {
     /// Defaults with the store in `data_dir`.
@@ -85,6 +92,7 @@ impl Config {
             body_timeout: Duration::from_secs(10),
             rate_per_sec: 50.0,
             rate_burst: 200.0,
+            max_requests: 256,
             max_subscriptions: 256,
             live_queue: 128,
             idle_timeout: Duration::from_secs(60),
@@ -114,8 +122,8 @@ impl Config {
             config.client_ip_header = Some(v.parse().map_err(|_| "SBTP_CLIENT_IP_HEADER")?);
         }
         for a in var("SBTP_LISTED_ADDRESSES")
-            .iter()
-            .flat_map(|v| v.split(','))
+            .unwrap_or_default()
+            .split_terminator(',')
         {
             let ip: IpAddr = a.trim().parse().map_err(|_| "SBTP_LISTED_ADDRESSES")?;
             config.listed.insert(ip.into());
@@ -137,9 +145,10 @@ struct Live {
 struct Relay {
     config: Config,
     store: store::Store,
-    deny: RwLock<Arc<DenyList>>,
     live: broadcast::Sender<Live>,
     rate: RateLimiter,
+    put_bytes: RateLimiter,
+    put_bytes_wide: RateLimiter,
     requests: Counter,
     request_slots: Semaphore,
     subscriptions: Counter,
@@ -148,17 +157,9 @@ struct Relay {
 }
 
 impl Relay {
-    fn deny(&self) -> Arc<DenyList> {
-        Arc::clone(&self.deny.read().unwrap_or_else(PoisonError::into_inner))
-    }
-
     /// Limit multiplier of a client: listed addresses get more (spec §7).
     fn factor(&self, key: ClientKey) -> u32 {
-        if self.config.listed.contains(&key) {
-            LISTED_FACTOR
-        } else {
-            1
-        }
+        self.config.listed.get(&key).map_or(1, |_| LISTED_FACTOR)
     }
 }
 
@@ -166,26 +167,33 @@ impl Relay {
 ///
 /// # Errors
 ///
-/// The store cannot be opened, or the listener fails.
+/// The deny list exists but cannot be read or parsed (starting without it would serve every
+/// denied block again), the store cannot be opened, or the listener fails.
 pub async fn run(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let store = store::Store::open(&config.data_dir)?;
     let deny_path = config.data_dir.join("deny.txt");
-    let deny = DenyList::load(&deny_path).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "deny list rejected, starting with an empty list");
-        DenyList::default()
-    });
+    let deny = DenyList::load(&deny_path).map_err(|e| format!("deny.txt: {e}"))?;
+    let store = store::Store::open(&config.data_dir, deny)?;
+    // Without the header behind a proxy, every client shares one set of limits; with it on a
+    // public address, any client can claim any address. Both go unnoticed otherwise.
+    let header = config.client_ip_header.is_some();
+    if header != listener.local_addr()?.ip().is_loopback() {
+        let why = "client addresses unreliable: SBTP_CLIENT_IP_HEADER with a public listener, \
+                   or a loopback listener without it (deploy/README.md)";
+        tracing::warn!(header, why);
+    }
     let (stop_tx, stop) = watch::channel(false);
     let relay = Arc::new(Relay {
         store,
-        deny: RwLock::new(Arc::new(deny)),
         live: broadcast::channel(config.live_queue.max(1)).0,
         rate: RateLimiter::new(config.rate_per_sec, config.rate_burst),
+        put_bytes: RateLimiter::new(PUT_BYTES_PER_SEC, PUT_BYTES_BURST),
+        put_bytes_wide: RateLimiter::new(PUT_BYTES_PER_SEC * WIDE, PUT_BYTES_BURST * WIDE),
         requests: Counter::default(),
-        request_slots: Semaphore::new(MAX_REQUESTS),
+        request_slots: Semaphore::new(config.max_requests),
         subscriptions: Counter::default(),
         subscription_slots: Arc::new(Semaphore::new(config.max_subscriptions)),
         stop,
@@ -193,15 +201,10 @@ pub async fn run(
     });
     let (relay_id, min_pow) = (&relay.store.relay_id, relay.config.min_pow_difficulty);
     tracing::info!(relay_id, min_pow, "relay started");
-    let weak = Arc::downgrade(&relay);
     let watcher = tokio::spawn(limits::watch_deny_list(
         deny_path,
         relay.config.deny_reload,
-        move |list| {
-            if let Some(relay) = weak.upgrade() {
-                *relay.deny.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(list);
-            }
-        },
+        Arc::downgrade(&relay),
     ));
     let app = http::router(Arc::clone(&relay));
     let served = axum::serve(
@@ -217,11 +220,8 @@ pub async fn run(
     .await;
     watcher.abort();
     // Upgraded connections are not waited for by axum: give subscribers a moment to close.
-    for _ in 0..20 {
-        if relay.subscription_slots.available_permits() == relay.config.max_subscriptions {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let all = u32::try_from(relay.config.max_subscriptions).unwrap_or(u32::MAX);
+    let closed = relay.subscription_slots.acquire_many(all);
+    let _ = tokio::time::timeout(Duration::from_secs(1), closed).await;
     Ok(served?)
 }

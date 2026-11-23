@@ -3,8 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
+
+use sbtp_core::BlockId;
+
+use crate::Relay;
 
 /// spec §7: the client address of the limits. An IPv6 /64 is one address; an IPv4-mapped IPv6
 /// address is its IPv4 address.
@@ -18,6 +22,18 @@ impl From<IpAddr> for ClientKey {
                 Some(v4) => Self(IpAddr::V4(v4)),
                 None => Self(IpAddr::V6((v6.to_bits() & !u128::from(u64::MAX)).into())),
             },
+            v4 @ IpAddr::V4(_) => Self(v4),
+        }
+    }
+}
+
+impl ClientKey {
+    /// The IPv6 /48 of the aggregate `PUT` budget (IPv4 unchanged): a /48 is the largest
+    /// common assignment to one site, so one allocation is one budget, not 65,536 /64 clients.
+    #[must_use]
+    pub fn wide(self) -> Self {
+        match self.0 {
+            IpAddr::V6(v6) => Self(IpAddr::V6((v6.to_bits() & !(u128::MAX >> 48)).into())),
             v4 @ IpAddr::V4(_) => Self(v4),
         }
     }
@@ -43,8 +59,9 @@ impl RateLimiter {
         }
     }
 
-    /// Takes one token, scaled by `factor` for listed clients. `Err(seconds)` to wait otherwise.
-    pub fn check(&self, key: ClientKey, factor: f64) -> Result<(), u64> {
+    /// Takes `cost` tokens, rates scaled by `factor` for listed clients. `Err(seconds)` to wait
+    /// otherwise.
+    pub fn check(&self, key: ClientKey, factor: f64, cost: f64) -> Result<(), u64> {
         let now = Instant::now();
         let (rate, burst) = (self.per_sec * factor, self.burst * factor);
         let mut map = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
@@ -58,13 +75,13 @@ impl RateLimiter {
         let (tokens, at) = map.entry(key).or_insert((burst, now));
         *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * rate).min(burst);
         *at = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
+        if *tokens >= cost {
+            *tokens -= cost;
             Ok(())
         } else {
-            // Whole seconds until one token is back, at least 1 (SPEC §7: `Retry-After` in seconds).
+            // Whole seconds until `cost` is back, at least 1 (SPEC §7: `Retry-After` in seconds).
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Err(((1.0 - *tokens) / rate).ceil().max(1.0) as u64)
+            Err(((cost - *tokens) / rate).ceil().max(1.0) as u64)
         }
     }
 }
@@ -122,18 +139,9 @@ impl DenyList {
             if line.is_empty() {
                 continue;
             }
-            let bad = || {
-                format!(
-                    "line {}: expected `block <hex>` or `key <hex>`",
-                    n.saturating_add(1)
-                )
-            };
+            let bad = || format!("line {}: expected `block|key <hex>`", n.saturating_add(1));
             let (kind, hex) = line.split_once(char::is_whitespace).ok_or_else(bad)?;
-            let bytes = hex
-                .trim()
-                .parse::<sbtp_core::BlockId>()
-                .map_err(|_| bad())?
-                .0;
+            let bytes = hex.trim().parse::<BlockId>().map_err(|_| bad())?.0;
             match kind {
                 "block" => list.blocks.insert(bytes),
                 "key" => list.keys.insert(bytes),
@@ -143,19 +151,18 @@ impl DenyList {
         Ok(list)
     }
 
-    /// The SPEC §5 error name when the block `id` with bytes `block` is denied.
-    pub fn check(&self, id: &[u8; 32], block: &[u8]) -> Option<&'static str> {
+    /// The SPEC §5 error name when the block `id` signed by `key` is denied.
+    pub fn check(&self, id: &[u8; 32], key: &[u8; 32]) -> Option<&'static str> {
         if self.blocks.contains(id) {
-            return Some("Denied");
+            Some("Denied")
+        } else {
+            self.keys.contains(key).then_some("DeniedKey")
         }
-        // spec §1: PubKey is bytes 19 to 51 of a stored (hence well-formed) block.
-        let key: Option<[u8; 32]> = block.get(19..51).and_then(|k| k.try_into().ok());
-        key.filter(|k| self.keys.contains(k)).map(|_| "DeniedKey")
     }
 }
 
 /// Reloads the deny list when the file's modification time or length changes.
-pub async fn watch_deny_list(path: std::path::PathBuf, every: Duration, apply: impl Fn(DenyList)) {
+pub async fn watch_deny_list(path: std::path::PathBuf, every: Duration, relay: Weak<Relay>) {
     let stamp = |p: &Path| {
         std::fs::metadata(p)
             .ok()
@@ -170,12 +177,16 @@ pub async fn watch_deny_list(path: std::path::PathBuf, every: Duration, apply: i
             continue;
         }
         seen = now;
-        match DenyList::load(&path) {
-            Ok(list) => {
-                tracing::info!("deny list reloaded");
-                apply(list);
+        let list = match DenyList::load(&path) {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "deny list rejected, previous list kept");
+                continue;
             }
-            Err(e) => tracing::warn!(error = %e, "deny list rejected, previous list kept"),
-        }
+        };
+        let Some(relay) = relay.upgrade() else { return };
+        // `set_deny` scans the log back to the last served block: off the async workers.
+        let done = tokio::task::spawn_blocking(move || relay.store.set_deny(list)).await;
+        tracing::info!(ok = matches!(done, Ok(Ok(()))), "deny list reloaded");
     }
 }

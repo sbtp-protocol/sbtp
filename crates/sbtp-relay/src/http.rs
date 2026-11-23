@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Extension;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
@@ -101,15 +102,13 @@ async fn guard(State(relay): State<Arc<Relay>>, req: Request, next: Next) -> Res
 async fn limited(relay: &Relay, mut req: Request, next: Next) -> Reply {
     let key = client_key(relay, &req);
     let factor = relay.factor(key);
-    relay
-        .rate
-        .check(key, f64::from(factor))
-        .map_err(rate_limited)?;
-    let per_client = REQUESTS_PER_CLIENT.saturating_mul(factor);
-    let _client = relay
-        .requests
-        .acquire(key, per_client)
-        .ok_or_else(|| rate_limited(1))?;
+    let (f, max) = (
+        f64::from(factor),
+        REQUESTS_PER_CLIENT.saturating_mul(factor),
+    );
+    relay.rate.check(key, f, 1.0).map_err(rate_limited)?;
+    let busy = || rate_limited(1);
+    let _client = relay.requests.acquire(key, max).ok_or_else(busy)?;
     let _slot = relay
         .request_slots
         .try_acquire()
@@ -126,8 +125,11 @@ fn client_key(relay: &Relay, req: &Request) -> ClientKey {
         .map(|c| c.0.ip());
     let header = relay.config.client_ip_header.as_ref();
     let last = header.and_then(|name| req.headers().get_all(name).iter().next_back());
-    let from_header = last.and_then(|v| v.to_str().ok()?.rsplit(',').next()?.trim().parse().ok());
-    from_header
+    let entry = last.and_then(|v| Some(v.to_str().ok()?.rsplit(',').next()?.trim()));
+    // A bare address, or `ip:port` and `[v6]:port` as some proxies write it.
+    let parse = |e: &str| e.parse().or(e.parse().map(|s: SocketAddr| s.ip())).ok();
+    entry
+        .and_then(parse)
         .or(peer)
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into())
         .into()
@@ -152,7 +154,12 @@ fn rejected(e: BlockError) -> Response {
     error(status, e.name())
 }
 
-async fn put_block(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Body) -> Reply {
+async fn put_block(
+    State(relay): State<Arc<Relay>>,
+    Extension(key): Extension<ClientKey>,
+    headers: HeaderMap,
+    body: Body,
+) -> Reply {
     let too_large = || error(StatusCode::PAYLOAD_TOO_LARGE, "BodyTooLarge");
     // spec §5, §7: a body over 65,909 bytes is rejected before it is read.
     let declared = headers
@@ -167,6 +174,11 @@ async fn put_block(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bo
         .map_err(|_| error(StatusCode::REQUEST_TIMEOUT, "RequestTimeout"))?
         // The limit, or a body cut short; either way nothing more is read.
         .map_err(|_| too_large())?;
+    // Per client and per /48, in bytes, valid or not, before any CPU or disk is spent.
+    #[allow(clippy::cast_precision_loss)]
+    let (factor, cost) = (f64::from(relay.factor(key)), bytes.len() as f64);
+    let wide = relay.put_bytes_wide.check(key.wide(), factor, cost);
+    (relay.put_bytes.check(key, factor, cost).and(wide)).map_err(rate_limited)?;
     blocking(&relay, move |relay| {
         // spec §5 `PUT`, in order: F1 to F9, P1, C1, C2, C3, the deny list, then storage.
         let checked = sbtp_core::parse(&bytes).and_then(|block| {
@@ -180,11 +192,8 @@ async fn put_block(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bo
             Err(e) => return Ok(Err(rejected(e))),
         };
         let id = *block.block_id();
-        if let Some(name) = relay.deny().check(&id.0, &bytes) {
-            return Ok(Err(error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, name)));
-        }
         let quota = relay.config.max_store_bytes;
-        let put = relay.store.put(&id, block.block(), quota, |position| {
+        let put = relay.store.put(&block, quota, |position| {
             let frame = [&position.to_be_bytes()[..], &bytes].concat().into();
             // No receiver is not an error: nobody is subscribed.
             let _ = relay.live.send(Live {
@@ -195,6 +204,7 @@ async fn put_block(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bo
         })?;
         Ok(match put {
             Put::Existing => Ok(StatusCode::OK.into_response()),
+            Put::Denied(name) => Err(error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, name)),
             Put::Full => {
                 tracing::warn!("disk quota reached, block refused");
                 Err(error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull"))
@@ -217,9 +227,7 @@ async fn get_block(
     let id = id.ok_or_else(|| error(StatusCode::BAD_REQUEST, "InvalidParameter"))?;
     let bytes = blocking(&relay, move |relay| relay.store.get(&id)).await?;
     let bytes = bytes.ok_or_else(|| error(StatusCode::NOT_FOUND, "NotFound"))?;
-    if relay.deny().check(&id.0, &bytes).is_some() {
-        return Err(error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "Denied"));
-    }
+    let bytes = bytes.map_err(|_| error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "Denied"))?;
     let headers = [
         (CONTENT_TYPE, "application/octet-stream"),
         (CACHE_CONTROL, "public, max-age=31536000, immutable"),
@@ -269,8 +277,8 @@ pub fn params(uri: &Uri, allowed: &[&str]) -> Result<Params, Response> {
 }
 
 /// spec §5: a position beyond every position given is `400 InvalidPosition`.
-pub async fn check_position(relay: &Arc<Relay>, since: u64) -> Result<(), Response> {
-    if since > blocking(relay, |relay| relay.store.max_position()).await? {
+pub fn check_position(relay: &Relay, since: u64) -> Result<(), Response> {
+    if since > relay.store.max_position() {
         return Err(error(StatusCode::BAD_REQUEST, "InvalidPosition"));
     }
     Ok(())
@@ -279,14 +287,11 @@ pub async fn check_position(relay: &Arc<Relay>, since: u64) -> Result<(), Respon
 async fn query(State(relay): State<Arc<Relay>>, uri: Uri) -> Reply {
     let p = params(&uri, &["parent", "since", "limit"])?;
     let since = p.since.unwrap_or(0);
-    check_position(&relay, since).await?;
+    check_position(&relay, since)?;
     let limit = p.limit.unwrap_or(100).min(MAX_QUERY_LIMIT.into());
     let limit = usize::try_from(limit).unwrap_or(1);
     let page = blocking(&relay, move |relay| {
-        let deny = relay.deny();
-        relay
-            .store
-            .page(p.parent.as_ref(), since, limit, usize::MAX, &deny, false)
+        relay.store.page(p.parent, since, limit, None)
     })
     .await?;
     // spec §5: about 90 KB for 1,000 entries, under the 131,072-byte cap.
@@ -304,7 +309,7 @@ async fn query(State(relay): State<Arc<Relay>>, uri: Uri) -> Reply {
 }
 
 async fn info(State(relay): State<Arc<Relay>>) -> Reply {
-    let last = blocking(&relay, |relay| relay.store.last_served(&relay.deny())).await?;
+    let last = relay.store.last_served();
     let (id, pow) = (&relay.store.relay_id, relay.config.min_pow_difficulty);
     let body = format!(
         "{{\"relay_id\":\"{id}\",\"min_pow_difficulty\":{pow},\"max_future_ms\":{MAX_FUTURE_MS},\

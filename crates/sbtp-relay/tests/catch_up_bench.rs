@@ -34,7 +34,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const IDS: TableDefinition<[u8; 32], u64> = TableDefinition::new("ids");
-const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("log");
+const LOG: TableDefinition<u64, ([u8; 32], [u8; 32])> = TableDefinition::new("log");
+const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 const CHILDREN: TableDefinition<([u8; 32], u64), ()> = TableDefinition::new("children");
 
 fn seed(dir: &TempDir, count: u64) {
@@ -47,6 +48,7 @@ fn seed(dir: &TempDir, count: u64) {
         {
             let (mut t_ids, mut log) = (txn.open_table(IDS).unwrap(), txn.open_table(LOG).unwrap());
             let mut children = txn.open_table(CHILDREN).unwrap();
+            let mut blocks = txn.open_table(BLOCKS).unwrap();
             for _ in 0..10_000.min(count - position) {
                 position += 1;
                 let mut payload = [0u8; 256];
@@ -67,8 +69,8 @@ fn seed(dir: &TempDir, count: u64) {
                 };
                 let id = unsigned.block_id().unwrap();
                 let bytes = unsigned.sign(&signer).unwrap();
-                log.insert(position, [&id.0[..], &bytes].concat().as_slice())
-                    .unwrap();
+                log.insert(position, (id.0, unsigned.pubkey)).unwrap();
+                blocks.insert(position, bytes.as_slice()).unwrap();
                 t_ids.insert(id.0, position).unwrap();
                 for p in &parents {
                     children.insert((p.0, position), ()).unwrap();

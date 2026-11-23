@@ -13,13 +13,15 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, Uri};
 use sbtp_core::BlockId;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::{Instant, interval_at, sleep_until, timeout};
 
-use crate::http::{Reply, blocking, check_position, error, params, rate_limited};
+use crate::http::{Reply, check_position, error, params, rate_limited};
+use crate::store::Page;
 use crate::{ClientKey, Live, MAX_SUBSCRIPTIONS_PER_IP, Relay};
 
 /// Catch-up page: few enough bytes that hundreds of subscribers stay within a lean memory budget.
-const PAGE_BLOCKS: usize = 128;
+const PAGE_LEN: usize = 128;
 const PAGE_BYTES: usize = 256 << 10;
 /// A client sends nothing but pongs and a close frame.
 const MAX_CLIENT_MESSAGE: usize = 1024;
@@ -44,7 +46,7 @@ pub async fn subscribe(
     // spec §6: `since` is required; a malformed upgrade is `InvalidParameter` too.
     let since = p.since.ok_or_else(invalid)?;
     let upgrade = upgrade.map_err(|_| invalid())?;
-    check_position(&relay, since).await?;
+    check_position(&relay, since)?;
     let max = MAX_SUBSCRIPTIONS_PER_IP.saturating_mul(relay.factor(key));
     let client = relay
         .subscriptions
@@ -57,14 +59,14 @@ pub async fn subscribe(
         .max_message_size(MAX_CLIENT_MESSAGE)
         .max_frame_size(MAX_CLIENT_MESSAGE);
     Ok(upgrade.on_upgrade(move |socket| async move {
-        let (buffer, rx, live) = (VecDeque::new(), None, false);
         let feed = Feed {
             relay,
             parent: p.parent,
             last: since,
-            buffer,
-            rx,
-            live,
+            buffer: VecDeque::new(),
+            rx: None,
+            live: false,
+            read: None,
         };
         session(socket, feed).await;
         drop((client, slot));
@@ -81,11 +83,13 @@ struct Feed {
     rx: Option<broadcast::Receiver<Live>>,
     /// Caught up: frames now come from the live queue.
     live: bool,
+    /// The catch-up read in flight, kept across a cancelled `next` instead of respawned.
+    read: Option<JoinHandle<Result<Page, redb::Error>>>,
 }
 
 impl Feed {
-    /// The next frame, or the close code that ends the subscription. Cancel-safe enough for
-    /// `select!`: a dropped catch-up read loses nothing, `last` moves only once a page is in.
+    /// The next frame, or the close code that ends the subscription. Cancel-safe for `select!`:
+    /// a client frame or a ping tick leaves the pending read in `read`, polled again next call.
     async fn next(&mut self) -> Result<Bytes, u16> {
         loop {
             if let Some(frame) = self.buffer.pop_front() {
@@ -102,25 +106,25 @@ impl Feed {
                     continue;
                 }
                 self.last = item.position;
-                let block = item.frame.get(8..).unwrap_or_default();
-                let wanted = self.parent.is_none_or(|p| {
-                    sbtp_core::parse(block).is_ok_and(|b| b.parents().contains(&p))
-                });
+                let block = sbtp_core::parse(item.frame.get(8..).unwrap_or_default());
                 // spec §6: a denied block is never sent.
-                if wanted && self.relay.deny().check(&item.id, block).is_none() {
+                let deny = self.relay.store.deny();
+                if block.is_ok_and(|b| {
+                    self.parent.is_none_or(|p| b.parents().contains(&p))
+                        && deny.check(&item.id, b.pubkey()).is_none()
+                }) {
                     return Ok(item.frame);
                 }
                 continue;
             }
-            let (parent, since) = (self.parent, self.last);
-            let page = blocking(&self.relay, move |relay| {
-                let deny = relay.deny();
-                relay
-                    .store
-                    .page(parent.as_ref(), since, PAGE_BLOCKS, PAGE_BYTES, &deny, true)
-            })
-            .await
-            .map_err(|_| RELAY_ERROR)?;
+            let (relay, parent, since) = (Arc::clone(&self.relay), self.parent, self.last);
+            let page = move || relay.store.page(parent, since, PAGE_LEN, Some(PAGE_BYTES));
+            let page = self.read.get_or_insert_with(|| spawn_blocking(page)).await;
+            self.read = None;
+            let Ok(Ok(page)) = page else {
+                tracing::error!("store error during catch-up");
+                return Err(RELAY_ERROR);
+            };
             self.last = page.since;
             let frames = page.items.into_iter().filter_map(|item| item.frame);
             self.buffer.extend(frames.map(Bytes::from));
