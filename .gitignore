@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+/pkg
+/crates/sbtp-wasm/pkg
+# npm package builds (crates/sbtp-wasm/npm/build.sh): tarballs are built by CI, never committed.
+/dist-npm/
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/data
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+CLAUDE.local.md
+
+# Local assistant configuration (kept outside this repository)
+/.claude/

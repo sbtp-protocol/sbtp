@@ -1,0 +1,7 @@
+{
+  "name": "c2_v2_only_order8_c",
+  "description": "PubKey P = 26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05, canonical small-order point (V2). R = [r]B, S = r = 12345; nonce 19, searched from 0 so that [k]P is the identity, hence [S]B - [k]P = R: the cofactorless equation V6 holds. No parent, payload \"v2 only\". Isolates V2: a verifier without the small-order check on PubKey accepts this block. Signature criteria (spec 3.2, evaluated by the generator): fails V2; holds V1, V3, V4, V5, V6.",
+  "block_hex": "5342010000018bcfe56800000000000000001326e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000077632206f6e6c79ef4f62f8479733ad879cfaced3c89a9c39dd4fc795ef2efa1c3eafe4d729a0813930000000000000000000000000000000000000000000000000000000000000",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "a32edd757f43a0adfad85b9d62c48c95d8c46e85bebd6c1978d2db50ef5ee9c5", "signed_message_hex": "534254502d76312d626c6f636b2d736967a32edd757f43a0adfad85b9d62c48c95d8c46e85bebd6c1978d2db50ef5ee9c5", "error": "InvalidPublicKey" }
+}

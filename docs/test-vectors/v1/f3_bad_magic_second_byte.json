@@ -1,0 +1,7 @@
+{
+  "name": "f3_bad_magic_second_byte",
+  "description": "No parent, payload \"magic\", second magic byte 0x43; signed by key A (public seed 32 x 0x01) over the modified bytes, so only F3 fails.",
+  "block_hex": "5343010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000056d616769638fc5cf1438b2d14c92ad3c9f51aacc77c43f3315b82dd2180c78865536dd78067aa5ffd9135e6ff3bae1d21cde2b9ad5167d5a0b215e330cab8f91aef78fd607",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "BadMagic" }
+}

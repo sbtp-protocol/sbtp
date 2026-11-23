@@ -1,0 +1,7 @@
+{
+  "name": "c3_signature_by_another_key",
+  "description": "No parent, payload \"other\", PubKey of key A (public seed 32 x 0x01); valid signature of the right message by key B (public seed 32 x 0x02). Signature criteria (spec 3.2, evaluated by the generator): fails V6; holds V1, V2, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000056f74686572b547f76545d1078c3bdf55581c11f7b8ecafa1368f0eddf91a4bdb4eb575bf5870a36228b3e4ab1c3fc1584433ed8da800f17d38890a870dad56becc85c43002",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "4783bb17fc450a9c0c22d4e37e8d31947e3cf8f05ada1fdb2bc38071401bdbd4", "signed_message_hex": "534254502d76312d626c6f636b2d7369674783bb17fc450a9c0c22d4e37e8d31947e3cf8f05ada1fdb2bc38071401bdbd4", "error": "InvalidSignature" }
+}

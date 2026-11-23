@@ -1,0 +1,7 @@
+{
+  "name": "f8_one_extra_byte",
+  "description": "A valid one-parent block followed by one 0x00 byte. F8.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c010101010101010101010101010101010101010101010101010101010101010101000a6578747261206279746551ace639f80e49dc2b408dc129842232ce8a35a2b428450a71f0989644c6238234e93814d4d5fd4cd321be32e0833d500a8cc2f6bab299f9101f8648cc8cb20000",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "TrailingBytes" }
+}

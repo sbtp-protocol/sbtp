@@ -1,0 +1,7 @@
+{
+  "name": "c3_bit_flipped_in_payload",
+  "description": "Two parents, payload \"flip\" signed by key A (public seed 32 x 0x01), then the lowest bit of the last payload byte flipped (\"flio\"); signature unchanged. Signature criteria (spec 3.2, evaluated by the generator): fails V6; holds V1, V2, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c02010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020004666c6971cc0e39d4c8d1d4f6dfa79462c18cefb23564205e07e004844422d10d67ea2eee427793accf700ea85932015ef209034e0fcd49a4425cd47dd8d361e296b07e0a",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "8c67b4e4bf105bcb9536f5a40909a266beb618a34970162be4d2ec9ff6186c32", "signed_message_hex": "534254502d76312d626c6f636b2d7369678c67b4e4bf105bcb9536f5a40909a266beb618a34970162be4d2ec9ff6186c32", "error": "InvalidSignature" }
+}

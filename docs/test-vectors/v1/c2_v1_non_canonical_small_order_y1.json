@@ -1,0 +1,7 @@
+{
+  "name": "c2_v1_non_canonical_small_order_y1",
+  "description": "PubKey y = 1 + p: non-canonical encoding of a small-order point; V1 fires before V2. No parent, payload \"c2\", signature by key A (public seed 32 x 0x01) over the right message, so it is not a signature for this PubKey; C2 is reported before C3. Signature criteria (spec 3.2, evaluated by the generator): fails V1, V2, V6; holds V3, V4, V5.",
+  "block_hex": "5342010000018bcfe568000000000000000000eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000026332a27976b0175a197912eb4f9c160cdcdf1e7564b973c14e9d60ea0130a3c1b696dc9d36944f5ecead6a37617d875b9d4b0759b03161f5c14c422fc6fcd697100a",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "6a59c43a31258d31d966c8ff5e73688a9254828e614593bafe926afc201d8c52", "signed_message_hex": "534254502d76312d626c6f636b2d7369676a59c43a31258d31d966c8ff5e73688a9254828e614593bafe926afc201d8c52", "error": "InvalidPublicKey" }
+}

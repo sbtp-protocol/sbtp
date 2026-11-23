@@ -1,0 +1,7 @@
+{
+  "name": "f1_117_bytes",
+  "description": "The minimum valid block (vector valid_0_parents_empty_payload) without its last byte: 117 bytes. F1; the conditions of F6 and F7 (len < 118) hold too. Rule order: this is the first failing check; later checks are not evaluated.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000058889a9f5ebacc2ab90da367f6d5bc6986ee23e0f0d851ee6d13cc7ecb4d4b42568d0b28e6c010148e22487f457579854d73e205c8ba250a6deb095ba60685",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "TooShort" }
+}

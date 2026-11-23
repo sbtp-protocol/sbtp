@@ -1,0 +1,7 @@
+{
+  "name": "f5_9_parents",
+  "description": "Parents Count 9, followed by 9 distinct parents (parent i = BLAKE3_derive_key(\"SBTP test vectors v1 parent\", [i])), empty payload and a signature by key A (public seed 32 x 0x01): the layout would be consistent, only F5 fails. 406 bytes.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0920722ca8348de58603c7857a4d903489803d89d36e8f7e5caaa61735a0376b04da3145fd79f7f50a860d9791cfc65a01436f8338316a0f965fe9a02379e99ac1dfcb09de3e1bda1aad0166e312ab162666922e70fd278097eaf8b0f9d3b91a22006826ad5871ff2dd66b3dead78383a85c8a73b86b6640dcb4d1aaae1aa5dab18265ab9e831ddd2bc0ccd9754f75c815e332a994de19ff7065df276fe19ad1606456a9f1b3feb8d876ee34a8f7278686834bfdabe9cc5ff6dc1c1fb613981fbbc79940c89ad2b27d700f8de4f909da79e462448c6e5d63f22c51c501057f068937eda58922387386321998768b56630f367a75da7efa931080aa26d9bd120f89695e03db483c0f9a5a51e3fb8fee3fe7ddc4e20fd51397a233cd25a58acec5090000ff550cd8288a5839d68a1f4890c1a723b9b5a4ef902d68f1d3656587d0aa0d118fa68ba1332c79fde022c0a887398c1f73d91e849cb1282a25ff0f9b35b3390b",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "TooManyParents" }
+}

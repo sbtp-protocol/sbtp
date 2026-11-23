@@ -1,0 +1,7 @@
+{
+  "name": "c2_v2_only_order8_a_torsion_r",
+  "description": "PubKey P = T = c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a, canonical point of order 8 (V2). R = [r]B + T, S = r = 12345: R has a torsion component but is not of small order. Nonce 0, searched from 0 so that [k]P = -T, hence [S]B - [k]P = [r]B + T = R: V6 holds. No parent, payload \"v2 only\". Isolates V2. Signature criteria (spec 3.2, evaluated by the generator): fails V2; holds V1, V3, V4, V5, V6.",
+  "block_hex": "5342010000018bcfe568000000000000000000c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000077632206f6e6c7940a4cf5c611d737a2f1c6fcca84d9cabfed80987f186a5a6c57e629bff1af27f3930000000000000000000000000000000000000000000000000000000000000",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "192afce8af2688472771f87119ff403d246f4f739d34d41fba94798bcdcc7914", "signed_message_hex": "534254502d76312d626c6f636b2d736967192afce8af2688472771f87119ff403d246f4f739d34d41fba94798bcdcc7914", "error": "InvalidPublicKey" }
+}

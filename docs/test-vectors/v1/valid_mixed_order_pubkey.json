@@ -1,0 +1,7 @@
+{
+  "name": "valid_mixed_order_pubkey",
+  "description": "Valid. PubKey A' = a*B + T, a the scalar of key A (public seed 32 x 0x01), T the order-8 point c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a; nonce 1, payload \"mixed order\". Signed with a and A' in the hash. k = SHA-512(R || A' || M) mod L is 0 mod 8, so [S]B - [k]A' = R and V6 holds; the unreduced digest is not 0 mod 8: this pins the mod L of V6 (ADR 0003). Signature criteria (spec 3.2, evaluated by the generator): V1 to V6 all hold.",
+  "block_hex": "5342010000018bcfe5680000000000000000019ea3f11f5bd34f0cd7147fd0a436c088f624c6100c1df6a53c0a29e05d60cea000000b6d69786564206f7264657219d1ae5c8a3f5fa9a32164bdd9931ea11d703d143e61988cf6461e17cd2fa32dfb1d98cf004eef37d860c4190e5678908045463d8b8e59e8bb6e0dd752d6b70b",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": true, "block_id": "e9faddc25a2e479a5f556ffd36728d1b4df7b833c1277847361c565e0681fbbc", "signed_message_hex": "534254502d76312d626c6f636b2d736967e9faddc25a2e479a5f556ffd36728d1b4df7b833c1277847361c565e0681fbbc", "error": null }
+}

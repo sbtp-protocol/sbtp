@@ -1,0 +1,7 @@
+{
+  "name": "self_test_valid",
+  "description": "Valid. No parent, payload \"S + L\". The unmodified block of the S + L vector, replayed at start-up (ADR 0003 rule 16); exported by sbtp-core as SELF_TEST_VALID_BLOCK. Signed by key A (public seed 32 x 0x01), timestamp 1700000000000. Signature criteria (spec 3.2, evaluated by the generator): V1 to V6 all hold.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000553202b204cfb6307494d2cfd35820ab39f5258b5b2ced9935db2b646b156bbd61d7336fc273144debae2a6532b9195107d83b13a7b74cedce983c54186ad255dcfa4b13304",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": true, "block_id": "f0ce4441bcd0475f18e071862d24ae65277fe5ecadcad803100bb9d85049755d", "signed_message_hex": "534254502d76312d626c6f636b2d736967f0ce4441bcd0475f18e071862d24ae65277fe5ecadcad803100bb9d85049755d", "error": null }
+}

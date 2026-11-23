@@ -1,0 +1,7 @@
+{
+  "name": "c2_v2_small_order_order8_a_and_v6",
+  "description": "PubKey c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a, canonical small-order point (V2). No parent, payload \"c2\", signature by key A (public seed 32 x 0x01) over the right message, so it is not a signature for this PubKey; C2 is reported before C3. Combined case: V6 fails too. V2 alone is isolated by vector c2_v2_only_order8_a. Signature criteria (spec 3.2, evaluated by the generator): fails V2, V6; holds V1, V3, V4, V5.",
+  "block_hex": "5342010000018bcfe568000000000000000000c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a00000263328f424d9efb3c446f1a386d2ba322124b6cc147d440b13d345d70511a221ad35dec170615f6de582fdc91906aa0e20d04ab2cbba6a600147fab9fc79a9e19e505",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": "43eb4ff54f7116c98ded24d1b9ed34db5412e07ac64445413c99f9330ce1c2cc", "signed_message_hex": "534254502d76312d626c6f636b2d73696743eb4ff54f7116c98ded24d1b9ed34db5412e07ac64445413c99f9330ce1c2cc", "error": "InvalidPublicKey" }
+}

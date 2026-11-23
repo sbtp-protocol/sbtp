@@ -1,0 +1,7 @@
+{
+  "name": "f6_truncated_in_parents",
+  "description": "A valid 4-parent block cut after 2.5 parents: 132 bytes, 246 needed for 4 parents, Payload Len and the signature. F6.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": false, "block_id": null, "signed_message_hex": null, "error": "Truncated" }
+}

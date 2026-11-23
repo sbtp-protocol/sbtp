@@ -1,0 +1,7 @@
+{
+  "name": "valid_0_parents_empty_payload",
+  "description": "Valid. Minimum size: 118 bytes, no parent, empty payload. Signed by key A (public seed 32 x 0x01), timestamp 1700000000000. Signature criteria (spec 3.2, evaluated by the generator): V1 to V6 all hold.",
+  "block_hex": "5342010000018bcfe5680000000000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000058889a9f5ebacc2ab90da367f6d5bc6986ee23e0f0d851ee6d13cc7ecb4d4b42568d0b28e6c010148e22487f457579854d73e205c8ba250a6deb095ba6068502",
+  "params": { "difficulty": 0, "requested_block_id": null },
+  "expect": { "valid": true, "block_id": "7b7dbd4a53255b45e4ac8797a7d093998ab22fe381735352c98c08448ef39ded", "signed_message_hex": "534254502d76312d626c6f636b2d7369677b7dbd4a53255b45e4ac8797a7d093998ab22fe381735352c98c08448ef39ded", "error": null }
+}
