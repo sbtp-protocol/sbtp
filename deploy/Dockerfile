@@ -24,8 +24,7 @@ COPY examples examples
 # The shipped profile: `--release`, the relay binary alone, never `--all-targets`.
 RUN cargo build --release --locked -p sbtp-relay --bin sbtp-relay \
  && mkdir -p /out/data \
- && cp target/release/sbtp-relay /out/sbtp-relay \
- && chmod 0700 /out/data
+ && cp target/release/sbtp-relay /out/sbtp-relay
 
 # `--target export`: the static binary alone, for `--output type=local`.
 FROM scratch AS export
@@ -35,9 +34,10 @@ COPY --from=build /out/sbtp-relay /sbtp-relay
 # The `nonroot` variant runs as uid/gid 65532.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 COPY --from=build /out/sbtp-relay /usr/local/bin/sbtp-relay
-# The data volume mount point, owned by the relay user, mode 0700. A named volume mounted here
-# starts with this owner and mode.
-COPY --from=build --chown=65532:65532 /out/data /data
+# The data volume mount point, owned by the relay user, mode 0700 (set by `--chmod`: COPY of a
+# directory copies its contents, not its mode). A named volume mounted here starts with this owner
+# and mode.
+COPY --from=build --chown=65532:65532 --chmod=0700 /out/data /data
 USER 65532:65532
 # The data directory is the volume, the only path the relay writes (logs go to standard error), so
 # the root filesystem can be read-only. The listener is every interface of the container's own

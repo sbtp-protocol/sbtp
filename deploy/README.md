@@ -101,10 +101,21 @@ it as `ghcr.io/sbtp-protocol/sbtp-relay` for `linux/amd64`, tagged `sha-<commit>
 check the SLSA build provenance before the first use of a digest:
 
 ```sh
-gh attestation verify oci://ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest> -R sbtp-protocol/sbtp
+gh attestation verify oci://ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest> \
+  --repo sbtp-protocol/sbtp \
+  --signer-workflow sbtp-protocol/sbtp/.github/workflows/relay-image.yml \
+  --source-ref refs/tags/relay-v<version> \
+  --source-digest <commit you reviewed> \
+  --deny-self-hosted-runners
 ```
 
-It succeeds only if the image was built by this repository's workflow from the commit it names.
+It succeeds only if the digest carries a provenance attestation signed by the `relay-image.yml`
+workflow of this repository, running on that tag and that commit, on a GitHub-hosted runner. It
+does not prove the commit is free of bugs or that the tag points at reviewed history: review the
+commit yourself, and prefer tags (protected by a repository ruleset) over `--source-ref
+refs/heads/v1` or `refs/heads/main`, which is what a manually dispatched build carries. A bare
+`-R sbtp-protocol/sbtp` check is not enough: it accepts an attestation from any workflow run in
+the repository, including one on an attacker's branch.
 
 Settings inside the container (the table above otherwise applies):
 
@@ -125,9 +136,14 @@ keeps a fault from taking the host down.
 
 ```sh
 docker run -d --name sbtp-relay --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --memory 256m -v sbtp-data:/data -e SBTP_CLIENT_IP_HEADER=x-real-ip \
+  --memory 256m -v sbtp-data:/data -p 127.0.0.1:8080:8080 -e SBTP_CLIENT_IP_HEADER=x-real-ip \
   ghcr.io/sbtp-protocol/sbtp-relay@sha256:<digest>
 ```
+
+Bind the port to loopback only, as above. Publishing it on a public interface (`-p 8080:8080`)
+bypasses the proxy (and host firewalls such as ufw), so any client could forge the client-address
+header and escape every per-client limit. The alternative is a user-defined Docker network shared
+with the proxy container and no `-p` at all.
 
 A named volume starts owned by `65532:65532`. A bind-mounted host directory must be writable by
 that uid.
@@ -137,11 +153,28 @@ error, and a probe from outside can call `GET /sbtp/v1/info`.
 
 ### Disk quota: no eviction
 
-The relay never evicts a block. Set `SBTP_MAX_STORE_BYTES` (in bytes) below the volume size, with
-room for the deny list, `relay.position` and file system overhead: for example 5 GiB
-(`5368709120`) on a 6 GB volume. Once the store reaches the quota, new blocks get `507` and
+The relay never evicts a block. Once the store reaches the quota, new blocks get `507` and
 everything already stored is still served. The operator then either grows the volume (and raises
 the quota) or adds the keys that fill it to the deny list.
+
+The quota is compared with the **length of `relay.redb`**, checked before each new block, and the
+database grows that file in large steps (redb 4.6.0, `page_manager.rs`): it doubles the file while
+it is smaller than one 4 GiB region, then adds one whole 4 GiB region at a time (a step is at most
+4 GiB plus a few MiB of region headers). The file is extended with `ftruncate`, so it is sparse
+(no disk space is used until pages are written), but a copy that does not preserve holes
+(`docker cp`, a plain `cp`, `tar` without `-S`) materialises the full length. A file just under
+the quota can still grow by one full step before the next check. So:
+
+> volume usable space >= quota + min(quota, 4 GiB) + headroom (1 GiB or more, for the deny list,
+> `relay.position`, file system overhead and a backup copy made in place)
+
+Real data stops at the last file length below the quota, so the usable capacity is smaller than
+the quota (between about half of it and all of it); the quota is a ceiling, not a target.
+
+Example, a 7 GB volume (about 6.5 GiB usable on ext4): set `SBTP_MAX_STORE_BYTES=2147483648`
+(2 GiB). The file cannot exceed about 4 GiB, which leaves about 2.5 GiB of headroom. A quota of
+4 GiB would allow an 8 GiB file and does not fit. The default (8 GiB) needs a volume of about
+16 GiB or more.
 
 ### Backup in a container
 
@@ -157,3 +190,15 @@ or take a snapshot of the volume (file system, LVM or cloud disk). Restoring eit
 rollback the relay cannot detect by itself: **before starting the relay on restored data, create
 `restored` in the volume** (see "Backup and restore" above), for example with
 `touch <volume path>/restored` on the host.
+
+To restore a copy into a container (the image has no shell), put the files in the volume owned by
+the relay user, then add the marker. `docker cp` writes root-owned files, which the relay (uid
+65532) cannot open: it then refuses to start, which is fail-safe, not a bug. For example, with
+any small image that has a shell and `cp`, on a stopped relay:
+
+```sh
+docker run --rm --user 0 -v sbtp-data:/data -v "$PWD/sbtp-data-backup:/b:ro" <image with sh> \
+  sh -c 'cp -a /b/. /data/ && chown -R 65532:65532 /data && touch /data/restored'
+```
+
+or, on the volume's host path, `chown -R 65532:65532 <path>` and `touch <path>/restored`.

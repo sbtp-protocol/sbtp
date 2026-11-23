@@ -30,12 +30,23 @@ env:
   IMAGE: ghcr.io/sbtp-protocol/sbtp-relay
 
 jobs:
+  # The same checks as CI, on this commit: no image is built from a commit that fails them.
+  ci:
+    name: CI checks
+    if: >-
+      github.ref == 'refs/heads/v1' || github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/relay-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   image:
     name: Build, smoke-test and push the relay image (linux/amd64)
     # A dispatch from another branch does nothing: images come from `v1`, `main` or a release tag.
     if: >-
       github.ref == 'refs/heads/v1' || github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/tags/relay-v')
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -173,6 +184,8 @@ jobs:
           TAGS: ${{ steps.tags.outputs.tags }}
           COMMIT: ${{ github.sha }}
           VISIBILITY: ${{ github.event.repository.visibility }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -192,7 +205,11 @@ jobs:
             echo "- Platform: linux/amd64"
             echo "- Tags: \`${TAGS//,/\`, \`}\`"
             if [ "$VISIBILITY" = "public" ]; then
-              echo "- Provenance: \`gh attestation verify oci://${IMAGE}@${DIGEST} -R sbtp-protocol/sbtp\`"
+              echo "- Provenance (this run's ref and commit; deploy/README.md says which to trust):"
+              echo
+              echo '```'
+              echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${REPO} --signer-workflow ${REPO}/.github/workflows/relay-image.yml --source-ref ${REF} --source-digest ${COMMIT} --deny-self-hosted-runners"
+              echo '```'
             else
               echo "- Provenance: none (repository is ${VISIBILITY}; attestations need a public repository on this plan)"
             fi
