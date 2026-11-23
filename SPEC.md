@@ -105,6 +105,9 @@ have gaps, and a position is never renumbered: a block denied after it was store
 MUST make positions visible in increasing order: once a reader sees position `q`, no block with a lower
 position appears later. Positions are local to one store of one relay, named by `relay_id` (§5,
 `/info`). Position `0` means "before the first block".
+A store restored or copied under a new `relay_id` MUST keep the relative order of the blocks it carries
+over (a re-import replays them in position order). A position is one relay's receipt order, not a consensus
+or a proof of time: an application that orders blocks by position trusts that relay for the order.
 
 **Retention.** A relay never evicts a block it has stored: it keeps serving it unless the operator
 denies it (`451`).

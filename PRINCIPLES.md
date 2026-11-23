@@ -97,3 +97,5 @@ object-storage mirrors, caches, demand-based eviction, detailed metrics, a home-
 - 2026-11-23: `/query` lists each block's position next to its id, so a client walking `/query` orders
   blocks as a `/subscribe` client does; `GET /block` carries no position (its response is cached as
   immutable, a position is local to one store).
+- 2026-11-23: a restored or copied store keeps the relative order of its blocks; ordering by position
+  means trusting that relay, which the spec states.
