@@ -177,8 +177,10 @@ async fn put_block(
     // Per client and per /48, in bytes, valid or not, before any CPU or disk is spent.
     #[allow(clippy::cast_precision_loss)]
     let (factor, cost) = (f64::from(relay.factor(key)), bytes.len() as f64);
-    let wide = relay.put_bytes_wide.check(key.wide(), factor, cost);
-    (relay.put_bytes.check(key, factor, cost).and(wide)).map_err(rate_limited)?;
+    // The /48 is charged only once the client's own budget admits the body (re-review R-L-1).
+    (relay.put_bytes.check(key, factor, cost))
+        .and_then(|()| relay.put_bytes_wide.check(key.wide(), factor, cost))
+        .map_err(rate_limited)?;
     blocking(&relay, move |relay| {
         // spec §5 `PUT`, in order: F1 to F9, P1, C1, C2, C3, the deny list, then storage.
         let checked = sbtp_core::parse(&bytes).and_then(|block| {
